@@ -437,6 +437,9 @@ const migrations = [
   `ALTER TABLE time_entries ADD COLUMN start_time TEXT`,
   `ALTER TABLE firms ADD COLUMN logo_data BLOB`,
   `ALTER TABLE firms ADD COLUMN logo_mime TEXT`,
+  `ALTER TABLE contacts ADD COLUMN originating_attorney_email TEXT`,
+  `ALTER TABLE contacts ADD COLUMN origination_split_pct REAL`,
+  `ALTER TABLE contacts ADD COLUMN billing_attorney_email TEXT`,
 ];
 for (const m of migrations) {
   try { db.exec(m); } catch(e) { /* column already exists */ }
@@ -980,6 +983,19 @@ function validateIncrement(v) {
   return n;
 }
 
+function validateSplitPct(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0 || n > 100) throw new Error('Origination split must be between 0 and 100');
+  return Math.round(n * 100) / 100;
+}
+
+function normalizeEmail(v) {
+  if (v == null) return null;
+  const s = String(v).trim().toLowerCase();
+  return s || null;
+}
+
 app.post('/api/contacts', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
   const b = req.body || {};
   const id = uid('c_');
@@ -987,8 +1003,9 @@ app.post('/api/contacts', authRequired, verifyFirmMembership, requireCap('editCo
   const last  = (b.lastName  || '').trim();
   const full  = (b.fullName || fullName(first, last) || b.companyName || 'Unnamed').trim();
   const now = new Date().toISOString();
-  let inc;
+  let inc, splitPct;
   try { inc = validateIncrement(b.billingIncrementMinutes); } catch(e) { return res.status(400).json({ error: e.message }); }
+  try { splitPct = validateSplitPct(b.originationSplitPct); } catch(e) { return res.status(400).json({ error: e.message }); }
   const last4 = b.taxIdLast4 ? String(b.taxIdLast4).replace(/\D/g, '').slice(-4) : null;
   db.prepare(`INSERT INTO contacts (
       id, firm_id, type, first_name, last_name, full_name, email, phone, title,
@@ -997,8 +1014,9 @@ app.post('/api/contacts', authRequired, verifyFirmMembership, requireCap('editCo
       billing_increment_minutes,
       mailing_address, date_of_birth, client_since, secondary_email, secondary_phone,
       industry, tax_id_last4, preferred_contact,
+      originating_attorney_email, origination_split_pct, billing_attorney_email,
       created_by, created_at, updated_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
     id, req.user.firmId, b.type || 'prospect', first, last, full,
     b.email || null, b.phone || null, b.title || null,
     b.companyId || null, b.companyName || null, b.address || null, b.linkedin || null,
@@ -1009,6 +1027,7 @@ app.post('/api/contacts', authRequired, verifyFirmMembership, requireCap('editCo
     b.mailingAddress || null, b.dateOfBirth || null, b.clientSince || null,
     b.secondaryEmail || null, b.secondaryPhone || null,
     b.industry || null, last4, b.preferredContact || null,
+    normalizeEmail(b.originatingAttorneyEmail), splitPct, normalizeEmail(b.billingAttorneyEmail),
     req.user.email, now, now
   );
   const c = db.prepare('SELECT * FROM contacts WHERE id = ?').get(id);
@@ -1026,12 +1045,20 @@ app.put('/api/contacts/:id', authRequired, verifyFirmMembership, requireCap('edi
   const first = b.firstName ?? existing.first_name ?? '';
   const last  = b.lastName  ?? existing.last_name  ?? '';
   const full  = (b.fullName || fullName(first, last) || b.companyName || existing.full_name || 'Unnamed').trim();
-  let inc;
+  let inc, splitPct;
   try { inc = 'billingIncrementMinutes' in b ? validateIncrement(b.billingIncrementMinutes) : existing.billing_increment_minutes; }
+  catch(e) { return res.status(400).json({ error: e.message }); }
+  try { splitPct = 'originationSplitPct' in b ? validateSplitPct(b.originationSplitPct) : existing.origination_split_pct; }
   catch(e) { return res.status(400).json({ error: e.message }); }
   const last4 = 'taxIdLast4' in b
     ? (b.taxIdLast4 ? String(b.taxIdLast4).replace(/\D/g, '').slice(-4) : null)
     : existing.tax_id_last4;
+  const origAttyEmail = 'originatingAttorneyEmail' in b
+    ? normalizeEmail(b.originatingAttorneyEmail)
+    : existing.originating_attorney_email;
+  const billAttyEmail = 'billingAttorneyEmail' in b
+    ? normalizeEmail(b.billingAttorneyEmail)
+    : existing.billing_attorney_email;
   db.prepare(`UPDATE contacts SET
       type = COALESCE(?, type),
       first_name = ?, last_name = ?, full_name = ?,
@@ -1044,6 +1071,7 @@ app.put('/api/contacts/:id', authRequired, verifyFirmMembership, requireCap('edi
       mailing_address = ?, date_of_birth = ?, client_since = ?,
       secondary_email = ?, secondary_phone = ?,
       industry = ?, tax_id_last4 = ?, preferred_contact = ?,
+      originating_attorney_email = ?, origination_split_pct = ?, billing_attorney_email = ?,
       updated_at = datetime('now')
     WHERE id = ? AND firm_id = ?`).run(
     b.type || null, (first||'').trim(), (last||'').trim(), full,
@@ -1064,6 +1092,7 @@ app.put('/api/contacts/:id', authRequired, verifyFirmMembership, requireCap('edi
     b.industry ?? existing.industry,
     last4,
     b.preferredContact ?? existing.preferred_contact,
+    origAttyEmail, splitPct, billAttyEmail,
     req.params.id, req.user.firmId
   );
   const c = db.prepare('SELECT * FROM contacts WHERE id = ?').get(req.params.id);

@@ -945,6 +945,26 @@ async function openContactForm(existing) {
             el('option', { value: '15', ...(c.billing_increment_minutes === 15 ? { selected: 'selected' } : {}) }, '0.25 hr (15 min)'),
           ]) ]),
       ]),
+      el('div', { class: 'form-row' }, [
+        el('div', { class: 'field' }, [ el('label', {}, 'Originating attorney'),
+          el('select', { name: 'originatingAttorneyEmail' }, [
+            el('option', { value: '', ...(!c.originating_attorney_email ? { selected: 'selected' } : {}) }, '—'),
+            ...users.filter(u => u.active).map(u =>
+              el('option', { value: u.email, ...(c.originating_attorney_email === u.email ? { selected: 'selected' } : {}) }, u.name + ' (' + u.email + ')')),
+          ]) ]),
+        el('div', { class: 'field' }, [ el('label', {}, 'Origination split %'),
+          el('input', { name: 'originationSplitPct', type: 'number', min: '0', max: '100', step: '0.01',
+            value: (c.origination_split_pct != null ? c.origination_split_pct : ''), placeholder: 'e.g. 25' }) ]),
+      ]),
+      el('div', { class: 'form-row' }, [
+        el('div', { class: 'field' }, [ el('label', {}, 'Billing attorney (reviews bills)'),
+          el('select', { name: 'billingAttorneyEmail' }, [
+            el('option', { value: '', ...(!c.billing_attorney_email ? { selected: 'selected' } : {}) }, '—'),
+            ...users.filter(u => u.active).map(u =>
+              el('option', { value: u.email, ...(c.billing_attorney_email === u.email ? { selected: 'selected' } : {}) }, u.name + ' (' + u.email + ')')),
+          ]) ]),
+        el('div', { class: 'field' }, []),
+      ]),
     ]),
     el('div', { class: 'field' }, [ el('label', {}, 'LinkedIn URL'), el('input', { name: 'linkedin', value: c.linkedin || '' }) ]),
     el('div', { class: 'field' }, [ el('label', {}, 'Notes'), el('textarea', { name: 'notes' }, c.notes || '') ]),
@@ -1024,6 +1044,12 @@ async function openContact(id) {
     showIf(contact.date_of_birth, el('div', { class: 'field-group' }, [ el('label', {}, 'Date of birth'), el('div', { class: 'val' }, fmt.date(contact.date_of_birth)) ])),
     showIf(contact.tax_id_last4, el('div', { class: 'field-group' }, [ el('label', {}, 'Tax ID (last 4)'), el('div', { class: 'val' }, '••• ' + contact.tax_id_last4) ])),
     el('div', { class: 'field-group' }, [ el('label', {}, 'Owner'), el('div', { class: 'val' }, contact.owner_email || '—') ]),
+    showIf(contact.type === 'client' && (contact.originating_attorney_email || contact.origination_split_pct != null),
+      el('div', { class: 'field-group' }, [ el('label', {}, 'Originating attorney'),
+        el('div', { class: 'val' }, (contact.originating_attorney_email || '—')
+          + (contact.origination_split_pct != null ? '  —  ' + contact.origination_split_pct + '% split' : '')) ])),
+    showIf(contact.type === 'client' && contact.billing_attorney_email,
+      el('div', { class: 'field-group' }, [ el('label', {}, 'Billing attorney'), el('div', { class: 'val' }, contact.billing_attorney_email) ])),
     el('div', { class: 'field-group' }, [ el('label', {}, 'Tags'), el('div', {}, (contact.tags||[]).length ? (contact.tags||[]).map(t => el('span', { class: 'tag' }, t)) : '—') ]),
     contact.notes ? el('div', { class: 'field-group' }, [ el('label', {}, 'Notes'), el('div', { class: 'val', style: 'white-space:pre-wrap' }, contact.notes) ]) : null,
   ]);
