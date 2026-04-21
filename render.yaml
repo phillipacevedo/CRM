@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: crm
+    runtime: node
+    buildCommand: npm install --build-from-source
+    startCommand: node server.js
+    disk:
+      name: crm-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: DB_PATH
+        value: /data/crm.db
+      - key: JWT_SECRET
+        generateValue: true
+      - key: SEED_ADMIN_EMAIL
+        value: pacevedo67@gmail.com
+      - key: SEED_ADMIN_PASSWORD
+        sync: false   # set in Render dashboard on first deploy, then remove
+      - key: SEED_FIRM_NAME
+        sync: false   # set in Render dashboard on first deploy
+      - key: ALLOWED_ORIGIN
+        sync: false   # set to https://crm.phillipacevedo.com after DNS setup
+      - key: DT_URL
+        value: https://dt.phillipacevedo.com
+      - key: SPV_URL
+        value: https://spv.phillipacevedo.com
+      - key: LB_URL
+        value: https://lb.phillipacevedo.com

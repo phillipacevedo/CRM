@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CRM — Sign in</title>
+<style>
+:root{--navy:#0f1f3d;--navy-light:#1a2f55;--gold:#c9a227;--gold-bg:#fdf8ea;--cream:#faf9f6;--border:#e2e0d8;--red:#b83232;--text:#1a1916;--text-muted:#5a5850;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Inter','Segoe UI',sans-serif;color:var(--text);background:linear-gradient(135deg,#0f1f3d 0%,#1a2f55 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.login-card{background:#fff;border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.3);width:100%;max-width:420px;overflow:hidden}
+.login-head{background:var(--navy);color:#fff;padding:32px 36px;text-align:center;position:relative}
+.login-head::after{content:'';position:absolute;bottom:-1px;left:0;right:0;height:3px;background:linear-gradient(90deg,transparent,var(--gold),transparent)}
+.login-head h1{font-size:26px;font-weight:700;letter-spacing:-.5px;margin-bottom:4px}
+.login-head p{font-size:13px;color:rgba(255,255,255,.65)}
+.login-body{padding:32px 36px}
+.field{margin-bottom:16px}
+.field label{display:block;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+.field input{width:100%;padding:10px 12px;border:1.5px solid var(--border);border-radius:8px;font-size:14px;outline:none;transition:border-color .15s}
+.field input:focus{border-color:var(--navy)}
+.btn{display:block;width:100%;padding:11px;background:var(--navy);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:background .15s}
+.btn:hover{background:var(--navy-light)}
+.btn:disabled{opacity:.6;cursor:not-allowed}
+.btn-gold{background:var(--gold);color:var(--navy);margin-top:8px}
+.btn-gold:hover{filter:brightness(.95);background:var(--gold)}
+.err{background:#fce8e8;color:var(--red);padding:10px;border-radius:6px;font-size:13px;margin-bottom:16px;display:none}
+.err.show{display:block}
+.links{text-align:center;margin-top:18px;font-size:12.5px;color:var(--text-muted)}
+.links a{color:var(--navy);text-decoration:none;font-weight:600}
+.links a:hover{text-decoration:underline}
+.app-switcher{display:flex;justify-content:center;gap:8px;padding:14px;background:var(--cream);border-top:1px solid var(--border);font-size:11px}
+.app-switcher a{color:var(--text-muted);text-decoration:none;padding:4px 10px;border-radius:4px;letter-spacing:.5px;font-weight:700}
+.app-switcher a:hover{background:#fff;color:var(--navy)}
+.loader{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="login-card">
+  <div class="login-head">
+    <h1>CRM</h1>
+    <p>Clients · Prospects · Industry contacts</p>
+  </div>
+  <div class="login-body">
+    <div id="err" class="err"></div>
+    <form id="login-form">
+      <div class="field">
+        <label for="email">Email</label>
+        <input id="email" type="email" autocomplete="username" required autofocus>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" required>
+      </div>
+      <button id="login-btn" class="btn" type="submit">Sign in</button>
+    </form>
+    <div class="links">
+      <a href="#" id="forgot">Forgot password?</a>
+    </div>
+  </div>
+  <div class="app-switcher">
+    <a href="https://dt.phillipacevedo.com">DealTracker</a>
+    <a href="https://lb.phillipacevedo.com">Leaderboard</a>
+    <a href="https://spv.phillipacevedo.com">SPV Tracker</a>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const err = $('#err');
+function showErr(m) { err.textContent = m; err.classList.add('show'); }
+function hideErr() { err.classList.remove('show'); }
+
+// If already logged in, jump straight to /app
+fetch('/api/auth/me', { credentials: 'include' }).then(r => { if (r.ok) window.location.href = '/app'; });
+
+// Accept inbound SSO token from DT/SPVT
+(async function ssoIfQuerystring() {
+  const p = new URLSearchParams(location.search);
+  const tok = p.get('ssoToken'); const src = p.get('src');
+  if (!tok || !src) return;
+  const endpoint = { dt: '/api/auth/dt-exchange', spv: '/api/auth/spv-exchange' }[src];
+  if (!endpoint) return;
+  try {
+    const r = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify({ token: tok }) });
+    if (r.ok) window.location.href = '/app';
+  } catch(e) {}
+})();
+
+$('#login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  hideErr();
+  const btn = $('#login-btn');
+  btn.disabled = true; btn.innerHTML = '<span class="loader"></span>';
+  try {
+    const r = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ email: $('#email').value, password: $('#password').value }),
+    });
+    const d = await r.json();
+    if (!r.ok) { showErr(d.error || 'Sign-in failed'); btn.disabled = false; btn.textContent = 'Sign in'; return; }
+    window.location.href = '/app';
+  } catch(e) { showErr('Network error'); btn.disabled = false; btn.textContent = 'Sign in'; }
+});
+
+$('#forgot').addEventListener('click', async (e) => {
+  e.preventDefault();
+  const email = prompt('Enter your email to receive a reset link:');
+  if (!email) return;
+  await fetch('/api/auth/forgot-password', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email }),
+  });
+  alert('If an account exists for that email, a reset link has been sent.');
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Accept invite — CRM</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,'Inter',sans-serif;background:linear-gradient(135deg,#0f1f3d,#1a2f55);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;margin:0}
+.card{background:#fff;border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.3);width:100%;max-width:440px;padding:36px}
+h1{color:#0f1f3d;margin-bottom:4px}
+.sub{color:#5a5850;margin-bottom:20px;font-size:14px}
+.sub strong{color:#0f1f3d}
+label{display:block;font-size:11px;font-weight:700;color:#5a5850;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;margin-top:12px}
+input{width:100%;padding:10px 12px;border:1.5px solid #e2e0d8;border-radius:8px;font-size:14px;outline:none;box-sizing:border-box}
+button{width:100%;padding:11px;background:#0f1f3d;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;margin-top:20px}
+.err{background:#fce8e8;color:#b83232;padding:10px;border-radius:6px;font-size:13px;margin-bottom:16px;display:none}
+.show{display:block}
+.row{display:flex;gap:10px}.row>*{flex:1}
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <h1>Accept invite</h1>
+  <div class="sub" id="sub">Loading…</div>
+  <div id="err" class="err"></div>
+  <form id="f" style="display:none">
+    <div class="row">
+      <div><label>First name</label><input id="first" required></div>
+      <div><label>Last name</label><input id="last" required></div>
+    </div>
+    <label>Password (min 8)</label><input id="pw" type="password" required>
+    <button type="submit">Create my account</button>
+  </form>
+</div>
+<script>
+const token = new URLSearchParams(location.search).get('token');
+async function load() {
+  if (!token) { document.getElementById('sub').textContent = 'Missing token.'; return; }
+  try {
+    const r = await fetch('/api/auth/invite-info?token=' + encodeURIComponent(token));
+    const d = await r.json();
+    if (!r.ok) { document.getElementById('sub').textContent = d.error || 'Invite invalid.'; return; }
+    document.getElementById('sub').innerHTML = `You're invited to join <strong>${d.firmName}</strong> as <strong>${d.role}</strong> (${d.email}).`;
+    document.getElementById('f').style.display = 'block';
+  } catch(e) { document.getElementById('sub').textContent = 'Network error.'; }
+}
+load();
+document.getElementById('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = { token, firstName: document.getElementById('first').value, lastName: document.getElementById('last').value, password: document.getElementById('pw').value };
+  const r = await fetch('/api/auth/accept-invite', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify(body) });
+  const d = await r.json();
+  if (!r.ok) { document.getElementById('err').textContent = d.error || 'Failed'; document.getElementById('err').classList.add('show'); return; }
+  window.location.href = '/app';
+});
+</script>
+</body>
+</html>
