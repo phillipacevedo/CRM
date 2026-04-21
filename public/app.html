@@ -195,23 +195,64 @@ table.data .num{text-align:right;font-variant-numeric:tabular-nums}
 .close-btn:hover{color:var(--text)}
 
 /* Kanban */
-.kanban{display:flex;gap:12px;overflow-x:auto;padding:4px 0;min-height:60vh}
+.kanban{display:flex;gap:14px;overflow-x:auto;padding:4px 0;min-height:60vh;scroll-padding:10px}
 .kanban-col{
-  flex-shrink:0;width:260px;background:#f4f3ee;border-radius:8px;padding:10px;
+  flex-shrink:0;width:288px;background:#f4f3ee;border-radius:10px;padding:10px;
   display:flex;flex-direction:column;max-height:calc(100vh - 180px);
+  border:1px solid transparent;transition:border-color .15s;
 }
-.kanban-col h4{font-size:12px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;padding:6px 4px;display:flex;justify-content:space-between}
-.kanban-col h4 .count{background:#fff;color:var(--text-muted);padding:1px 7px;border-radius:10px;font-size:11px}
-.kanban-cards{flex:1;overflow-y:auto;padding:4px;display:flex;flex-direction:column;gap:6px}
+.kanban-col-header{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  padding:6px 4px 10px;border-bottom:1px solid rgba(0,0,0,0.06);margin-bottom:8px;position:sticky;top:0;background:#f4f3ee;z-index:1;
+}
+.kanban-col-header .title{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:700;color:var(--text);text-transform:uppercase;letter-spacing:.5px}
+.kanban-col-header .title .dot{width:8px;height:8px;border-radius:50%;background:var(--navy);flex-shrink:0}
+.kanban-col-header .count{background:#fff;color:var(--text-muted);padding:2px 9px;border-radius:10px;font-size:11px;font-weight:600}
+.kanban-cards{flex:1;overflow-y:auto;padding:2px;display:flex;flex-direction:column;gap:8px}
 .kanban-card{
-  background:#fff;border:1px solid var(--border);border-radius:6px;padding:10px 12px;
-  font-size:12.5px;cursor:grab;transition:box-shadow .15s;
+  background:#fff;border:1px solid var(--border);border-left:3px solid var(--navy);border-radius:7px;padding:10px 12px;
+  font-size:12.5px;cursor:grab;transition:box-shadow .15s,transform .15s,border-color .15s;
 }
-.kanban-card:hover{box-shadow:var(--shadow)}
+.kanban-card:hover{box-shadow:var(--shadow-md);transform:translateY(-1px)}
 .kanban-card.dragging{opacity:.5}
-.kanban-card .name{font-weight:600;margin-bottom:3px}
-.kanban-card .company{color:var(--text-muted);font-size:11.5px}
-.kanban-col.drag-over{background:#e8e6dc;outline:2px dashed var(--gold)}
+.kanban-card.overdue{border-left-color:var(--red)}
+.kanban-card.soon{border-left-color:var(--gold)}
+.kanban-card .card-head{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.kanban-card .card-head .name{font-weight:600;color:var(--text);font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kanban-card .company{color:var(--text-muted);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kanban-card .card-meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px}
+.kanban-card .card-meta .due{font-size:11px;font-weight:500}
+.kanban-card .card-meta .chip{font-size:10.5px;color:var(--text-muted);background:var(--cream);padding:1px 7px;border-radius:10px;max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kanban-card .card-tags{display:flex;gap:4px;flex-wrap:wrap;margin-top:5px}
+.kanban-col.drag-over{background:#e8e6dc;outline:2px dashed var(--gold);border-color:var(--gold)}
+
+/* Shared contact-row visuals (used by contacts + clients tables) */
+.avatar{
+  width:32px;height:32px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;
+  font-weight:600;font-size:11.5px;color:#fff;flex-shrink:0;letter-spacing:.3px;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,0.15);
+}
+.contact-cell{display:flex;align-items:center;gap:10px;min-width:0}
+.contact-cell .meta{display:flex;flex-direction:column;min-width:0}
+.contact-cell .meta .name{font-weight:600;color:var(--text);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center;gap:6px}
+.contact-cell .meta .sub{font-size:11.5px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px}
+.contact-info{display:flex;flex-direction:column;gap:2px;min-width:0}
+.contact-info a{font-size:12.5px;color:var(--navy);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px;display:inline-block}
+.contact-info a:hover{text-decoration:underline}
+.contact-info .phone{font-size:11.5px;color:var(--text-muted);font-variant-numeric:tabular-nums}
+.due-pill{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;font-weight:500;padding:2px 7px;border-radius:10px}
+.due-overdue{background:var(--red-bg);color:var(--red)}
+.due-today{background:var(--gold-bg);color:#7a6119}
+.due-soon{background:#fff4d6;color:#7a6119}
+.due-future{background:var(--gray-bg);color:var(--text-muted)}
+.tag-row{display:flex;gap:4px;flex-wrap:wrap;align-items:center;max-width:180px}
+.tag-more{font-size:10.5px;color:var(--text-muted);background:transparent;padding:2px 4px}
+.priv-lock{color:var(--red);font-size:11px;font-weight:600;letter-spacing:.3px}
+
+/* Client-specific subtle indicator on row */
+table.data.contacts tbody tr.is-client td:first-child{box-shadow:inset 3px 0 0 var(--green)}
+
+.muted-cell{color:var(--text-muted)}
 
 /* Detail pane */
 .detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-bottom:24px}
@@ -778,6 +819,7 @@ const CONTACT_SORT_KEY = {
   email:       c => (c.email || '').toLowerCase(),
   owner:       c => (c.owner_email || '').toLowerCase(),
   next_action: c => c.next_action_at || '',
+  client_since: c => c.client_since || '',
 };
 
 function sortContactRows(rows, sort, dir) {
@@ -828,14 +870,59 @@ function applyClientFilters() {
   wrap.appendChild(buildContactsTable(rows, {
     sort: cv.sort, dir: cv.dir,
     onChange: (key) => { toggleContactSort(cv, key); applyClientFilters(); },
-  }));
+  }, { showType: false, showClientSince: true }));
   const count = $('#clients-count');
   if (count) count.textContent = `${rows.length} client${rows.length === 1 ? '' : 's'}`;
 }
 
-function buildContactsTable(rows, sortState) {
+// Shared helpers — also used by the kanban and detail views
+const INITIALS_PALETTE = ['#1e3a5f','#4a5d7e','#7a4a0a','#3a6a1a','#8a3a3a','#3a2a8a','#1a6a7a','#6a3a6a','#4a5f2a','#5a3a2a'];
+function contactInitials(c) {
+  const src = c.full_name || c.company_name || c.email || '?';
+  const parts = src.trim().split(/\s+/).slice(0, 2);
+  return parts.map(p => p[0]).join('').toUpperCase() || '?';
+}
+function contactAvatarColor(c) {
+  const src = (c.id || c.full_name || c.email || '').toString();
+  let h = 0; for (let i = 0; i < src.length; i++) h = (h * 31 + src.charCodeAt(i)) >>> 0;
+  return INITIALS_PALETTE[h % INITIALS_PALETTE.length];
+}
+function avatarEl(c) {
+  return el('div', { class: 'avatar', style: 'background:' + contactAvatarColor(c) }, contactInitials(c));
+}
+// Classify a YYYY-MM-DD date relative to today → CSS class + label.
+function dueClassAndLabel(isoDate) {
+  if (!isoDate) return null;
+  const today = new Date(); today.setHours(0,0,0,0);
+  const d = new Date(isoDate);
+  if (isNaN(d)) return null;
+  d.setHours(0,0,0,0);
+  const diff = Math.round((d - today) / 86400000);
+  const label = fmt.mdy(isoDate);
+  if (diff < 0) return { cls: 'due-overdue', label, rel: `${-diff}d overdue` };
+  if (diff === 0) return { cls: 'due-today',  label, rel: 'today' };
+  if (diff <= 3)  return { cls: 'due-soon',   label, rel: `in ${diff}d` };
+  if (diff <= 14) return { cls: 'due-future', label, rel: `in ${diff}d` };
+  return { cls: 'due-future', label };
+}
+function duePill(isoDate, nextAction) {
+  const info = dueClassAndLabel(isoDate);
+  if (!info) return el('span', { class: 'muted-cell' }, '—');
+  return el('div', { style: 'display:flex;flex-direction:column;gap:3px;min-width:0' }, [
+    el('span', { class: 'due-pill ' + info.cls, title: info.rel || '' }, [
+      info.label,
+      info.rel ? el('span', { style: 'opacity:.7' }, ' · ' + info.rel) : null,
+    ]),
+    nextAction ? el('span', { style: 'font-size:11.5px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px' }, nextAction) : null,
+  ]);
+}
+
+function buildContactsTable(rows, sortState, opts = {}) {
   if (rows.length === 0) return el('div', { class: 'card empty' }, 'No contacts match. Add one to get started.');
   const editable = can('editContacts');
+  const showTypeCol = opts.showType !== false; // clients-only view hides this
+  const showClientSinceCol = !!opts.showClientSince;
+
   const th = (key, label, extra) => {
     if (!sortState) return el('th', extra || {}, label);
     const arrow = sortState.sort === key ? (sortState.dir === 'asc' ? ' ▲' : ' ▼') : '';
@@ -846,27 +933,56 @@ function buildContactsTable(rows, sortState) {
       onclick: () => sortState.onChange(key),
     }, label + arrow);
   };
-  const tbl = el('table', { class: 'data' }, [
+
+  const tbl = el('table', { class: 'data contacts' }, [
     el('thead', {}, el('tr', {}, [
-      th('name', 'Name'), th('type', 'Type'), th('company', 'Company'), th('email', 'Email'),
-      th('owner', 'Owner'), th('next_action', 'Next action'),
+      th('name', 'Name'),
+      showTypeCol ? th('type', 'Type') : null,
+      th('company', 'Company'),
+      el('th', {}, 'Contact'),
+      th('owner', 'Owner'),
+      showClientSinceCol ? th('client_since', 'Client since') : null,
+      th('next_action', 'Next action'),
       el('th', {}, 'Tags'),
-      editable ? el('th', { style: 'width:80px' }, '') : null,
+      editable ? el('th', { style: 'width:88px' }, '') : null,
     ])),
-    el('tbody', {}, rows.map(c => el('tr', { onclick: () => openContact(c.id) }, [
-      el('td', {}, [ el('strong', {}, c.full_name || '—'), c.privilege ? el('span', { style: 'color:var(--red);margin-left:6px;font-size:11px' }, '🔒 PRIV') : null ]),
-      el('td', {}, el('span', { class: 'badge badge-' + c.type }, (CONTACT_TYPES.find(t => t.id === c.type)?.label || c.type))),
-      el('td', {}, c.company_name || '—'),
-      el('td', {}, c.email ? el('a', { href: 'mailto:' + c.email }, c.email) : '—'),
-      el('td', {}, c.owner_email || '—'),
-      el('td', {}, c.next_action_at ? [ el('div', { style: 'font-size:12px' }, fmt.date(c.next_action_at)), el('div', { style: 'color:var(--text-muted);font-size:11.5px' }, c.next_action || '') ] : '—'),
-      el('td', {}, [
-        (c.tags || []).slice(0, 2).map(t => el('span', { class: 'tag' }, t)),
-      ]),
-      editable ? el('td', { onclick: (ev) => ev.stopPropagation() }, [
-        el('button', { class: 'btn btn-ghost btn-sm', onclick: () => openContactForm(c) }, 'Edit'),
-      ]) : null,
-    ]))),
+    el('tbody', {}, rows.map(c => {
+      const typeLabel = CONTACT_TYPES.find(t => t.id === c.type)?.label || c.type;
+      const ownerShort = (c.owner_email || '').split('@')[0];
+      const tags = c.tags || [];
+      return el('tr', {
+        class: c.type === 'client' ? 'is-client' : '',
+        onclick: () => openContact(c.id),
+      }, [
+        el('td', { style: 'min-width:220px' }, el('div', { class: 'contact-cell' }, [
+          avatarEl(c),
+          el('div', { class: 'meta' }, [
+            el('div', { class: 'name' }, [
+              c.full_name || '—',
+              c.privilege ? el('span', { class: 'priv-lock', title: 'Privileged / confidential' }, ' 🔒') : null,
+            ]),
+            c.title ? el('div', { class: 'sub' }, c.title) : null,
+          ]),
+        ])),
+        showTypeCol ? el('td', {}, el('span', { class: 'badge badge-' + c.type }, typeLabel)) : null,
+        el('td', {}, c.company_name || el('span', { class: 'muted-cell' }, '—')),
+        el('td', {}, el('div', { class: 'contact-info' }, [
+          c.email ? el('a', { href: 'mailto:' + c.email, onclick: (e) => e.stopPropagation(), title: c.email }, c.email) : null,
+          c.phone ? el('span', { class: 'phone' }, c.phone) : null,
+          !c.email && !c.phone ? el('span', { class: 'muted-cell' }, '—') : null,
+        ])),
+        el('td', {}, ownerShort ? el('span', { title: c.owner_email, style: 'font-size:12.5px' }, ownerShort) : el('span', { class: 'muted-cell' }, '—')),
+        showClientSinceCol ? el('td', {}, c.client_since ? el('span', { style: 'font-size:12.5px' }, fmt.mdy(c.client_since)) : el('span', { class: 'muted-cell' }, '—')) : null,
+        el('td', {}, duePill(c.next_action_at, c.next_action)),
+        el('td', {}, el('div', { class: 'tag-row' }, [
+          ...tags.slice(0, 3).map(t => el('span', { class: 'tag' }, t)),
+          tags.length > 3 ? el('span', { class: 'tag-more', title: tags.slice(3).join(', ') }, '+' + (tags.length - 3)) : null,
+        ])),
+        editable ? el('td', { onclick: (ev) => ev.stopPropagation() }, [
+          el('button', { class: 'btn btn-ghost btn-sm', onclick: () => openContactForm(c) }, 'Edit'),
+        ]) : null,
+      ]);
+    })),
   ]);
   return tbl;
 }
@@ -1563,8 +1679,13 @@ async function renderPipeline(mount) {
     actions.appendChild(el('button', { class: 'btn btn-primary btn-sm', onclick: () => openContactForm({ type: 'prospect' }) }, '+ New prospect'));
   }
 
+  // Stable, distinct color per stage for the header dot + card accent
+  const stageColors = ['#1e3a5f','#4a5d7e','#7a6119','#3a6a1a','#8a3a3a','#3a2a8a','#1a6a7a','#6a3a6a'];
+  const colorFor = (idx) => stageColors[idx % stageColors.length];
+
   const kanban = el('div', { class: 'kanban' });
-  stages.forEach(stage => {
+  stages.forEach((stage, idx) => {
+    const stageColor = colorFor(idx);
     const cards = prospects.filter(p => (p.pipeline_stage || stages[0].id) === stage.id);
     const col = el('div', { class: 'kanban-col', 'data-stage': stage.id,
       ondragover: (e) => { e.preventDefault(); col.classList.add('drag-over'); },
@@ -1577,17 +1698,46 @@ async function renderPipeline(mount) {
         navigate('pipeline');
       },
     }, [
-      el('h4', {}, [ document.createTextNode(stage.label), el('span', { class: 'count' }, String(cards.length)) ]),
-      el('div', { class: 'kanban-cards' }, cards.map(c => el('div', {
-        class: 'kanban-card', draggable: 'true',
-        ondragstart: (e) => { e.dataTransfer.setData('text/plain', c.id); e.currentTarget.classList.add('dragging'); },
-        ondragend: (e) => e.currentTarget.classList.remove('dragging'),
-        onclick: () => openContact(c.id),
-      }, [
-        el('div', { class: 'name' }, c.full_name || '—'),
-        c.company_name ? el('div', { class: 'company' }, c.company_name) : null,
-        c.next_action_at ? el('div', { style: 'margin-top:4px;font-size:11px;color:var(--text-muted)' }, '⏰ ' + fmt.date(c.next_action_at)) : null,
-      ]))),
+      el('div', { class: 'kanban-col-header' }, [
+        el('div', { class: 'title' }, [
+          el('span', { class: 'dot', style: 'background:' + stageColor }),
+          stage.label,
+        ]),
+        el('span', { class: 'count' }, String(cards.length)),
+      ]),
+      el('div', { class: 'kanban-cards' }, cards.length === 0
+        ? [ el('div', { style: 'font-size:11.5px;color:var(--text-muted);padding:12px 6px;text-align:center;font-style:italic' }, 'Drop here') ]
+        : cards.map(c => {
+          const info = dueClassAndLabel(c.next_action_at);
+          const accentCls = info && (info.cls === 'due-overdue' ? 'overdue' : (info.cls === 'due-today' ? 'soon' : ''));
+          const tags = c.tags || [];
+          const ownerShort = (c.owner_email || '').split('@')[0];
+          return el('div', {
+            class: 'kanban-card' + (accentCls ? ' ' + accentCls : ''),
+            style: accentCls ? '' : 'border-left-color:' + stageColor,
+            draggable: 'true',
+            ondragstart: (e) => { e.dataTransfer.setData('text/plain', c.id); e.currentTarget.classList.add('dragging'); },
+            ondragend: (e) => e.currentTarget.classList.remove('dragging'),
+            onclick: () => openContact(c.id),
+          }, [
+            el('div', { class: 'card-head' }, [
+              avatarEl(c),
+              el('div', { class: 'name', title: c.full_name || '' }, c.full_name || '—'),
+            ]),
+            c.company_name ? el('div', { class: 'company', title: c.company_name }, c.company_name) : null,
+            (info || ownerShort) ? el('div', { class: 'card-meta' }, [
+              info ? el('span', { class: 'due-pill ' + info.cls, title: info.rel || '' }, [
+                info.label,
+                info.rel ? el('span', { style: 'opacity:.7' }, ' · ' + info.rel) : null,
+              ]) : null,
+              ownerShort ? el('span', { class: 'chip', title: c.owner_email }, ownerShort) : null,
+            ]) : null,
+            tags.length ? el('div', { class: 'card-tags' }, [
+              ...tags.slice(0, 3).map(t => el('span', { class: 'tag' }, t)),
+              tags.length > 3 ? el('span', { class: 'tag-more', title: tags.slice(3).join(', ') }, '+' + (tags.length - 3)) : null,
+            ]) : null,
+          ]);
+        })),
     ]);
     kanban.appendChild(col);
   });

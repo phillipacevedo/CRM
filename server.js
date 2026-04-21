@@ -1909,22 +1909,60 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
     ];
     const rows = [];
     let total = 0;
+    let totalHours = 0;
+    const byTimekeeper = new Map();
     for (const t of timeEntries) {
       const hours = (Number(t.minutes) || 0) / 60;
       const amount = +(hours * (Number(t.rate) || 0)).toFixed(2);
       total += amount;
+      totalHours += hours;
+      const tk = timekeeperName(t) || '(unassigned)';
+      const agg = byTimekeeper.get(tk) || { hours: 0, amount: 0 };
+      agg.hours += hours;
+      agg.amount += amount;
+      byTimekeeper.set(tk, agg);
       rows.push([shortDate(t.date), timekeeperName(t), t.description || '', hours.toFixed(2), fmtMoney(t.rate), fmtMoney(amount)]);
     }
     renderTable(tCols, rows);
 
-    // Footer row
+    // Footer row — total hours + total amount
     y += 4;
     doc.moveTo(PAGE_LEFT, y).lineTo(PAGE_RIGHT, y).strokeColor(accent).lineWidth(1).stroke();
     y += 8;
     doc.font('Helvetica-Bold').fontSize(10).fillColor(accent)
-       .text('Total Professional Services Rendered', PAGE_LEFT, y, { width: tCols[5].x - PAGE_LEFT - 5, align: 'right' });
-    doc.text(fmtMoney(total), tCols[5].x + 5, y, { width: tCols[5].w - 10, align: 'right' });
-    y += 20;
+       .text('Total Professional Services Rendered', PAGE_LEFT, y, { width: tCols[3].x - PAGE_LEFT - 5, align: 'right' });
+    doc.text(totalHours.toFixed(2), tCols[3].x + 5, y, { width: tCols[3].w - 10, align: 'right' });
+    doc.text(fmtMoney(total),       tCols[5].x + 5, y, { width: tCols[5].w - 10, align: 'right' });
+    y += 24;
+
+    // Summary by timekeeper
+    if (byTimekeeper.size > 0) {
+      // Page-break if this section wouldn't have room for a title + at least
+      // a header row and one data row (~80pt).
+      if (y + 80 > PAGE_BOTTOM) {
+        doc.addPage();
+        y = drawHeader(true);
+      }
+      writeTitle('Summary by Timekeeper', 12, 'left');
+      const tkCols = [
+        { label: 'Timekeeper', x: PAGE_LEFT,       w: 300, align: 'left'  },
+        { label: 'Hours',      x: PAGE_LEFT + 300, w: 100, align: 'right' },
+        { label: 'Amount',     x: PAGE_LEFT + 400, w: 112, align: 'right' },
+      ];
+      const tkRows = [...byTimekeeper.entries()]
+        .sort((a, b) => b[1].amount - a[1].amount)
+        .map(([name, v]) => [name, v.hours.toFixed(2), fmtMoney(v.amount)]);
+      renderTable(tkCols, tkRows);
+
+      y += 4;
+      doc.moveTo(PAGE_LEFT, y).lineTo(PAGE_RIGHT, y).strokeColor(accent).lineWidth(1).stroke();
+      y += 8;
+      doc.font('Helvetica-Bold').fontSize(10).fillColor(accent)
+         .text('Total', PAGE_LEFT, y, { width: tkCols[1].x - PAGE_LEFT - 5, align: 'right' });
+      doc.text(totalHours.toFixed(2), tkCols[1].x + 5, y, { width: tkCols[1].w - 10, align: 'right' });
+      doc.text(fmtMoney(total),       tkCols[2].x + 5, y, { width: tkCols[2].w - 10, align: 'right' });
+      y += 20;
+    }
   }
 
   // ═══ Expense detail ═════════════════════════════════════════════════════
