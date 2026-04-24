@@ -144,6 +144,73 @@ const forgotPasswordLimiter = rateLimit({
   message: { error: 'Too many reset requests. Try again later.' },
 });
 
+// ── PAYMENT-SECRET ENCRYPTION (Stripe keys, Mercury token) ──────────────
+// AES-256-GCM keyed off PAYMENTS_KEK (base64, 32 bytes). If the KEK is missing,
+// `paymentsEnabled` stays false and config endpoints refuse to save credentials.
+// Storage format: base64(iv|authTag|ciphertext). IV is 12 bytes, tag is 16.
+let PAYMENTS_KEK_BUF = null;
+let paymentsEnabled = false;
+if (process.env.PAYMENTS_KEK) {
+  try {
+    const buf = Buffer.from(process.env.PAYMENTS_KEK, 'base64');
+    if (buf.length !== 32) throw new Error(`PAYMENTS_KEK must decode to 32 bytes (got ${buf.length})`);
+    PAYMENTS_KEK_BUF = buf;
+    paymentsEnabled = true;
+  } catch (e) {
+    console.error('WARN: PAYMENTS_KEK invalid — payment features disabled.', e.message);
+  }
+} else {
+  console.log('[payments] PAYMENTS_KEK not set — payment features disabled. Generate with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64\'))"');
+}
+function encryptSecret(plain) {
+  if (!PAYMENTS_KEK_BUF) throw new Error('PAYMENTS_KEK not configured');
+  if (plain == null || plain === '') return null;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', PAYMENTS_KEK_BUF, iv);
+  const ct = Buffer.concat([cipher.update(String(plain), 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, ct]).toString('base64');
+}
+function decryptSecret(stored) {
+  if (!PAYMENTS_KEK_BUF) throw new Error('PAYMENTS_KEK not configured');
+  if (!stored) return null;
+  const buf = Buffer.from(stored, 'base64');
+  if (buf.length < 28) throw new Error('Ciphertext too short');
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(12, 28);
+  const ct = buf.subarray(28);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', PAYMENTS_KEK_BUF, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8');
+}
+// Masks secret keys for read endpoints — show only the last 4 chars.
+function maskSecret(s) {
+  if (!s) return null;
+  const str = String(s);
+  return str.length <= 4 ? '••••' : '••••' + str.slice(-4);
+}
+
+// Stripe SDK is loaded lazily so the server boots even if `stripe` is not installed.
+let stripeSdk = null;
+try { stripeSdk = require('stripe'); }
+catch { console.log('[payments] stripe npm package not installed — pay-link endpoints will return 503'); }
+
+// Returns a Stripe client scoped to a firm's stored secret key. Throws with a
+// status-tagged error so routes can forward the status code directly.
+function getStripeClient(firmId) {
+  if (!stripeSdk) throw Object.assign(new Error('Stripe SDK is not installed on the server'), { status: 503 });
+  if (!paymentsEnabled) throw Object.assign(new Error('PAYMENTS_KEK is not configured on the server'), { status: 503 });
+  const row = db.prepare('SELECT stripe_secret_key, stripe_publishable, stripe_webhook_secret FROM firm_payment_config WHERE firm_id = ?').get(firmId);
+  if (!row || !row.stripe_secret_key) throw Object.assign(new Error('Stripe is not connected for this firm. Configure it in Settings → Payments.'), { status: 503 });
+  const sk = decryptSecret(row.stripe_secret_key);
+  if (!sk) throw Object.assign(new Error('Stripe secret key could not be decrypted'), { status: 500 });
+  return {
+    client:        stripeSdk(sk, { apiVersion: '2024-06-20' }),
+    publishable:   row.stripe_publishable || '',
+    webhookSecret: row.stripe_webhook_secret ? decryptSecret(row.stripe_webhook_secret) : null,
+  };
+}
+
 // ── DATABASE SETUP ──────────────────────────────────────────────────────
 const dbDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
@@ -358,9 +425,11 @@ db.exec(`
     created_at   TEXT DEFAULT (datetime('now'))
   );
 
-  -- Live timers: one active timer per user. Row exists only while running/paused.
+  -- Live timers: a user can have multiple concurrent timers (e.g. one per matter).
+  -- Each row exists only while running/paused; stop commits to time_entries and deletes the row.
   CREATE TABLE IF NOT EXISTS timers (
-    user_email          TEXT PRIMARY KEY REFERENCES users(email) ON DELETE CASCADE,
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_email          TEXT NOT NULL REFERENCES users(email) ON DELETE CASCADE,
     firm_id             TEXT NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
     matter_id           TEXT REFERENCES matters(id) ON DELETE CASCADE,
     description         TEXT,
@@ -417,6 +486,75 @@ db.exec(`
     uploaded_by  TEXT NOT NULL,
     created_at   TEXT DEFAULT (datetime('now'))
   );
+
+  -- ── PAYMENTS & BANK RECONCILIATION ──────────────────────────────────
+  -- See PAYMENTS_DESIGN.md for the full design. Secrets are encrypted with
+  -- PAYMENTS_KEK (AES-256-GCM). Storing them is refused when KEK is missing.
+  CREATE TABLE IF NOT EXISTS firm_payment_config (
+    firm_id                      TEXT PRIMARY KEY REFERENCES firms(id) ON DELETE CASCADE,
+    stripe_account_id            TEXT,
+    stripe_secret_key            TEXT,   -- encrypted
+    stripe_publishable           TEXT,
+    stripe_webhook_secret        TEXT,   -- encrypted
+    mercury_token                TEXT,   -- encrypted
+    mercury_operating_account_id TEXT,
+    mercury_trust_account_id     TEXT,
+    ach_enabled                  INTEGER DEFAULT 1,
+    card_enabled                 INTEGER DEFAULT 1,
+    updated_at                   TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS invoice_payments (
+    id                       TEXT PRIMARY KEY,
+    firm_id                  TEXT NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
+    invoice_id               TEXT REFERENCES invoices(id) ON DELETE SET NULL,
+    client_contact_id        TEXT REFERENCES contacts(id) ON DELETE SET NULL,
+    destination              TEXT NOT NULL,   -- 'operating' | 'trust'
+    amount                   REAL NOT NULL,
+    currency                 TEXT DEFAULT 'usd',
+    method                   TEXT,            -- stripe_card|stripe_ach|wire|check|manual
+    status                   TEXT NOT NULL,   -- pending|succeeded|failed|refunded
+    stripe_payment_intent_id TEXT UNIQUE,
+    stripe_charge_id         TEXT,
+    mercury_txn_id           TEXT UNIQUE,
+    trust_ledger_id          TEXT REFERENCES trust_ledger(id) ON DELETE SET NULL,
+    occurred_at              TEXT,
+    raw_json                 TEXT,
+    created_at               TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS payment_links (
+    token        TEXT PRIMARY KEY,
+    firm_id      TEXT NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
+    invoice_id   TEXT REFERENCES invoices(id) ON DELETE CASCADE,
+    destination  TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    expires_at   TEXT,
+    used_at      TEXT,
+    created_by   TEXT,
+    created_at   TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS bank_transactions (
+    id                    TEXT PRIMARY KEY,   -- Mercury's transaction id
+    firm_id               TEXT NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
+    account_id            TEXT NOT NULL,
+    account_role          TEXT,               -- 'operating' | 'trust'
+    amount                REAL NOT NULL,
+    posted_at             TEXT,
+    counterparty          TEXT,
+    memo                  TEXT,
+    external_id           TEXT,
+    reconciled_payment_id TEXT REFERENCES invoice_payments(id) ON DELETE SET NULL,
+    raw_json              TEXT,
+    fetched_at            TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS mercury_sync_state (
+    firm_id        TEXT PRIMARY KEY REFERENCES firms(id) ON DELETE CASCADE,
+    last_synced_at TEXT,
+    last_cursor    TEXT
+  );
 `);
 
 // ── MIGRATIONS (idempotent ALTERs) ──────────────────────────────────────
@@ -441,9 +579,74 @@ const migrations = [
   `ALTER TABLE contacts ADD COLUMN origination_split_pct REAL`,
   `ALTER TABLE contacts ADD COLUMN billing_attorney_email TEXT`,
 ];
+// Only swallow "duplicate column" errors (idempotency). Anything else — syntax
+// typos, missing table, permission issues — is a real problem and should fail
+// loudly at boot rather than silently leave the schema half-applied.
 for (const m of migrations) {
-  try { db.exec(m); } catch(e) { /* column already exists */ }
+  try { db.exec(m); }
+  catch(e) {
+    if (!/duplicate column name/i.test(e.message)) {
+      console.error(`Migration failed: ${m}\n  → ${e.message}`);
+      throw e;
+    }
+  }
+  // Post-check: for each ALTER TABLE ... ADD COLUMN, verify the column really
+  // landed. Belt-and-suspenders against a future change accidentally weakening
+  // the idempotency catch above.
+  const match = m.match(/^ALTER TABLE (\w+) ADD COLUMN (\w+)/i);
+  if (match) {
+    const [, table, column] = match;
+    const has = db.prepare(`SELECT 1 AS ok FROM pragma_table_info(?) WHERE name = ?`).get(table, column);
+    if (!has) { console.error(`Migration post-check failed: ${table}.${column} missing after ALTER`); throw new Error(`Migration post-check: ${table}.${column} not applied`); }
+  }
 }
+
+// Multi-timer migration: the original timers table had user_email as PRIMARY KEY
+// (one row per user). Detect that and rebuild with id as PK so one user can hold
+// several concurrent timers.
+try {
+  const hasIdCol = db.prepare(`SELECT 1 AS ok FROM pragma_table_info('timers') WHERE name = 'id'`).get();
+  if (!hasIdCol) {
+    db.exec(`
+      CREATE TABLE timers_new (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_email          TEXT NOT NULL REFERENCES users(email) ON DELETE CASCADE,
+        firm_id             TEXT NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
+        matter_id           TEXT REFERENCES matters(id) ON DELETE CASCADE,
+        description         TEXT,
+        started_at          TEXT,
+        accumulated_seconds INTEGER DEFAULT 0,
+        created_at          TEXT DEFAULT (datetime('now'))
+      );
+      INSERT INTO timers_new (user_email, firm_id, matter_id, description, started_at, accumulated_seconds, created_at)
+        SELECT user_email, firm_id, matter_id, description, started_at, accumulated_seconds, created_at FROM timers;
+      DROP TABLE timers;
+      ALTER TABLE timers_new RENAME TO timers;
+    `);
+  }
+} catch(e) { console.error('Timer multi-row migration failed:', e.message); }
+
+// Backfill: any contact with a NULL owner_email gets the contact's created_by,
+// falling back to the firm's first admin email. Staff visibility depends on
+// owner_email being set (see visibleContactWhere), so a NULL here would make
+// the contact invisible to non-admins. One-time fix; the write paths now
+// guarantee owner_email is always set.
+try {
+  const nulls = db.prepare(`SELECT id, firm_id, created_by FROM contacts WHERE owner_email IS NULL OR owner_email = ''`).all();
+  if (nulls.length) {
+    const adminForFirm = db.prepare(`SELECT email FROM users WHERE firm_id = ? AND is_admin = 1 AND active = 1 ORDER BY email LIMIT 1`);
+    const update = db.prepare(`UPDATE contacts SET owner_email = ? WHERE id = ?`);
+    let fixed = 0;
+    for (const row of nulls) {
+      const fallback = (row.created_by && String(row.created_by).toLowerCase().trim())
+                    || adminForFirm.get(row.firm_id)?.email
+                    || null;
+      if (fallback) { update.run(fallback, row.id); fixed++; }
+    }
+    if (fixed) console.log(`[migration] Backfilled owner_email on ${fixed}/${nulls.length} contacts.`);
+    else if (nulls.length) console.warn(`[migration] ${nulls.length} contacts have NULL owner_email and no resolvable fallback — inspect manually.`);
+  }
+} catch(e) { console.error('owner_email backfill failed:', e.message); }
 
 // ── INDEXES ─────────────────────────────────────────────────────────────
 db.exec(`
@@ -465,6 +668,9 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_time_invoice ON time_entries(invoice_id);
   CREATE INDEX IF NOT EXISTS idx_invoices_firm ON invoices(firm_id);
   CREATE INDEX IF NOT EXISTS idx_invoices_client ON invoices(client_contact_id);
+  -- Covers the outstanding-balance subquery on the invoice PDF route
+  -- (WHERE firm_id = ? AND client_contact_id = ? AND status = 'sent').
+  CREATE INDEX IF NOT EXISTS idx_invoices_client_status ON invoices(firm_id, client_contact_id, status);
   CREATE INDEX IF NOT EXISTS idx_invoice_lines_invoice ON invoice_lines(invoice_id);
   CREATE INDEX IF NOT EXISTS idx_trust_firm ON trust_ledger(firm_id);
   CREATE INDEX IF NOT EXISTS idx_trust_client ON trust_ledger(client_contact_id);
@@ -476,6 +682,12 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_expenses_invoice ON expenses(invoice_id);
   CREATE INDEX IF NOT EXISTS idx_expense_attachments_expense ON expense_attachments(expense_id);
   CREATE INDEX IF NOT EXISTS idx_token_denylist_expires ON token_denylist(expires_at);
+  CREATE INDEX IF NOT EXISTS idx_timers_user ON timers(user_email);
+  CREATE INDEX IF NOT EXISTS idx_invpay_invoice ON invoice_payments(invoice_id);
+  CREATE INDEX IF NOT EXISTS idx_invpay_firm    ON invoice_payments(firm_id, status);
+  CREATE INDEX IF NOT EXISTS idx_paylinks_invoice ON payment_links(invoice_id);
+  CREATE INDEX IF NOT EXISTS idx_banktx_firm   ON bank_transactions(firm_id, posted_at);
+  CREATE INDEX IF NOT EXISTS idx_banktx_unrec  ON bank_transactions(firm_id) WHERE reconciled_payment_id IS NULL;
 `);
 
 // ── SEED FIRM + ADMIN (first boot only) ─────────────────────────────────
@@ -548,6 +760,156 @@ if (ALLOWED_ORIGIN === '*' && process.env.NODE_ENV === 'production') {
   console.warn('WARNING: ALLOWED_ORIGIN is "*" in production. Set it to your domain.');
 }
 app.use(cors(ALLOWED_ORIGIN === '*' ? {} : { origin: ALLOWED_ORIGIN, credentials: true }));
+
+// ── STRIPE WEBHOOK (raw body; MUST be mounted before express.json) ──────
+// Stripe's signature verification hashes the raw request bytes, so this
+// route reads the body as a Buffer. All other routes below use JSON parsing.
+app.post('/api/pay/stripe-webhook', express.raw({ type: 'application/json', limit: '1mb' }), async (req, res) => {
+  if (!stripeSdk) return res.status(503).send('stripe SDK missing');
+  const sig = req.headers['stripe-signature'];
+  if (!sig) return res.status(400).send('missing signature');
+
+  // Find the firm whose webhook secret verifies this payload. With a single-firm
+  // deployment there is at most one row; iterating keeps this honest for future
+  // multi-firm support and avoids having to trust unsigned payload metadata.
+  let event = null, firmId = null;
+  try {
+    const cfgs = db.prepare(`SELECT firm_id, stripe_webhook_secret FROM firm_payment_config
+                             WHERE stripe_webhook_secret IS NOT NULL`).all();
+    // webhooks.constructEvent is HMAC-only and doesn't hit Stripe's API, but
+    // we still need an SDK instance to access it. Use a syntactically valid
+    // placeholder key so older SDK versions that validate at construction pass.
+    const verifier = stripeSdk('sk_test_placeholder_verification_only');
+    for (const c of cfgs) {
+      let whsec = null;
+      try { whsec = decryptSecret(c.stripe_webhook_secret); }
+      catch (e) {
+        // Almost always means PAYMENTS_KEK was rotated without re-entering the
+        // webhook secret. Left silent, every webhook silently ignores this firm
+        // forever. Log loud and clear so admins notice.
+        console.error(`[stripe-webhook] RECONCILE NEEDED — cannot decrypt webhook secret for firm ${c.firm_id}; re-enter it in Settings → Payments. Error:`, e.message);
+        continue;
+      }
+      if (!whsec) continue;
+      try {
+        event = verifier.webhooks.constructEvent(req.body, sig, whsec);
+        firmId = c.firm_id;
+        break;
+      } catch { /* wrong secret for this firm — try next */ }
+    }
+  } catch (e) {
+    console.error('[stripe-webhook] verification error:', e.message);
+    return res.status(400).send('verification error');
+  }
+  if (!event) return res.status(400).send('signature verification failed');
+
+  try {
+    if (event.type === 'payment_intent.succeeded') {
+      handlePaymentIntentSucceeded(firmId, event.data.object);
+    } else if (event.type === 'payment_intent.payment_failed') {
+      const pi = event.data.object;
+      db.prepare(`UPDATE invoice_payments SET status='failed', raw_json=?
+                  WHERE stripe_payment_intent_id=? AND firm_id=?`)
+        .run(JSON.stringify(pi), pi.id, firmId);
+    } else if (event.type === 'charge.refunded') {
+      handleChargeRefunded(firmId, event.data.object);
+    }
+  } catch (e) {
+    // ACK with 202 instead of 500 so Stripe doesn't retry the same event for 3
+    // days. A bug in our handler won't fix itself on retry; the error lives in
+    // logs for manual reconciliation. Transient DB failures trade automatic
+    // retry for a manual replay — acceptable for a single-firm deployment.
+    console.error('[stripe-webhook] RECONCILE NEEDED — handler error for', event.type, 'eventId=', event.id, 'firmId=', firmId, '—', e.message, e.stack);
+    return res.status(202).send('acked; handler error logged for reconciliation');
+  }
+  res.json({ received: true });
+});
+
+// Webhook event handlers. Kept out of the route body so they can be tested
+// (and so the route stays readable). All DB writes are idempotent — Stripe
+// retries events and the same event may arrive multiple times.
+function handlePaymentIntentSucceeded(firmId, pi) {
+  const existing = db.prepare(
+    'SELECT * FROM invoice_payments WHERE stripe_payment_intent_id = ? AND firm_id = ?'
+  ).get(pi.id, firmId);
+  if (!existing) {
+    console.warn('[webhook] PI succeeded but no invoice_payments row:', pi.id);
+    return;
+  }
+  if (existing.status === 'succeeded') return;
+
+  const charge = pi.charges?.data?.[0] || null;
+  const method = charge?.payment_method_details?.type === 'us_bank_account'
+    ? 'stripe_ach' : 'stripe_card';
+
+  db.transaction(() => {
+    db.prepare(`UPDATE invoice_payments
+                SET status='succeeded', method=?, stripe_charge_id=?,
+                    occurred_at=datetime('now'), raw_json=?
+                WHERE id=?`)
+      .run(method, charge?.id || null, JSON.stringify(pi), existing.id);
+
+    if (existing.destination === 'operating' && existing.invoice_id) {
+      const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?')
+        .get(existing.invoice_id, firmId);
+      if (inv) {
+        const newPaid = Math.round(((inv.amount_paid || 0) + existing.amount) * 100) / 100;
+        const fullyPaid = newPaid >= (inv.total || 0) - 0.005;
+        const newStatus = fullyPaid ? 'paid' : (inv.status === 'draft' ? 'sent' : inv.status);
+        db.prepare(`UPDATE invoices SET amount_paid=?, status=?, updated_at=datetime('now') WHERE id=?`)
+          .run(newPaid, newStatus, inv.id);
+      }
+    } else if (existing.destination === 'trust') {
+      // Trust-destination payments should write a trust_ledger deposit row.
+      // Not yet implemented (step 3 of the payments rollout). Fail loudly so
+      // the 202-on-error webhook path logs a RECONCILE NEEDED entry — the
+      // payment row is already marked succeeded; a human needs to post the
+      // matching trust ledger entry manually until the handler ships.
+      throw new Error(`Trust-destination payment ${existing.id} succeeded but trust_ledger writer is not implemented yet — manual reconciliation required.`);
+    }
+
+    if (existing.invoice_id) {
+      db.prepare(`UPDATE payment_links SET used_at=datetime('now')
+                  WHERE firm_id=? AND invoice_id=? AND used_at IS NULL`)
+        .run(firmId, existing.invoice_id);
+    }
+  })();
+}
+
+function handleChargeRefunded(firmId, ch) {
+  // Full refunds only in step 2. Partial refunds are tracked but don't split
+  // into multiple rows — revisit when the manual refund flow lands (step 6).
+  const row = db.prepare(
+    'SELECT * FROM invoice_payments WHERE stripe_charge_id = ? AND firm_id = ?'
+  ).get(ch.id, firmId);
+  if (!row || row.status === 'refunded') return;
+  const rawRefund = (ch.amount_refunded || 0) / 100;
+  if (rawRefund <= 0) return;
+  // Clamp to the original payment amount. Stripe itself enforces this, but a
+  // replayed/mangled webhook shouldn't be able to push our amount_paid math
+  // into absurd territory. Log if the values disagree so we notice.
+  const refundedAmount = Math.min(rawRefund, row.amount);
+  if (rawRefund > row.amount + 0.005) {
+    console.warn('[webhook] refund amount exceeds original payment — clamping', { chargeId: ch.id, paymentId: row.id, rawRefund, original: row.amount });
+  }
+
+  db.transaction(() => {
+    db.prepare(`UPDATE invoice_payments SET status='refunded', raw_json=? WHERE id=?`)
+      .run(JSON.stringify(ch), row.id);
+    if (row.destination === 'operating' && row.invoice_id) {
+      const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?')
+        .get(row.invoice_id, firmId);
+      if (inv) {
+        const newPaid = Math.max(0, Math.round(((inv.amount_paid || 0) - refundedAmount) * 100) / 100);
+        const shouldReopen = inv.status === 'paid' && newPaid < (inv.total || 0) - 0.005;
+        const newStatus = shouldReopen ? 'sent' : inv.status;
+        db.prepare(`UPDATE invoices SET amount_paid=?, status=?, updated_at=datetime('now') WHERE id=?`)
+          .run(newPaid, newStatus, inv.id);
+      }
+    }
+  })();
+}
+
 app.use(express.json({ limit: '20mb' }));
 app.use(express.static(path.join(__dirname, 'public'), {
   setHeaders(res, filePath) {
@@ -584,6 +946,9 @@ function authRequired(req, res, next) {
     if (payload.jti) {
       const denied = db.prepare('SELECT 1 FROM token_denylist WHERE jti = ?').get(payload.jti);
       if (denied) return res.status(401).json({ error: 'Session revoked. Sign in again.' });
+    }
+    if (payload && typeof payload.email === 'string') {
+      payload.email = payload.email.toLowerCase().trim();
     }
     req.user = payload;
     next();
@@ -947,6 +1312,190 @@ app.delete('/api/firm/logo', authRequired, requireCap('manageFirm'), (req, res) 
 });
 
 // ═══════════════════════════════════════════════════════════════════════
+// PAYMENT CONFIG (Stripe + Mercury credentials per firm)
+// ═══════════════════════════════════════════════════════════════════════
+// GET returns a redacted view — secrets are never sent back in plaintext.
+// PUT accepts partial updates: only fields present in the body are touched.
+// POST /test pings the provider APIs with the currently stored credentials
+// and reports which ones work. Stripe/Mercury calls are issued server-side
+// so the keys never reach the browser.
+
+function readPaymentConfig(firmId) {
+  return db.prepare('SELECT * FROM firm_payment_config WHERE firm_id = ?').get(firmId) || null;
+}
+
+app.get('/api/firm/payments', authRequired, requireCap('manageFirm'), (req, res) => {
+  const row = readPaymentConfig(req.user.firmId);
+  // Show whether the system can even accept payment secrets right now.
+  const resp = {
+    paymentsEnabled,            // PAYMENTS_KEK configured on this server
+    connected: { stripe: false, mercury: false },
+    stripeAccountId:            row?.stripe_account_id || '',
+    stripePublishable:          row?.stripe_publishable || '',
+    stripeSecretKeyMasked:      null,
+    stripeWebhookSecretMasked:  null,
+    mercuryTokenMasked:         null,
+    mercuryOperatingAccountId:  row?.mercury_operating_account_id || '',
+    mercuryTrustAccountId:      row?.mercury_trust_account_id || '',
+    achEnabled:  row ? !!row.ach_enabled  : true,
+    cardEnabled: row ? !!row.card_enabled : true,
+    updatedAt:   row?.updated_at || null,
+  };
+  if (row && paymentsEnabled) {
+    try {
+      const sk = decryptSecret(row.stripe_secret_key);
+      const wh = decryptSecret(row.stripe_webhook_secret);
+      const mt = decryptSecret(row.mercury_token);
+      resp.stripeSecretKeyMasked     = maskSecret(sk);
+      resp.stripeWebhookSecretMasked = maskSecret(wh);
+      resp.mercuryTokenMasked        = maskSecret(mt);
+      resp.connected.stripe  = !!sk;
+      resp.connected.mercury = !!mt;
+    } catch (e) {
+      // If decryption fails the KEK was rotated without re-encrypting rows.
+      console.error('[payments] decrypt failed for firm', req.user.firmId, e.message);
+    }
+  }
+  res.json(resp);
+});
+
+app.put('/api/firm/payments', authRequired, requireCap('manageFirm'), (req, res) => {
+  if (!paymentsEnabled) {
+    return res.status(503).json({ error: 'PAYMENTS_KEK is not configured on the server. Payment credentials cannot be stored.' });
+  }
+  const b = req.body || {};
+  const firmId = req.user.firmId;
+  const cur = readPaymentConfig(firmId);
+
+  // Accept any subset of fields. `null` or empty string clears a field;
+  // undefined leaves it unchanged.
+  const next = {
+    stripe_account_id:            cur?.stripe_account_id ?? null,
+    stripe_secret_key:            cur?.stripe_secret_key ?? null,
+    stripe_publishable:           cur?.stripe_publishable ?? null,
+    stripe_webhook_secret:        cur?.stripe_webhook_secret ?? null,
+    mercury_token:                cur?.mercury_token ?? null,
+    mercury_operating_account_id: cur?.mercury_operating_account_id ?? null,
+    mercury_trust_account_id:     cur?.mercury_trust_account_id ?? null,
+    ach_enabled:  cur ? cur.ach_enabled  : 1,
+    card_enabled: cur ? cur.card_enabled : 1,
+  };
+
+  const setPlain = (field, val) => {
+    if (val === undefined) return;
+    next[field] = (val === null || val === '') ? null : String(val).trim();
+  };
+  const setSecret = (field, val) => {
+    if (val === undefined) return;
+    if (val === null || val === '') { next[field] = null; return; }
+    next[field] = encryptSecret(String(val).trim());
+  };
+
+  setPlain('stripe_account_id',            b.stripeAccountId);
+  setPlain('stripe_publishable',           b.stripePublishable);
+  setPlain('mercury_operating_account_id', b.mercuryOperatingAccountId);
+  setPlain('mercury_trust_account_id',     b.mercuryTrustAccountId);
+  setSecret('stripe_secret_key',           b.stripeSecretKey);
+  setSecret('stripe_webhook_secret',       b.stripeWebhookSecret);
+  setSecret('mercury_token',               b.mercuryToken);
+  if (b.achEnabled  !== undefined) next.ach_enabled  = b.achEnabled  ? 1 : 0;
+  if (b.cardEnabled !== undefined) next.card_enabled = b.cardEnabled ? 1 : 0;
+
+  // Light validation on publishable-key format when provided, to catch paste errors early.
+  if (next.stripe_publishable && !/^pk_(test|live)_/.test(next.stripe_publishable)) {
+    return res.status(400).json({ error: 'Stripe publishable key should start with pk_test_ or pk_live_' });
+  }
+
+  db.prepare(`
+    INSERT INTO firm_payment_config (
+      firm_id, stripe_account_id, stripe_secret_key, stripe_publishable,
+      stripe_webhook_secret, mercury_token, mercury_operating_account_id,
+      mercury_trust_account_id, ach_enabled, card_enabled, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(firm_id) DO UPDATE SET
+      stripe_account_id            = excluded.stripe_account_id,
+      stripe_secret_key            = excluded.stripe_secret_key,
+      stripe_publishable           = excluded.stripe_publishable,
+      stripe_webhook_secret        = excluded.stripe_webhook_secret,
+      mercury_token                = excluded.mercury_token,
+      mercury_operating_account_id = excluded.mercury_operating_account_id,
+      mercury_trust_account_id     = excluded.mercury_trust_account_id,
+      ach_enabled                  = excluded.ach_enabled,
+      card_enabled                 = excluded.card_enabled,
+      updated_at                   = excluded.updated_at
+  `).run(
+    firmId, next.stripe_account_id, next.stripe_secret_key, next.stripe_publishable,
+    next.stripe_webhook_secret, next.mercury_token, next.mercury_operating_account_id,
+    next.mercury_trust_account_id, next.ach_enabled, next.card_enabled
+  );
+  res.json({ ok: true });
+});
+
+// Pings Stripe + Mercury with the stored credentials. Reports which ones
+// are reachable. Requires global fetch (Node 18+); server.js already runs
+// under that requirement. Timeouts keep a bad key from hanging the UI.
+app.post('/api/firm/payments/test', authRequired, requireCap('manageFirm'), async (req, res) => {
+  if (!paymentsEnabled) return res.status(503).json({ error: 'PAYMENTS_KEK not configured' });
+  const row = readPaymentConfig(req.user.firmId);
+  const out = { stripe: { ok: false }, mercury: { ok: false } };
+
+  const timedFetch = async (url, init = {}, ms = 8000) => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), ms);
+    try { return await fetch(url, { ...init, signal: ctrl.signal }); }
+    finally { clearTimeout(t); }
+  };
+
+  // Stripe — hit /v1/account which always works for any valid secret key.
+  try {
+    const sk = row ? decryptSecret(row.stripe_secret_key) : null;
+    if (!sk) { out.stripe.error = 'No Stripe secret key saved'; }
+    else {
+      const r = await timedFetch('https://api.stripe.com/v1/account', {
+        headers: { Authorization: 'Bearer ' + sk },
+      });
+      if (r.ok) {
+        const j = await r.json();
+        out.stripe.ok = true;
+        out.stripe.accountId    = j.id;
+        out.stripe.livemode     = !!j.charges_enabled && !sk.startsWith('sk_test_');
+        out.stripe.displayName  = j.settings?.dashboard?.display_name || j.email || null;
+      } else {
+        const j = await r.json().catch(() => ({}));
+        out.stripe.error = j.error?.message || `HTTP ${r.status}`;
+      }
+    }
+  } catch (e) { out.stripe.error = e.message; }
+
+  // Mercury — list accounts endpoint is the canonical "is this token alive" check.
+  try {
+    const mt = row ? decryptSecret(row.mercury_token) : null;
+    if (!mt) { out.mercury.error = 'No Mercury token saved'; }
+    else {
+      const r = await timedFetch('https://api.mercury.com/api/v1/accounts', {
+        headers: { Authorization: 'Bearer ' + mt, Accept: 'application/json' },
+      });
+      if (r.ok) {
+        const j = await r.json();
+        const accts = Array.isArray(j.accounts) ? j.accounts : (Array.isArray(j) ? j : []);
+        out.mercury.ok = true;
+        out.mercury.accountCount = accts.length;
+        out.mercury.accounts = accts.map(a => ({
+          id:   a.id,
+          name: a.nickname || a.name || a.accountNumber || a.id,
+          kind: a.kind || a.type || null,
+        }));
+      } else {
+        const j = await r.json().catch(() => ({}));
+        out.mercury.error = j.message || j.error || `HTTP ${r.status}`;
+      }
+    }
+  } catch (e) { out.mercury.error = e.message; }
+
+  res.json(out);
+});
+
+// ═══════════════════════════════════════════════════════════════════════
 // CONTACTS
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1021,7 +1570,7 @@ app.post('/api/contacts', authRequired, verifyFirmMembership, requireCap('editCo
     b.email || null, b.phone || null, b.title || null,
     b.companyId || null, b.companyName || null, b.address || null, b.linkedin || null,
     b.referredById || null, b.pipelineStage || null,
-    JSON.stringify(b.tags || []), b.privilege ? 1 : 0, (b.ownerEmail || req.user.email).toLowerCase(),
+    JSON.stringify(b.tags || []), b.privilege ? 1 : 0, normalizeEmail(b.ownerEmail) || req.user.email,
     b.notes || null, b.nextAction || null, b.nextActionAt || null,
     inc,
     b.mailingAddress || null, b.dateOfBirth || null, b.clientSince || null,
@@ -1081,7 +1630,7 @@ app.put('/api/contacts/:id', authRequired, verifyFirmMembership, requireCap('edi
     b.referredById ?? existing.referred_by_id, b.pipelineStage ?? existing.pipeline_stage,
     JSON.stringify(b.tags ?? parseJSON(existing.tags, [])),
     typeof b.privilege === 'boolean' ? (b.privilege ? 1 : 0) : existing.privilege,
-    (b.ownerEmail ?? existing.owner_email).toLowerCase(),
+    normalizeEmail(b.ownerEmail ?? existing.owner_email) || req.user.email,
     b.notes ?? existing.notes, b.nextAction ?? existing.next_action, b.nextActionAt ?? existing.next_action_at,
     inc,
     b.mailingAddress ?? existing.mailing_address,
@@ -1366,19 +1915,29 @@ function effectiveRate(userEmail, matterId) {
   return u?.default_rate || 0;
 }
 
-const DEFAULT_INCREMENT_MIN = 6;  // firm default = 0.1 hr (6 min)
+const DEFAULT_INCREMENT_MIN = 6;  // fallback when a firm hasn't set its own default
 const VALID_INCREMENTS = [6, 15];
 
-// Resolve the billing increment in minutes for a matter: matter → client → firm default (6).
+// The firm-level default increment is stored on firms.settings JSON under
+// `defaultIncrementMinutes`. Falls back to 6 (0.1 hr) if unset or invalid.
+function firmDefaultIncrementMinutes(firmId) {
+  if (!firmId) return DEFAULT_INCREMENT_MIN;
+  const row = db.prepare('SELECT settings FROM firms WHERE id = ?').get(firmId);
+  const s = parseJSON(row?.settings, {});
+  const v = parseInt(s.defaultIncrementMinutes, 10);
+  return VALID_INCREMENTS.includes(v) ? v : DEFAULT_INCREMENT_MIN;
+}
+
+// Resolve the billing increment in minutes for a matter: matter → client → firm default.
 function effectiveIncrementMinutes(matterId) {
-  const m = db.prepare('SELECT billing_increment_minutes, client_contact_id FROM matters WHERE id = ?').get(matterId);
+  const m = db.prepare('SELECT billing_increment_minutes, client_contact_id, firm_id FROM matters WHERE id = ?').get(matterId);
   if (!m) return DEFAULT_INCREMENT_MIN;
   if (m.billing_increment_minutes) return m.billing_increment_minutes;
   if (m.client_contact_id) {
     const c = db.prepare('SELECT billing_increment_minutes FROM contacts WHERE id = ?').get(m.client_contact_id);
     if (c?.billing_increment_minutes) return c.billing_increment_minutes;
   }
-  return DEFAULT_INCREMENT_MIN;
+  return firmDefaultIncrementMinutes(m.firm_id);
 }
 
 app.get('/api/time', authRequired, verifyFirmMembership, (req, res) => {
@@ -1539,9 +2098,14 @@ app.post('/api/invoices', authRequired, verifyFirmMembership, requireCap('manage
       amount: Number(l.amount ?? (Number(l.quantity) || 1) * (Number(l.rate) || 0)), sort_order: sort++ });
   });
 
-  const subtotal = +lines.reduce((s, l) => s + (l.amount || 0), 0).toFixed(2);
+  // Compute tax against the raw (unrounded) subtotal so fractional cents from
+  // each line don't drop before the multiplication. Subtotal and tax are then
+  // each rounded independently; total is the sum of the two rounded values so
+  // the UI's "subtotal + tax = total" always reconciles exactly.
+  const rawSubtotal = lines.reduce((s, l) => s + (l.amount || 0), 0);
+  const subtotal = +rawSubtotal.toFixed(2);
   const taxRate  = Number(b.taxRate) || 0;
-  const tax      = +(subtotal * taxRate).toFixed(2);
+  const tax      = +(rawSubtotal * taxRate).toFixed(2);
   const total    = +(subtotal + tax).toFixed(2);
 
   const tx = db.transaction(() => {
@@ -1551,14 +2115,23 @@ app.post('/api/invoices', authRequired, verifyFirmMembership, requireCap('manage
       b.issuedAt || now, b.dueAt || null, subtotal, tax, total, 'draft', b.notes || null, req.user.email);
     const ins = db.prepare(`INSERT INTO invoice_lines (id, invoice_id, kind, description, time_entry_id, quantity, rate, amount, sort_order) VALUES (?,?,?,?,?,?,?,?,?)`);
     lines.forEach(l => ins.run(l.id, id, l.kind, l.description, l.time_entry_id, l.quantity, l.rate, l.amount, l.sort_order));
-    // Mark time entries as billed against this invoice
-    const markTime = db.prepare(`UPDATE time_entries SET invoice_id = ?, status = 'billed', updated_at = datetime('now') WHERE id = ?`);
-    lines.filter(l => l.time_entry_id).forEach(l => markTime.run(id, l.time_entry_id));
-    // Mark expenses as billed too
-    const markExp = db.prepare(`UPDATE expenses SET invoice_id = ?, status = 'billed', updated_at = datetime('now') WHERE id = ?`);
-    lines.filter(l => l._expense_id).forEach(l => markExp.run(id, l._expense_id));
+    // Mark time entries as billed against this invoice. The WHERE clause requires
+    // status='draft' so an entry that's already on another invoice can't be silently
+    // re-bound — if a row didn't update, it was already billed and we abort.
+    const markTime = db.prepare(`UPDATE time_entries SET invoice_id = ?, status = 'billed', updated_at = datetime('now') WHERE id = ? AND firm_id = ? AND status = 'draft'`);
+    lines.filter(l => l.time_entry_id).forEach(l => {
+      const info = markTime.run(id, l.time_entry_id, req.user.firmId);
+      if (info.changes === 0) throw new Error(`Time entry ${l.time_entry_id} is already billed or not in this firm`);
+    });
+    // Mark expenses as billed too — same guard.
+    const markExp = db.prepare(`UPDATE expenses SET invoice_id = ?, status = 'billed', updated_at = datetime('now') WHERE id = ? AND firm_id = ? AND status = 'draft'`);
+    lines.filter(l => l._expense_id).forEach(l => {
+      const info = markExp.run(id, l._expense_id, req.user.firmId);
+      if (info.changes === 0) throw new Error(`Expense ${l._expense_id} is already billed or not in this firm`);
+    });
   });
-  tx();
+  try { tx(); }
+  catch(e) { return res.status(409).json({ error: e.message || 'Could not create invoice' }); }
 
   res.json({ id, number, subtotal, tax, total });
 });
@@ -1585,10 +2158,11 @@ app.patch('/api/invoices/:id', authRequired, verifyFirmMembership, requireCap('m
       }
     }
     const rows = db.prepare('SELECT amount FROM invoice_lines WHERE invoice_id = ?').all(req.params.id);
-    const subtotal = +rows.reduce((s, r) => s + (Number(r.amount) || 0), 0).toFixed(2);
+    const rawSubtotal = rows.reduce((s, r) => s + (Number(r.amount) || 0), 0);
+    const subtotal = +rawSubtotal.toFixed(2);
     const currentRate = inv.subtotal > 0 ? inv.tax / inv.subtotal : 0;
     const taxRate = (b.taxRate === undefined || b.taxRate === null || b.taxRate === '') ? currentRate : Number(b.taxRate);
-    const tax = +(subtotal * (Number.isFinite(taxRate) ? taxRate : 0)).toFixed(2);
+    const tax = +(rawSubtotal * (Number.isFinite(taxRate) ? taxRate : 0)).toFixed(2);
     const total = +(subtotal + tax).toFixed(2);
     db.prepare(`UPDATE invoices SET issued_at = ?, due_at = ?, notes = ?, subtotal = ?, tax = ?, total = ?, updated_at = datetime('now') WHERE id = ?`)
       .run(
@@ -1606,7 +2180,7 @@ app.patch('/api/invoices/:id/status', authRequired, verifyFirmMembership, requir
   if (!['draft','sent','paid','void'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
   const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
   if (!inv) return res.status(404).json({ error: 'Not found' });
-  db.prepare(`UPDATE invoices SET status = ?, amount_paid = CASE WHEN ? = 'paid' THEN total ELSE amount_paid END, updated_at = datetime('now') WHERE id = ?`)
+  db.prepare(`UPDATE invoices SET status = ?, amount_paid = CASE ? WHEN 'paid' THEN total WHEN 'void' THEN 0 ELSE amount_paid END, updated_at = datetime('now') WHERE id = ?`)
     .run(status, status, req.params.id);
   // If voided, release the time entries and expenses
   if (status === 'void') {
@@ -1628,9 +2202,335 @@ app.delete('/api/invoices/:id', authRequired, verifyFirmMembership, requireCap('
   res.json({ ok: true });
 });
 
+// ═══════════════════════════════════════════════════════════════════════
+// PAYMENT LINKS (admin-created, public-consumable)
+// ═══════════════════════════════════════════════════════════════════════
+// Step 2 constraints: operating destination only; link amount is always the
+// full current balance (partial payment is not offered in the public page).
+// Trust-destination links land in step 3.
+app.post('/api/invoices/:id/payment-link', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  if (!inv) return res.status(404).json({ error: 'Invoice not found' });
+  if (inv.status === 'void') return res.status(400).json({ error: 'Invoice is void' });
+  if (inv.status === 'paid') return res.status(400).json({ error: 'Invoice is already paid' });
+
+  const cfg = readPaymentConfig(req.user.firmId);
+  if (!cfg || !cfg.stripe_secret_key) {
+    return res.status(503).json({ error: 'Stripe is not connected. Configure it in Settings → Payments.' });
+  }
+
+  const balanceDue = Math.max(0, Math.round(((inv.total || 0) - (inv.amount_paid || 0)) * 100));
+  if (balanceDue <= 0) return res.status(400).json({ error: 'Nothing left to pay on this invoice' });
+
+  const expiresInDays = Math.max(1, Math.min(365, parseInt(req.body?.expiresInDays ?? 30, 10)));
+  const token = crypto.randomBytes(32).toString('base64url');
+  const expiresAt = new Date(Date.now() + expiresInDays * 86400000).toISOString();
+
+  db.prepare(`INSERT INTO payment_links
+              (token, firm_id, invoice_id, destination, amount_cents, expires_at, created_by)
+              VALUES (?, ?, ?, 'operating', ?, ?, ?)`)
+    .run(token, req.user.firmId, inv.id, balanceDue, expiresAt, req.user.email);
+
+  const base = (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host');
+  res.json({ token, url: base + '/pay/' + token, expiresAt, amountCents: balanceDue });
+});
+
+// Lists prior pay links for an invoice so the UI can surface existing links
+// rather than blindly creating duplicates. Returns status computed client-side-safe.
+app.get('/api/invoices/:id/payment-links', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const inv = db.prepare('SELECT id FROM invoices WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  if (!inv) return res.status(404).json({ error: 'Invoice not found' });
+  const rows = db.prepare(`SELECT token, destination, amount_cents, expires_at, used_at, created_by, created_at
+                           FROM payment_links WHERE invoice_id = ? AND firm_id = ?
+                           ORDER BY created_at DESC LIMIT 20`).all(req.params.id, req.user.firmId);
+  const base = (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host');
+  res.json(rows.map(r => ({
+    ...r,
+    url: base + '/pay/' + r.token,
+    expired: r.expires_at && new Date(r.expires_at) < new Date(),
+  })));
+});
+
+// ── PUBLIC PAY PAGE (no auth; token proves authorization) ───────────────
+// Rate limiter shared across pay routes to blunt token-guessing attempts.
+const payLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000, max: 60,
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many requests. Try again shortly.' },
+});
+
+function escHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c =>
+    ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+
+function renderSimplePayPage(title, message) {
+  return `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escHtml(title)}</title>
+<style>body{font-family:system-ui,-apple-system,Segoe UI,Helvetica,Arial,sans-serif;background:#f6f4ef;margin:0;padding:40px 20px;color:#222}
+.card{max-width:460px;margin:40px auto;background:#fff;padding:32px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.06)}
+h1{font-size:20px;margin:0 0 12px;color:#0f1f3d}
+p{line-height:1.55;margin:0;color:#555}</style>
+</head><body><div class="card"><h1>${escHtml(title)}</h1><p>${escHtml(message)}</p></div></body></html>`;
+}
+
+app.get('/pay/:token', payLimiter, (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const link = db.prepare('SELECT * FROM payment_links WHERE token = ?').get(req.params.token);
+  if (!link) return res.status(404).type('html').send(renderSimplePayPage('Link not found', 'This payment link is invalid or has been removed.'));
+  if (link.expires_at && new Date(link.expires_at) < new Date()) {
+    return res.status(410).type('html').send(renderSimplePayPage('Link expired', 'This payment link has expired. Please contact the firm for a new one.'));
+  }
+
+  const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?').get(link.invoice_id, link.firm_id);
+  if (!inv || inv.status === 'void') {
+    return res.status(404).type('html').send(renderSimplePayPage('Invoice unavailable', 'This invoice is no longer available.'));
+  }
+  if (inv.status === 'paid' || (inv.total && (inv.amount_paid || 0) >= inv.total - 0.005)) {
+    return res.type('html').send(renderSimplePayPage('Already paid', 'This invoice has already been paid in full. Thank you!'));
+  }
+
+  const firm = db.prepare('SELECT name FROM firms WHERE id = ?').get(link.firm_id);
+  const cfg  = readPaymentConfig(link.firm_id);
+  const pub  = cfg?.stripe_publishable || '';
+  if (!pub || !cfg?.stripe_secret_key) {
+    return res.status(503).type('html').send(renderSimplePayPage('Payments unavailable',
+      'This firm has not finished connecting Stripe. Please contact them to arrange payment another way.'));
+  }
+
+  const amount = (link.amount_cents / 100).toLocaleString('en-US', { style: 'currency', currency: 'usd' });
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pay ${escHtml(firm.name)} — Invoice ${escHtml(inv.number || inv.id)}</title>
+<script src="https://js.stripe.com/v3/"></script>
+<style>
+  :root{--navy:#0f1f3d;--gold:#c9a227;--cream:#f6f4ef;--muted:#666}
+  *{box-sizing:border-box}
+  body{font-family:system-ui,-apple-system,Segoe UI,Helvetica,Arial,sans-serif;background:var(--cream);margin:0;padding:32px 16px;color:#222}
+  .card{max-width:480px;margin:20px auto;background:#fff;padding:28px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.06)}
+  h1{font-size:18px;margin:0 0 4px;color:var(--navy)}
+  .firm{font-size:13px;color:var(--muted);margin-bottom:20px}
+  .row{display:flex;justify-content:space-between;padding:10px 0;font-size:14px;border-top:1px solid #eee}
+  .row:first-of-type{border-top:none}
+  .row .lbl{color:var(--muted)}
+  .total{font-size:22px;font-weight:700;color:var(--navy);margin:18px 0 22px;display:flex;justify-content:space-between;align-items:baseline}
+  .total .lbl{font-size:13px;color:var(--muted);font-weight:400}
+  #payment-element{margin-bottom:18px}
+  button{width:100%;padding:13px;font-size:15px;font-weight:600;background:var(--gold);color:var(--navy);border:0;border-radius:6px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  #msg{margin-top:14px;padding:10px 12px;border-radius:6px;font-size:13px;display:none}
+  #msg.err{background:#fbe9e9;color:#8a1c1c;display:block}
+  #msg.ok{background:#e6f5ea;color:#1a5c2e;display:block}
+  .footnote{font-size:11px;color:var(--muted);margin-top:16px;text-align:center}
+  .spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(0,0,0,.2);border-top-color:var(--navy);border-radius:50%;animation:sp 0.8s linear infinite;vertical-align:middle;margin-right:6px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head><body>
+<div class="card">
+  <h1>Invoice ${escHtml(inv.number || inv.id)}</h1>
+  <div class="firm">Payable to ${escHtml(firm.name)}</div>
+
+  <div class="row"><span class="lbl">Invoice #</span><span>${escHtml(inv.number || inv.id)}</span></div>
+  <div class="row"><span class="lbl">Billed to</span><span>${escHtml(inv.client_name || '—')}</span></div>
+  ${inv.issued_at ? `<div class="row"><span class="lbl">Issued</span><span>${escHtml(new Date(inv.issued_at).toLocaleDateString())}</span></div>` : ''}
+  <div class="total"><span class="lbl">Amount due</span><span>${escHtml(amount)}</span></div>
+
+  <form id="payment-form">
+    <div id="payment-element"><div style="padding:20px;text-align:center;color:var(--muted);font-size:13px"><span class="spinner"></span>Loading payment form…</div></div>
+    <button type="submit" id="submit-btn" disabled>Pay ${escHtml(amount)}</button>
+    <div id="msg"></div>
+  </form>
+  <div class="footnote">Secured by Stripe. Card details never touch this firm's servers.</div>
+</div>
+
+<script>
+(function(){
+  var PUB = ${JSON.stringify(pub)};
+  var TOKEN = ${JSON.stringify(req.params.token)};
+  var RETURN_URL = window.location.origin + '/pay/' + TOKEN + '/complete';
+  var stripe = Stripe(PUB);
+  var elements;
+  var msg = document.getElementById('msg');
+  var submitBtn = document.getElementById('submit-btn');
+  var form = document.getElementById('payment-form');
+
+  function showMsg(text, kind){ msg.textContent = text; msg.className = kind || ''; }
+
+  // Create a PaymentIntent, then mount the Payment Element bound to it.
+  fetch('/api/pay/' + TOKEN + '/intent', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' })
+    .then(function(r){ return r.json().then(function(j){ if (!r.ok) throw new Error(j.error || 'init failed'); return j; }); })
+    .then(function(j){
+      elements = stripe.elements({ clientSecret: j.clientSecret, appearance: { theme: 'stripe', variables: { colorPrimary: '#0f1f3d' } } });
+      var pe = elements.create('payment', { layout: 'tabs' });
+      document.getElementById('payment-element').innerHTML = '';
+      pe.mount('#payment-element');
+      pe.on('ready', function(){ submitBtn.disabled = false; });
+    })
+    .catch(function(e){
+      document.getElementById('payment-element').innerHTML = '';
+      showMsg(e.message || 'Could not start payment', 'err');
+    });
+
+  form.addEventListener('submit', function(ev){
+    ev.preventDefault();
+    if (!elements) return;
+    submitBtn.disabled = true;
+    showMsg('Processing…');
+    stripe.confirmPayment({ elements: elements, confirmParams: { return_url: RETURN_URL } })
+      .then(function(result){
+        // Only reached if there was an immediate error (no redirect).
+        if (result.error) {
+          showMsg(result.error.message || 'Payment failed', 'err');
+          submitBtn.disabled = false;
+        }
+      });
+  });
+})();
+</script>
+</body></html>`);
+});
+
+// After redirect back from 3DS / ACH, Stripe appends query params we can use
+// to display a success screen. The webhook is the source of truth for invoice
+// state — this screen is cosmetic.
+app.get('/pay/:token/complete', payLimiter, (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const status = String(req.query.redirect_status || '').toLowerCase();
+  if (status === 'succeeded') {
+    return res.type('html').send(renderSimplePayPage('Payment received',
+      'Thank you — your payment has been submitted. The firm will send a confirmation once the funds clear. You can close this window.'));
+  }
+  if (status === 'processing') {
+    return res.type('html').send(renderSimplePayPage('Payment processing',
+      'Your payment is being processed. ACH payments typically settle in 3–5 business days. You will receive a confirmation from the firm once it clears.'));
+  }
+  return res.type('html').send(renderSimplePayPage('Payment not completed',
+    'The payment was not completed. You can return to the pay link and try again.'));
+});
+
+// Creates (or reuses) a Stripe PaymentIntent for the pay link. One pending
+// invoice_payments row is inserted on first call; subsequent calls for the
+// same link return the same PI's client_secret so re-renders don't duplicate.
+app.post('/api/pay/:token/intent', payLimiter, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const link = db.prepare('SELECT * FROM payment_links WHERE token = ?').get(req.params.token);
+  if (!link) return res.status(404).json({ error: 'Invalid link' });
+  if (link.expires_at && new Date(link.expires_at) < new Date()) return res.status(410).json({ error: 'Link expired' });
+
+  const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?').get(link.invoice_id, link.firm_id);
+  if (!inv || inv.status === 'void') return res.status(400).json({ error: 'Invoice not available' });
+  if (inv.status === 'paid' || (inv.total && (inv.amount_paid || 0) >= inv.total - 0.005)) {
+    return res.status(400).json({ error: 'Invoice is already paid' });
+  }
+
+  let bits;
+  try { bits = getStripeClient(link.firm_id); }
+  catch (e) { return res.status(e.status || 500).json({ error: e.message }); }
+
+  const cfg = readPaymentConfig(link.firm_id);
+  const methods = [];
+  if (cfg.card_enabled) methods.push('card');
+  if (cfg.ach_enabled)  methods.push('us_bank_account');
+  if (!methods.length) return res.status(503).json({ error: 'No payment methods are enabled' });
+
+  // If a pending PI already exists for this link, reuse it to avoid creating
+  // orphaned intents when the customer reloads the page.
+  const existing = db.prepare(`SELECT * FROM invoice_payments
+                               WHERE firm_id=? AND invoice_id=? AND status='pending'
+                                 AND stripe_payment_intent_id IS NOT NULL
+                               ORDER BY created_at DESC LIMIT 1`)
+    .get(link.firm_id, link.invoice_id);
+  if (existing) {
+    try {
+      const pi = await bits.client.paymentIntents.retrieve(existing.stripe_payment_intent_id);
+      if (pi && (pi.status === 'requires_payment_method' || pi.status === 'requires_confirmation' || pi.status === 'requires_action')) {
+        return res.json({ clientSecret: pi.client_secret });
+      }
+    } catch { /* fall through and create a new one */ }
+  }
+
+  try {
+    const pi = await bits.client.paymentIntents.create({
+      amount:   link.amount_cents,
+      currency: 'usd',
+      payment_method_types: methods,
+      description: `Invoice ${inv.number || inv.id}`,
+      metadata: {
+        firm_id:            link.firm_id,
+        invoice_id:         link.invoice_id,
+        payment_link_token: link.token,
+        destination:        link.destination,
+      },
+    });
+    const rowId = '_' + crypto.randomBytes(8).toString('hex');
+    db.prepare(`INSERT INTO invoice_payments
+                (id, firm_id, invoice_id, client_contact_id, destination, amount, currency, status, stripe_payment_intent_id)
+                VALUES (?, ?, ?, ?, ?, ?, 'usd', 'pending', ?)`)
+      .run(rowId, link.firm_id, link.invoice_id, inv.client_contact_id,
+           link.destination, link.amount_cents / 100, pi.id);
+    res.json({ clientSecret: pi.client_secret });
+  } catch (e) {
+    console.error('[stripe] paymentIntents.create failed:', e.stack || e.message);
+    // Don't forward the raw Stripe error message — it can include account/key
+    // fragments or internal URLs. Client gets a generic message; ops can find
+    // the detailed error in the server log.
+    res.status(500).json({ error: 'Could not start payment. Please try again or contact support.' });
+  }
+});
+
+// Default font family for invoice PDFs. Shadowed inside renderInvoicePdf when
+// firmSettings.invoiceFontFamily === 'serif'. Keep these module-scoped so the
+// preview watermark (outside renderInvoicePdf) can reference F_BOLD too.
+const F_REGULAR_DEFAULT = 'Helvetica';
+const F_BOLD_DEFAULT    = 'Helvetica-Bold';
+const F_ITALIC_DEFAULT  = 'Helvetica-Oblique';
+const F_REGULAR = F_REGULAR_DEFAULT;
+const F_BOLD    = F_BOLD_DEFAULT;
+const F_ITALIC  = F_ITALIC_DEFAULT;
+
 // Render an invoice PDF into the supplied PDFDocument. Shared between the real
 // PDF route and the settings-page preview so both stay visually identical.
 function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client, timeEntries, outstanding, logoBuffer }) {
+  // Map extended client-side font names onto one of the three PDFKit builtin
+  // font packs (PDFKit ships Helvetica / Times / Courier by default; other
+  // families would require registering TTF files).
+  const FAMILY_MAP = {
+    helvetica: 'helvetica', arial: 'helvetica', verdana: 'helvetica', trebuchet: 'helvetica',
+    sans: 'helvetica',
+    times: 'times', georgia: 'times', palatino: 'times', garamond: 'times',
+    serif: 'times',
+    courier: 'courier', monaco: 'courier',
+  };
+  const FONT_PACKS = {
+    helvetica: { regular: 'Helvetica',   bold: 'Helvetica-Bold', italic: 'Helvetica-Oblique' },
+    times:     { regular: 'Times-Roman', bold: 'Times-Bold',     italic: 'Times-Italic' },
+    courier:   { regular: 'Courier',     bold: 'Courier-Bold',   italic: 'Courier-Oblique' },
+  };
+  const mapFamily = (f) => FAMILY_MAP[f] || 'helvetica';
+  const fontKey = mapFamily(firmSettings.invoiceFontFamily);
+  const F_REGULAR = FONT_PACKS[fontKey].regular;
+  const F_BOLD    = FONT_PACKS[fontKey].bold;
+  const F_ITALIC  = FONT_PACKS[fontKey].italic;
+  doc.font(F_REGULAR); // default for branches (e.g. simple template) that don't set font explicitly
+
+  // Per-label overrides: { [key]: { family?, size? } }.
+  const labelStyles = firmSettings.labelStyles || {};
+  // Apply a label's style (font family + size). `weight` selects 'regular' /
+  // 'bold' / 'italic' within the chosen pack. `defaultSize` is the hardcoded
+  // size used when the label has no per-label size override. Returns the
+  // rendered text so callers can chain `.text(forLabel(...), ...)`.
+  const forLabel = (key, defaultSize, weight = 'regular') => {
+    const s = labelStyles[key] || {};
+    const pack = FONT_PACKS[mapFamily(s.family) || fontKey];
+    const size = (s.size != null && Number(s.size) > 0) ? Number(s.size) : defaultSize;
+    doc.font(pack[weight] || pack.regular).fontSize(size);
+    return labels[key];
+  };
+
+  // Logo scale — clamp to [0.5, 2.0] to avoid layout blowups.
+  const logoScale = Math.max(0.5, Math.min(2.0, Number(firmSettings.invoiceLogoScale) || 1));
+
   // Branding / customization
   const template   = firmSettings.invoiceTemplate || 'ap';
   const accent     = firmSettings.accentColor || '#1e3a5f';
@@ -1650,11 +2550,54 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
   const muted = '#666';
   const border = '#c8d3e0';
 
+  // Customizable text labels. Every string the PDF prints that isn't data is
+  // overridable via firmSettings.labels so admins can tweak wording (e.g.
+  // rename "BILLING SUMMARY" to "STATEMENT OF ACCOUNT") without code edits.
+  const labels = Object.assign({
+    invoiceHeading:          'INVOICE',
+    invoiceNumberLabel:      'Invoice No.',
+    dueLabelPrefix:          'Due:',
+    billingSummaryTitle:     'BILLING SUMMARY',
+    servicesSubtitlePrefix:  'For Professional Services Rendered as of',
+    paymentDetailsNote:      'Payment Details on Last Page',
+    professionalServicesTitle: 'Summary of Professional Services',
+    totalServicesLabel:      'Total Professional Services Rendered',
+    summaryByTimekeeperTitle:'Summary by Timekeeper',
+    costsTitle:              'Summary of Costs',
+    totalCostsLabel:         'Total Costs',
+    remittanceTitle:         'REMITTANCE',
+    currentDueLabel:         'Current Balance Due This Invoice',
+    outstandingLabel:        'Outstanding Balance',
+    totalBalanceDueLabel:    'TOTAL BALANCE DUE',
+    checksPayableLabel:      'All checks should be made payable to:',
+    wireHeadingLabel:        'For payment by wire or ACH in USD:',
+    notesHeadingLabel:       'Notes',
+    invoiceTotalLabel:       'Invoice Total',
+    taxLabel:                'Tax',
+    subtotalLabel:           'Subtotal',
+    colMatter:    'Matter #',
+    colDescription: 'Description',
+    colFees:      'Fees',
+    colCosts:     'Costs',
+    colTotal:     'Total',
+    colDate:      'Date',
+    colTimekeeper:'Timekeeper',
+    colHours:     'Hours',
+    colRate:      'Rate',
+    colAmount:    'Amount',
+    wireBeneficiaryNameLabel:    'Beneficiary Name',
+    wireBeneficiaryAddressLabel: 'Beneficiary Address',
+    wireAccountNumberLabel:      'Account Number',
+    wireRoutingNumberLabel:      'ABA Routing Number',
+    wireBankNameLabel:           'Bank Name',
+    wireBankAddressLabel:        'Bank Address',
+  }, firmSettings.labels || {});
+
   // Fallback to the original simple format if the firm prefers it
   if (template === 'simple') {
     doc.fontSize(20).fillColor(accent).text(firm.name, 50, 50);
     if (firmAddr) doc.fontSize(10).fillColor(muted).text(firmAddr);
-    doc.fontSize(24).fillColor(accent).text('INVOICE', 400, 50, { align: 'right' });
+    doc.fontSize(24).fillColor(accent).text(labels.invoiceHeading, 400, 50, { align: 'right' });
     doc.fontSize(10).fillColor('#333').text(inv.number || '', 400, 80, { align: 'right' });
     doc.moveTo(50, 130).lineTo(562, 130).strokeColor('#ddd').stroke();
     doc.fontSize(9).fillColor('#888').text('BILL TO', 50, 150);
@@ -1667,10 +2610,10 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
     doc.moveTo(50, y).lineTo(562, y).strokeColor('#ddd').stroke();
     y += 10;
     doc.fontSize(9).fillColor('#888');
-    doc.text('DESCRIPTION', 50, y);
+    doc.text(String(labels.colDescription).toUpperCase(), 50, y);
     doc.text('QTY', 340, y, { width: 50, align: 'right' });
-    doc.text('RATE', 400, y, { width: 70, align: 'right' });
-    doc.text('AMOUNT', 480, y, { width: 80, align: 'right' });
+    doc.text(String(labels.colRate).toUpperCase(), 400, y, { width: 70, align: 'right' });
+    doc.text(String(labels.colAmount).toUpperCase(), 480, y, { width: 80, align: 'right' });
     y += 16;
     doc.moveTo(50, y).lineTo(562, y).strokeColor('#ddd').stroke();
     y += 8;
@@ -1688,16 +2631,16 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
     doc.moveTo(340, y).lineTo(562, y).strokeColor('#ddd').stroke();
     y += 10;
     doc.fontSize(10).fillColor('#333');
-    doc.text('Subtotal', 340, y, { width: 140, align: 'right' });
+    doc.text(labels.subtotalLabel || 'Subtotal', 340, y, { width: 140, align: 'right' });
     doc.text(fmtMoney(inv.subtotal), 480, y, { width: 80, align: 'right' });
     y += 16;
     if (inv.tax > 0) {
-      doc.text('Tax', 340, y, { width: 140, align: 'right' });
+      doc.text(labels.taxLabel, 340, y, { width: 140, align: 'right' });
       doc.text(fmtMoney(inv.tax), 480, y, { width: 80, align: 'right' });
       y += 16;
     }
     doc.fontSize(12).fillColor(accent);
-    doc.text('TOTAL', 340, y, { width: 140, align: 'right' });
+    doc.text(String(labels.colTotal || 'Total').toUpperCase(), 340, y, { width: 140, align: 'right' });
     doc.text(fmtMoney(inv.total), 480, y, { width: 80, align: 'right' });
     if (inv.notes) {
       y += 50;
@@ -1749,18 +2692,19 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
   const drawHeader = (short) => {
     if (short) {
       const topY = 40;
-      const logoH = short ? 26 : 50;
-      if (!tryImage(PAGE_LEFT, topY, { fit: [180, logoH] })) {
-        doc.font('Helvetica-Bold').fontSize(12).fillColor(accent)
+      const logoH = (short ? 26 : 50) * logoScale;
+      if (!tryImage(PAGE_LEFT, topY, { fit: [180 * logoScale, logoH] })) {
+        doc.font(F_BOLD).fontSize(12).fillColor(accent)
            .text(logoText, PAGE_LEFT, topY + 4, { width: 260, lineBreak: false, ellipsis: true });
       }
-      doc.font('Helvetica-Bold').fontSize(16).fillColor(accent)
-         .text('INVOICE', PAGE_LEFT, topY, { width: PAGE_WIDTH, align: 'right' });
-      doc.font('Helvetica').fontSize(9).fillColor(muted)
+      forLabel('invoiceHeading', 16, 'bold');
+      doc.fillColor(accent)
+         .text(labels.invoiceHeading, PAGE_LEFT, topY, { width: PAGE_WIDTH, align: 'right' });
+      doc.font(F_REGULAR).fontSize(9).fillColor(muted)
          .text(`${inv.number || ''}  ·  ${longDate(inv.issued_at)}`, PAGE_LEFT, topY + 18, { width: PAGE_WIDTH, align: 'right' });
 
       let y = topY + logoH + 8;
-      doc.font('Helvetica').fontSize(9).fillColor('#222');
+      doc.font(F_REGULAR).fontSize(9).fillColor('#222');
       for (const line of clientLines) {
         doc.text(line, PAGE_LEFT, y, { width: PAGE_WIDTH * 0.6 });
         y += 11;
@@ -1772,24 +2716,25 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
 
     // Full header (cover page)
     const topY = 50;
-    const logoMaxH = 60, logoMaxW = 280;
+    const logoMaxH = 60 * logoScale, logoMaxW = 280 * logoScale;
     let logoBottom = topY;
     if (tryImage(PAGE_LEFT, topY, { fit: [logoMaxW, logoMaxH] })) {
       logoBottom = topY + logoMaxH;
     } else {
-      doc.font('Helvetica-Bold').fontSize(24).fillColor(accent)
+      doc.font(F_BOLD).fontSize(24).fillColor(accent)
          .text(logoText, PAGE_LEFT, topY + 10, { width: logoMaxW, lineBreak: false, ellipsis: true });
       logoBottom = topY + 44;
     }
-    doc.font('Helvetica-Bold').fontSize(28).fillColor(accent)
-       .text('INVOICE', PAGE_LEFT, topY + 12, { width: PAGE_WIDTH, align: 'right' });
+    forLabel('invoiceHeading', 28, 'bold');
+    doc.fillColor(accent)
+       .text(labels.invoiceHeading, PAGE_LEFT, topY + 12, { width: PAGE_WIDTH, align: 'right' });
 
     const dividerY = Math.max(logoBottom + 6, topY + 58);
     doc.moveTo(PAGE_LEFT, dividerY).lineTo(PAGE_RIGHT, dividerY).strokeColor(accent).lineWidth(1.5).stroke();
 
     // Bill-to (left) and invoice meta (right)
     const blockTop = dividerY + 16;
-    doc.font('Helvetica').fontSize(10).fillColor('#111');
+    doc.font(F_REGULAR).fontSize(10).fillColor('#111');
     let ly = blockTop;
     for (const line of clientLines) {
       doc.text(line, PAGE_LEFT, ly, { width: PAGE_WIDTH * 0.55 });
@@ -1798,12 +2743,18 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
 
     const metaX = PAGE_LEFT + PAGE_WIDTH * 0.58;
     const metaW = PAGE_WIDTH - PAGE_WIDTH * 0.58;
-    doc.font('Helvetica-Bold').fontSize(10).fillColor('#111')
-       .text(`Invoice No. ${inv.number || ''}`, metaX, blockTop, { width: metaW, align: 'right' });
-    doc.font('Helvetica').fontSize(10).fillColor('#333')
+    forLabel('invoiceNumberLabel', 10, 'bold');
+    doc.fillColor('#111')
+       .text(`${labels.invoiceNumberLabel} ${inv.number || ''}`, metaX, blockTop, { width: metaW, align: 'right' });
+    doc.font(F_REGULAR).fontSize(10).fillColor('#333')
        .text(longDate(inv.issued_at), metaX, blockTop + 14, { width: metaW, align: 'right' });
     if (inv.due_at) {
-      doc.text('Due: ' + longDate(inv.due_at), metaX, blockTop + 28, { width: metaW, align: 'right' });
+      const prevFont = doc._font && doc._font.name;
+      const prevSize = doc._fontSize;
+      forLabel('dueLabelPrefix', 10, 'regular');
+      doc.fillColor('#333').text(labels.dueLabelPrefix + ' ' + longDate(inv.due_at), metaX, blockTop + 28, { width: metaW, align: 'right' });
+      if (prevFont) doc.font(prevFont);
+      if (prevSize) doc.fontSize(prevSize);
     }
 
     const metaBottom = blockTop + (inv.due_at ? 44 : 28);
@@ -1818,17 +2769,22 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
     const headerFontSize = opts.headerFontSize || 9;
     const bodyFontSize   = opts.bodyFontSize   || 9.5;
 
+    const setColHeaderStyle = (c) => {
+      if (c.key) forLabel(c.key, headerFontSize, 'bold');
+      else doc.font(F_BOLD).fontSize(headerFontSize);
+    };
     const drawHeaderRow = () => {
-      doc.font('Helvetica-Bold').fontSize(headerFontSize);
       let maxH = 0;
       for (const c of cols) {
+        setColHeaderStyle(c);
         const h = doc.heightOfString(c.label, { width: c.w - cellPad * 2, align: c.align || 'left' });
         if (h > maxH) maxH = h;
       }
       const rowH = maxH + headerPad * 2;
       doc.save().rect(PAGE_LEFT, y, PAGE_WIDTH, rowH).fill(accent).restore();
-      doc.font('Helvetica-Bold').fontSize(headerFontSize).fillColor('#fff');
       for (const c of cols) {
+        setColHeaderStyle(c);
+        doc.fillColor('#fff');
         doc.text(c.label, c.x + cellPad, y + headerPad, { width: c.w - cellPad * 2, align: c.align || 'left' });
       }
       y += rowH;
@@ -1836,7 +2792,7 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
 
     drawHeaderRow();
 
-    doc.font('Helvetica').fontSize(bodyFontSize).fillColor('#111');
+    doc.font(F_REGULAR).fontSize(bodyFontSize).fillColor('#111');
     for (const row of rows) {
       // Measure the row using the tallest cell.
       let maxH = 14;
@@ -1854,7 +2810,7 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
       }
       for (let i = 0; i < cols.length; i++) {
         const cell = row[i] == null ? '' : String(row[i]);
-        doc.font('Helvetica').fontSize(bodyFontSize).fillColor('#111')
+        doc.font(F_REGULAR).fontSize(bodyFontSize).fillColor('#111')
            .text(cell, cols[i].x + cellPad, y + 4, { width: cols[i].w - cellPad * 2, align: cols[i].align || 'left' });
       }
       doc.moveTo(PAGE_LEFT, y + rowH).lineTo(PAGE_RIGHT, y + rowH).strokeColor(border).lineWidth(0.3).stroke();
@@ -1862,9 +2818,12 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
     }
   };
 
-  // Write centered + sized title, advancing y by actual (measured) height.
-  const writeTitle = (text, size, align = 'left') => {
-    doc.font('Helvetica-Bold').fontSize(size).fillColor(accent);
+  // Write a title, advancing y by the measured height. If `key` is supplied,
+  // the title adopts per-label family + size from labelStyles.
+  const writeTitle = (text, size, align = 'left', key = null) => {
+    if (key) forLabel(key, size, 'bold');
+    else doc.font(F_BOLD).fontSize(size);
+    doc.fillColor(accent);
     const h = doc.heightOfString(text, { width: PAGE_WIDTH, align });
     doc.text(text, PAGE_LEFT, y, { width: PAGE_WIDTH, align });
     y += h + 8;
@@ -1873,9 +2832,10 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
   // ═══ Page 1: Cover + Billing Summary ════════════════════════════════════
   let y = drawHeader(false);
 
-  writeTitle('BILLING SUMMARY', 14, 'center');
-  doc.font('Helvetica-Oblique').fontSize(10).fillColor('#333');
-  const subtitleText = `For Professional Services Rendered as of ${longDate(inv.issued_at)}`;
+  writeTitle(labels.billingSummaryTitle, 14, 'center', 'billingSummaryTitle');
+  forLabel('servicesSubtitlePrefix', 10, 'italic');
+  doc.fillColor('#333');
+  const subtitleText = `${labels.servicesSubtitlePrefix} ${longDate(inv.issued_at)}`;
   const subtitleH = doc.heightOfString(subtitleText, { width: PAGE_WIDTH, align: 'center' });
   doc.text(subtitleText, PAGE_LEFT, y, { width: PAGE_WIDTH, align: 'center' });
   y += subtitleH + 16;
@@ -1888,11 +2848,11 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
 
   // Summary table: balanced columns so no header wraps awkwardly
   const sumCols = [
-    { label: 'Matter #',    x: PAGE_LEFT,       w: 64,  align: 'left'  },
-    { label: 'Description', x: PAGE_LEFT + 64,  w: 216, align: 'left'  },
-    { label: 'Fees',        x: PAGE_LEFT + 280, w: 80,  align: 'right' },
-    { label: 'Costs',       x: PAGE_LEFT + 360, w: 76,  align: 'right' },
-    { label: 'Total',       x: PAGE_LEFT + 436, w: 76,  align: 'right' },
+    { key: 'colMatter',      label: labels.colMatter,      x: PAGE_LEFT,       w: 64,  align: 'left'  },
+    { key: 'colDescription', label: labels.colDescription, x: PAGE_LEFT + 64,  w: 216, align: 'left'  },
+    { key: 'colFees',        label: labels.colFees,        x: PAGE_LEFT + 280, w: 80,  align: 'right' },
+    { key: 'colCosts',       label: labels.colCosts,       x: PAGE_LEFT + 360, w: 76,  align: 'right' },
+    { key: 'colTotal',       label: labels.colTotal,       x: PAGE_LEFT + 436, w: 76,  align: 'right' },
   ];
   renderTable(sumCols, [
     [matterLabel, matterDesc, fmtMoney(servicesTotal), fmtMoney(costsTotal), fmtMoney(inv.subtotal)],
@@ -1901,40 +2861,44 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
   // Totals row — manually styled (shaded)
   const totalsH = 24;
   doc.save().rect(PAGE_LEFT, y, PAGE_WIDTH, totalsH).fill('#eef2f7').restore();
-  doc.font('Helvetica-Bold').fontSize(10).fillColor('#111')
-     .text('Total', sumCols[0].x + 5, y + 7, { width: sumCols[1].x + sumCols[1].w - sumCols[0].x - 10 });
+  forLabel('colTotal', 10, 'bold');
+  doc.fillColor('#111')
+     .text(labels.colTotal, sumCols[0].x + 5, y + 7, { width: sumCols[1].x + sumCols[1].w - sumCols[0].x - 10 });
   doc.text(fmtMoney(servicesTotal), sumCols[2].x + 5, y + 7, { width: sumCols[2].w - 10, align: 'right' });
   doc.text(fmtMoney(costsTotal),    sumCols[3].x + 5, y + 7, { width: sumCols[3].w - 10, align: 'right' });
   doc.text(fmtMoney(inv.subtotal),  sumCols[4].x + 5, y + 7, { width: sumCols[4].w - 10, align: 'right' });
   y += totalsH + 8;
 
   if (inv.tax > 0) {
-    doc.font('Helvetica').fontSize(10).fillColor('#333');
-    doc.text('Tax', sumCols[3].x - 80, y, { width: 140 + 80, align: 'right' });
+    forLabel('taxLabel', 10, 'regular');
+    doc.fillColor('#333');
+    doc.text(labels.taxLabel, sumCols[3].x - 80, y, { width: 140 + 80, align: 'right' });
     doc.text(fmtMoney(inv.tax), sumCols[4].x + 5, y, { width: sumCols[4].w - 10, align: 'right' });
     y += 16;
-    doc.font('Helvetica-Bold').fontSize(11).fillColor(accent);
-    doc.text('Invoice Total', sumCols[3].x - 80, y, { width: 140 + 80, align: 'right' });
+    forLabel('invoiceTotalLabel', 11, 'bold');
+    doc.fillColor(accent);
+    doc.text(labels.invoiceTotalLabel || 'Invoice Total', sumCols[3].x - 80, y, { width: 140 + 80, align: 'right' });
     doc.text(fmtMoney(inv.total), sumCols[4].x + 5, y, { width: sumCols[4].w - 10, align: 'right' });
     y += 20;
   }
 
-  doc.font('Helvetica-Oblique').fontSize(10).fillColor(muted)
-     .text('Payment Details on Last Page', PAGE_LEFT, PAGE_BOTTOM - 20, { width: PAGE_WIDTH, align: 'center', lineBreak: false });
+  forLabel('paymentDetailsNote', 10, 'italic');
+  doc.fillColor(muted)
+     .text(labels.paymentDetailsNote, PAGE_LEFT, PAGE_BOTTOM - 20, { width: PAGE_WIDTH, align: 'center', lineBreak: false });
 
   // ═══ Professional Services detail ═══════════════════════════════════════
   if (timeEntries.length > 0) {
     doc.addPage();
     y = drawHeader(true);
-    writeTitle(`Summary of Professional Services — ${matterDesc || matterLabel}`, 12, 'left');
+    writeTitle(`${labels.professionalServicesTitle} — ${matterDesc || matterLabel}`, 12, 'left', 'professionalServicesTitle');
 
     const tCols = [
-      { label: 'Date',        x: PAGE_LEFT,       w: 58,  align: 'left'  },
-      { label: 'Timekeeper',  x: PAGE_LEFT + 58,  w: 100, align: 'left'  },
-      { label: 'Description', x: PAGE_LEFT + 158, w: 198, align: 'left'  },
-      { label: 'Hours',       x: PAGE_LEFT + 356, w: 46,  align: 'right' },
-      { label: 'Rate',        x: PAGE_LEFT + 402, w: 54,  align: 'right' },
-      { label: 'Amount',      x: PAGE_LEFT + 456, w: 56,  align: 'right' },
+      { key: 'colDate',        label: labels.colDate,        x: PAGE_LEFT,       w: 58,  align: 'left'  },
+      { key: 'colTimekeeper',  label: labels.colTimekeeper,  x: PAGE_LEFT + 58,  w: 100, align: 'left'  },
+      { key: 'colDescription', label: labels.colDescription, x: PAGE_LEFT + 158, w: 198, align: 'left'  },
+      { key: 'colHours',       label: labels.colHours,       x: PAGE_LEFT + 356, w: 46,  align: 'right' },
+      { key: 'colRate',        label: labels.colRate,        x: PAGE_LEFT + 402, w: 54,  align: 'right' },
+      { key: 'colAmount',      label: labels.colAmount,      x: PAGE_LEFT + 456, w: 56,  align: 'right' },
     ];
     const rows = [];
     let total = 0;
@@ -1958,8 +2922,9 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
     y += 4;
     doc.moveTo(PAGE_LEFT, y).lineTo(PAGE_RIGHT, y).strokeColor(accent).lineWidth(1).stroke();
     y += 8;
-    doc.font('Helvetica-Bold').fontSize(10).fillColor(accent)
-       .text('Total Professional Services Rendered', PAGE_LEFT, y, { width: tCols[3].x - PAGE_LEFT - 5, align: 'right' });
+    forLabel('totalServicesLabel', 10, 'bold');
+    doc.fillColor(accent)
+       .text(labels.totalServicesLabel, PAGE_LEFT, y, { width: tCols[3].x - PAGE_LEFT - 5, align: 'right' });
     doc.text(totalHours.toFixed(2), tCols[3].x + 5, y, { width: tCols[3].w - 10, align: 'right' });
     doc.text(fmtMoney(total),       tCols[5].x + 5, y, { width: tCols[5].w - 10, align: 'right' });
     y += 24;
@@ -1972,11 +2937,11 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
         doc.addPage();
         y = drawHeader(true);
       }
-      writeTitle('Summary by Timekeeper', 12, 'left');
+      writeTitle(labels.summaryByTimekeeperTitle, 12, 'left', 'summaryByTimekeeperTitle');
       const tkCols = [
-        { label: 'Timekeeper', x: PAGE_LEFT,       w: 300, align: 'left'  },
-        { label: 'Hours',      x: PAGE_LEFT + 300, w: 100, align: 'right' },
-        { label: 'Amount',     x: PAGE_LEFT + 400, w: 112, align: 'right' },
+        { key: 'colTimekeeper', label: labels.colTimekeeper, x: PAGE_LEFT,       w: 300, align: 'left'  },
+        { key: 'colHours',      label: labels.colHours,      x: PAGE_LEFT + 300, w: 100, align: 'right' },
+        { key: 'colAmount',     label: labels.colAmount,     x: PAGE_LEFT + 400, w: 112, align: 'right' },
       ];
       const tkRows = [...byTimekeeper.entries()]
         .sort((a, b) => b[1].amount - a[1].amount)
@@ -1986,8 +2951,9 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
       y += 4;
       doc.moveTo(PAGE_LEFT, y).lineTo(PAGE_RIGHT, y).strokeColor(accent).lineWidth(1).stroke();
       y += 8;
-      doc.font('Helvetica-Bold').fontSize(10).fillColor(accent)
-         .text('Total', PAGE_LEFT, y, { width: tkCols[1].x - PAGE_LEFT - 5, align: 'right' });
+      forLabel('colTotal', 10, 'bold');
+      doc.fillColor(accent)
+         .text(labels.colTotal, PAGE_LEFT, y, { width: tkCols[1].x - PAGE_LEFT - 5, align: 'right' });
       doc.text(totalHours.toFixed(2), tkCols[1].x + 5, y, { width: tkCols[1].w - 10, align: 'right' });
       doc.text(fmtMoney(total),       tkCols[2].x + 5, y, { width: tkCols[2].w - 10, align: 'right' });
       y += 20;
@@ -1999,19 +2965,20 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
   if (expenseLines.length > 0) {
     doc.addPage();
     y = drawHeader(true);
-    writeTitle(`Summary of Costs — ${matterDesc || matterLabel}`, 12, 'left');
+    writeTitle(`${labels.costsTitle} — ${matterDesc || matterLabel}`, 12, 'left', 'costsTitle');
 
     const eCols = [
-      { label: 'Description', x: PAGE_LEFT,       w: 400, align: 'left'  },
-      { label: 'Amount',      x: PAGE_LEFT + 400, w: 112, align: 'right' },
+      { key: 'colDescription', label: labels.colDescription, x: PAGE_LEFT,       w: 400, align: 'left'  },
+      { key: 'colAmount',      label: labels.colAmount,      x: PAGE_LEFT + 400, w: 112, align: 'right' },
     ];
     renderTable(eCols, expenseLines.map(l => [l.description || '', fmtMoney(l.amount)]));
 
     y += 4;
     doc.moveTo(PAGE_LEFT, y).lineTo(PAGE_RIGHT, y).strokeColor(accent).lineWidth(1).stroke();
     y += 8;
-    doc.font('Helvetica-Bold').fontSize(10).fillColor(accent)
-       .text('Total Costs', PAGE_LEFT, y, { width: eCols[0].w + eCols[0].x - PAGE_LEFT, align: 'right' });
+    forLabel('totalCostsLabel', 10, 'bold');
+    doc.fillColor(accent)
+       .text(labels.totalCostsLabel, PAGE_LEFT, y, { width: eCols[0].w + eCols[0].x - PAGE_LEFT, align: 'right' });
     doc.text(fmtMoney(costsTotal), eCols[1].x + 5, y, { width: eCols[1].w - 10, align: 'right' });
     y += 20;
   }
@@ -2019,39 +2986,43 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
   // ═══ Remittance page ════════════════════════════════════════════════════
   doc.addPage();
   y = drawHeader(true);
-  writeTitle('REMITTANCE', 16, 'center');
+  writeTitle(labels.remittanceTitle, 16, 'center', 'remittanceTitle');
   y += 4;
 
   const currentDue = +(Number(inv.total) - Number(inv.amount_paid || 0)).toFixed(2);
   const totalDue = +(currentDue + outstanding).toFixed(2);
 
-  const bal = (label, amount, emphasize) => {
+  const bal = (key, amount, emphasize) => {
+    const label = labels[key];
     if (emphasize) {
       const h = 28;
       doc.save().rect(PAGE_LEFT, y, PAGE_WIDTH, h).fill(accent).restore();
-      doc.font('Helvetica-Bold').fontSize(12).fillColor('#fff');
+      forLabel(key, 12, 'bold');
+      doc.fillColor('#fff');
       doc.text(label, PAGE_LEFT + 14, y + 8, { width: PAGE_WIDTH * 0.65 });
       doc.text(fmtMoney(amount), PAGE_LEFT, y + 8, { width: PAGE_WIDTH - 14, align: 'right' });
       y += h + 6;
     } else {
       const h = 22;
-      doc.font('Helvetica').fontSize(11).fillColor('#222');
+      forLabel(key, 11, 'regular');
+      doc.fillColor('#222');
       doc.text(label, PAGE_LEFT + 14, y + 6, { width: PAGE_WIDTH * 0.65 });
       doc.text(fmtMoney(amount), PAGE_LEFT, y + 6, { width: PAGE_WIDTH - 14, align: 'right' });
       doc.moveTo(PAGE_LEFT, y + h).lineTo(PAGE_RIGHT, y + h).strokeColor(border).lineWidth(0.5).stroke();
       y += h + 2;
     }
   };
-  bal('Current Balance Due This Invoice', currentDue, false);
-  bal('Outstanding Balance',              outstanding, false);
-  bal('TOTAL BALANCE DUE',                totalDue, true);
+  bal('currentDueLabel',      currentDue,  false);
+  bal('outstandingLabel',     outstanding, false);
+  bal('totalBalanceDueLabel', totalDue,    true);
 
   y += 18;
-  const block = (title, textLines) => {
+  const block = (key, textLines) => {
     if (!textLines.filter(Boolean).length) return;
-    doc.font('Helvetica-Bold').fontSize(11).fillColor(accent).text(title, PAGE_LEFT, y, { width: PAGE_WIDTH });
+    forLabel(key, 11, 'bold');
+    doc.fillColor(accent).text(labels[key], PAGE_LEFT, y, { width: PAGE_WIDTH });
     y += 16;
-    doc.font('Helvetica').fontSize(10).fillColor('#111');
+    doc.font(F_REGULAR).fontSize(10).fillColor('#111');
     for (const line of textLines.filter(Boolean)) {
       doc.text(line, PAGE_LEFT + 14, y, { width: PAGE_WIDTH - 14 });
       y += 13;
@@ -2060,44 +3031,47 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
   };
 
   if (remitName || remitAddr) {
-    block('All checks should be made payable to:', [remitName, ...(remitAddr ? String(remitAddr).split(/\r?\n/) : [])]);
+    block('checksPayableLabel', [remitName, ...(remitAddr ? String(remitAddr).split(/\r?\n/) : [])]);
   }
 
   if (wire.accountNumber || wire.routingNumber || wire.bankName) {
-    doc.font('Helvetica-Bold').fontSize(11).fillColor(accent).text('For payment by wire or ACH in USD:', PAGE_LEFT, y, { width: PAGE_WIDTH });
+    forLabel('wireHeadingLabel', 11, 'bold');
+    doc.fillColor(accent).text(labels.wireHeadingLabel, PAGE_LEFT, y, { width: PAGE_WIDTH });
     y += 18;
     const wireRows = [
-      ['Beneficiary Name',    wire.beneficiaryName],
-      ['Beneficiary Address', wire.beneficiaryAddress],
-      ['Account Number',      wire.accountNumber],
-      ['ABA Routing Number',  wire.routingNumber],
-      ['Bank Name',           wire.bankName],
-      ['Bank Address',        wire.bankAddress],
+      ['wireBeneficiaryNameLabel',    wire.beneficiaryName],
+      ['wireBeneficiaryAddressLabel', wire.beneficiaryAddress],
+      ['wireAccountNumberLabel',      wire.accountNumber],
+      ['wireRoutingNumberLabel',      wire.routingNumber],
+      ['wireBankNameLabel',           wire.bankName],
+      ['wireBankAddressLabel',        wire.bankAddress],
     ].filter(([, v]) => v);
     const labelW = 150;
-    for (const [label, value] of wireRows) {
+    for (const [key, value] of wireRows) {
       const valLines = String(value).split(/\r?\n/).filter(Boolean);
-      doc.font('Helvetica').fontSize(10);
+      doc.font(F_REGULAR).fontSize(10);
       const valH = valLines.reduce((h, line) => h + doc.heightOfString(line, { width: PAGE_WIDTH - labelW - 20 }), 0) + 6;
       const rh = Math.max(22, valH);
       doc.save().rect(PAGE_LEFT, y, PAGE_WIDTH, rh).fill('#f5f7fb').restore();
       doc.rect(PAGE_LEFT, y, PAGE_WIDTH, rh).strokeColor(border).lineWidth(0.5).stroke();
-      doc.font('Helvetica-Bold').fontSize(10).fillColor('#222').text(label, PAGE_LEFT + 10, y + 6, { width: labelW - 10 });
-      doc.font('Helvetica').fontSize(10).fillColor('#111').text(valLines.join('\n'), PAGE_LEFT + labelW + 4, y + 6, { width: PAGE_WIDTH - labelW - 14 });
+      forLabel(key, 10, 'bold');
+      doc.fillColor('#222').text(labels[key], PAGE_LEFT + 10, y + 6, { width: labelW - 10 });
+      doc.font(F_REGULAR).fontSize(10).fillColor('#111').text(valLines.join('\n'), PAGE_LEFT + labelW + 4, y + 6, { width: PAGE_WIDTH - labelW - 14 });
       y += rh;
     }
     y += 18;
   }
 
   if (inv.notes) {
-    doc.font('Helvetica-Bold').fontSize(10).fillColor(accent).text('Notes', PAGE_LEFT, y, { width: PAGE_WIDTH });
+    forLabel('notesHeadingLabel', 10, 'bold');
+    doc.fillColor(accent).text(labels.notesHeadingLabel, PAGE_LEFT, y, { width: PAGE_WIDTH });
     y += 14;
-    doc.font('Helvetica').fontSize(10).fillColor('#333').text(inv.notes, PAGE_LEFT, y, { width: PAGE_WIDTH });
+    doc.font(F_REGULAR).fontSize(10).fillColor('#333').text(inv.notes, PAGE_LEFT, y, { width: PAGE_WIDTH });
     y += doc.heightOfString(inv.notes, { width: PAGE_WIDTH }) + 14;
   }
 
   if (footerText) {
-    doc.font('Helvetica-Bold').fontSize(11).fillColor(accent)
+    doc.font(F_BOLD).fontSize(11).fillColor(accent)
        .text(footerText, PAGE_LEFT, PAGE_BOTTOM - 16, { width: PAGE_WIDTH, align: 'center', lineBreak: false });
   }
 }
@@ -2126,6 +3100,10 @@ app.get('/api/invoices/:id/pdf', authRequired, verifyFirmMembership, requireCap(
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `inline; filename="${inv.number || inv.id}.pdf"`);
   const doc = new PDFDocument({ size: 'LETTER', margin: 50 });
+  // If the client disconnects or the stream errors, tear the doc down so PDFKit
+  // doesn't keep writing to a dead socket (memory + fd leak).
+  doc.on('error', (e) => { console.error('Invoice PDF stream error:', e); try { res.end(); } catch {} });
+  res.on('close', () => { if (!res.writableEnded) doc.destroy(); });
   doc.pipe(res);
   renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client, timeEntries, outstanding, logoBuffer });
   doc.end();
@@ -2208,6 +3186,8 @@ app.post('/api/invoices/preview', authRequired, verifyFirmMembership, requireCap
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', 'inline; filename="invoice-preview.pdf"');
   const doc = new PDFDocument({ size: 'LETTER', margin: 50, bufferPages: true });
+  doc.on('error', (e) => { console.error('Invoice preview PDF stream error:', e); try { res.end(); } catch {} });
+  res.on('close', () => { if (!res.writableEnded) doc.destroy(); });
   doc.pipe(res);
   renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client, timeEntries, outstanding, logoBuffer });
   // Diagonal "PREVIEW" watermark on every page (requires bufferPages).
@@ -2215,7 +3195,7 @@ app.post('/api/invoices/preview', authRequired, verifyFirmMembership, requireCap
   for (let i = range.start; i < range.start + range.count; i++) {
     doc.switchToPage(i);
     doc.save();
-    doc.fillColor('#d0d7e2').opacity(0.35).fontSize(90).font('Helvetica-Bold');
+    doc.fillColor('#d0d7e2').opacity(0.35).fontSize(90).font(F_BOLD);
     doc.rotate(-30, { origin: [306, 396] });
     doc.text('PREVIEW', 0, 360, { width: 612, align: 'center' });
     doc.restore();
@@ -2321,7 +3301,7 @@ app.post('/api/contacts/import', authRequired, verifyFirmMembership, requireCap(
         r.email || null, r.phone || null, r.title || null,
         r.companyName || r.company_name || null, r.address || null, r.linkedin || null,
         r.pipelineStage || r.pipeline_stage || null, JSON.stringify(r.tags || []), r.privilege ? 1 : 0,
-        (r.ownerEmail || r.owner_email || req.user.email).toLowerCase(),
+        normalizeEmail(r.ownerEmail || r.owner_email) || req.user.email,
         r.notes || null, r.nextAction || null, r.nextActionAt || null,
         req.user.email, now, now);
       inserted++;
@@ -2377,7 +3357,7 @@ app.get('/api/staff/export', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// TIMERS (live stopwatch — one per user)
+// TIMERS (live stopwatches — users may run several concurrently)
 // ═══════════════════════════════════════════════════════════════════════
 
 function timerElapsedSeconds(t) {
@@ -2391,6 +3371,7 @@ function timerToJSON(t) {
   if (!t) return null;
   const matter = t.matter_id ? db.prepare('SELECT id, name, client_name FROM matters WHERE id = ?').get(t.matter_id) : null;
   return {
+    id: t.id,
     matterId: t.matter_id,
     matterName: matter?.name || null,
     clientName: matter?.client_name || null,
@@ -2398,74 +3379,102 @@ function timerToJSON(t) {
     running: !!t.started_at,
     elapsedSeconds: timerElapsedSeconds(t),
     startedAt: t.started_at,
-    incrementMinutes: t.matter_id ? effectiveIncrementMinutes(t.matter_id) : DEFAULT_INCREMENT_MIN,
+    incrementMinutes: t.matter_id ? effectiveIncrementMinutes(t.matter_id) : firmDefaultIncrementMinutes(t.firm_id),
   };
 }
 
-app.get('/api/timer', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
-  const t = db.prepare('SELECT * FROM timers WHERE user_email = ?').get(req.user.email);
-  res.json(timerToJSON(t));
+function getTimerById(id, userEmail, firmId) {
+  // firmId is optional for backward compat, but always pass it from a route so a
+  // timer row left over from a prior firm membership can't be acted on.
+  if (firmId) {
+    return db.prepare('SELECT * FROM timers WHERE id = ? AND user_email = ? AND firm_id = ?').get(id, userEmail, firmId);
+  }
+  return db.prepare('SELECT * FROM timers WHERE id = ? AND user_email = ?').get(id, userEmail);
+}
+
+// Pauses every running timer for a user except optionally one (the one we're
+// about to start/resume). Keeps accumulated_seconds correct for each paused row.
+function pauseOtherRunningTimers(userEmail, exceptId = null) {
+  const rows = db.prepare('SELECT * FROM timers WHERE user_email = ? AND started_at IS NOT NULL').all(userEmail);
+  const upd = db.prepare('UPDATE timers SET started_at = NULL, accumulated_seconds = ? WHERE id = ?');
+  for (const t of rows) {
+    if (exceptId != null && String(t.id) === String(exceptId)) continue;
+    upd.run(timerElapsedSeconds(t), t.id);
+  }
+}
+
+// List all timers for the current user, newest first.
+app.get('/api/timers', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
+  const rows = db.prepare('SELECT * FROM timers WHERE user_email = ? ORDER BY created_at DESC, id DESC').all(req.user.email);
+  res.json(rows.map(timerToJSON));
 });
 
-// Start a new timer (replaces any existing timer — if existing was running, it's discarded).
-// To preserve prior work, call /api/timer/stop first.
-app.post('/api/timer/start', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
+// Create a new timer. Users may hold several concurrent timer rows, but only
+// one runs at a time — any others that were running get paused.
+app.post('/api/timers', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
   const { matterId, description } = req.body || {};
   if (!matterId) return res.status(400).json({ error: 'matterId required' });
   const m = db.prepare('SELECT id FROM matters WHERE id = ? AND firm_id = ?').get(matterId, req.user.firmId);
   if (!m) return res.status(404).json({ error: 'Matter not found' });
   const now = new Date().toISOString();
-  db.prepare(`INSERT INTO timers (user_email, firm_id, matter_id, description, started_at, accumulated_seconds)
-              VALUES (?, ?, ?, ?, ?, 0)
-              ON CONFLICT(user_email) DO UPDATE SET
-                firm_id = excluded.firm_id, matter_id = excluded.matter_id,
-                description = excluded.description, started_at = excluded.started_at,
-                accumulated_seconds = 0`)
-    .run(req.user.email, req.user.firmId, matterId, description || null, now);
-  res.json(timerToJSON(db.prepare('SELECT * FROM timers WHERE user_email = ?').get(req.user.email)));
+  const info = db.transaction(() => {
+    pauseOtherRunningTimers(req.user.email);
+    return db.prepare(`INSERT INTO timers (user_email, firm_id, matter_id, description, started_at, accumulated_seconds)
+                       VALUES (?, ?, ?, ?, ?, 0)`)
+      .run(req.user.email, req.user.firmId, matterId, description || null, now);
+  })();
+  res.json(timerToJSON(getTimerById(info.lastInsertRowid, req.user.email, req.user.firmId)));
 });
 
-app.post('/api/timer/pause', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
-  const t = db.prepare('SELECT * FROM timers WHERE user_email = ?').get(req.user.email);
-  if (!t) return res.status(404).json({ error: 'No timer running' });
-  if (!t.started_at) return res.json(timerToJSON(t));  // already paused
+app.post('/api/timers/:id/pause', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
+  const t = getTimerById(req.params.id, req.user.email, req.user.firmId);
+  if (!t) return res.status(404).json({ error: 'Timer not found' });
+  if (!t.started_at) return res.json(timerToJSON(t));
   const elapsed = timerElapsedSeconds(t);
-  db.prepare('UPDATE timers SET started_at = NULL, accumulated_seconds = ? WHERE user_email = ?').run(elapsed, req.user.email);
-  res.json(timerToJSON(db.prepare('SELECT * FROM timers WHERE user_email = ?').get(req.user.email)));
+  db.prepare('UPDATE timers SET started_at = NULL, accumulated_seconds = ? WHERE id = ?').run(elapsed, t.id);
+  res.json(timerToJSON(getTimerById(t.id, req.user.email, req.user.firmId)));
 });
 
-app.post('/api/timer/resume', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
-  const t = db.prepare('SELECT * FROM timers WHERE user_email = ?').get(req.user.email);
-  if (!t) return res.status(404).json({ error: 'No timer to resume' });
-  if (t.started_at) return res.json(timerToJSON(t));  // already running
-  db.prepare('UPDATE timers SET started_at = ? WHERE user_email = ?').run(new Date().toISOString(), req.user.email);
-  res.json(timerToJSON(db.prepare('SELECT * FROM timers WHERE user_email = ?').get(req.user.email)));
+// Resume a paused timer — auto-pauses every other running timer so only one
+// stopwatch ticks at a time.
+app.post('/api/timers/:id/resume', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
+  const t = getTimerById(req.params.id, req.user.email, req.user.firmId);
+  if (!t) return res.status(404).json({ error: 'Timer not found' });
+  if (t.started_at) return res.json(timerToJSON(t));
+  db.transaction(() => {
+    pauseOtherRunningTimers(req.user.email, t.id);
+    db.prepare('UPDATE timers SET started_at = ? WHERE id = ?').run(new Date().toISOString(), t.id);
+  })();
+  res.json(timerToJSON(getTimerById(t.id, req.user.email, req.user.firmId)));
 });
 
-app.patch('/api/timer', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
-  // Update description or matter of a running/paused timer (not the elapsed time).
-  const t = db.prepare('SELECT * FROM timers WHERE user_email = ?').get(req.user.email);
-  if (!t) return res.status(404).json({ error: 'No timer' });
+app.patch('/api/timers/:id', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
+  const t = getTimerById(req.params.id, req.user.email, req.user.firmId);
+  if (!t) return res.status(404).json({ error: 'Timer not found' });
   const { matterId, description } = req.body || {};
   if (matterId) {
     const m = db.prepare('SELECT id FROM matters WHERE id = ? AND firm_id = ?').get(matterId, req.user.firmId);
     if (!m) return res.status(404).json({ error: 'Matter not found' });
   }
-  db.prepare('UPDATE timers SET matter_id = COALESCE(?, matter_id), description = COALESCE(?, description) WHERE user_email = ?')
-    .run(matterId || null, description ?? null, req.user.email);
-  res.json(timerToJSON(db.prepare('SELECT * FROM timers WHERE user_email = ?').get(req.user.email)));
+  db.prepare('UPDATE timers SET matter_id = COALESCE(?, matter_id), description = COALESCE(?, description) WHERE id = ?')
+    .run(matterId || null, description ?? null, t.id);
+  res.json(timerToJSON(getTimerById(t.id, req.user.email, req.user.firmId)));
 });
 
-// Stop — commits the elapsed time as a time_entry and clears the timer.
+// Stop — commits the elapsed time as a time_entry and deletes the timer row.
 // Rounds up to the nearest 6 minutes (0.1 hr) by default, which is standard legal billing increment.
-app.post('/api/timer/stop', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
-  const t = db.prepare('SELECT * FROM timers WHERE user_email = ?').get(req.user.email);
-  if (!t) return res.status(404).json({ error: 'No timer to stop' });
+app.post('/api/timers/:id/stop', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
+  const t = getTimerById(req.params.id, req.user.email, req.user.firmId);
+  if (!t) return res.status(404).json({ error: 'Timer not found' });
   if (!t.matter_id) return res.status(400).json({ error: 'Timer has no matter — set one first' });
+  // Defense-in-depth: re-verify the matter still belongs to this firm. The timer
+  // row was firm-scoped at create/patch time, but matters in theory could have
+  // been moved; we don't want to commit a time entry against a foreign matter.
+  const matter = db.prepare('SELECT id FROM matters WHERE id = ? AND firm_id = ?').get(t.matter_id, req.user.firmId);
+  if (!matter) return res.status(404).json({ error: 'Matter not found' });
   const elapsed = timerElapsedSeconds(t);
   const rawMinutes = elapsed / 60;
   const inc = effectiveIncrementMinutes(t.matter_id);
-  // Round UP to the resolved increment (matter > client > firm default). ?rounding=raw disables.
   const minutes = req.query.rounding === 'raw' ? Math.round(rawMinutes) : Math.max(inc, Math.ceil(rawMinutes / inc) * inc);
   const rate = effectiveRate(req.user.email, t.matter_id);
   const entryId = uid('t_');
@@ -2477,7 +3486,7 @@ app.post('/api/timer/stop', authRequired, verifyFirmMembership, requireCap('logT
     db.prepare(`INSERT INTO time_entries (id, firm_id, user_email, matter_id, date, minutes, rate, description, billable)
                 VALUES (?,?,?,?,?,?,?,?,?)`).run(
       entryId, req.user.firmId, req.user.email, t.matter_id, date, minutes, rate, description, billable);
-    db.prepare('DELETE FROM timers WHERE user_email = ?').run(req.user.email);
+    db.prepare('DELETE FROM timers WHERE id = ?').run(t.id);
   })();
 
   res.json({
@@ -2487,8 +3496,10 @@ app.post('/api/timer/stop', authRequired, verifyFirmMembership, requireCap('logT
   });
 });
 
-app.delete('/api/timer', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
-  db.prepare('DELETE FROM timers WHERE user_email = ?').run(req.user.email);
+app.delete('/api/timers/:id', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
+  const t = getTimerById(req.params.id, req.user.email, req.user.firmId);
+  if (!t) return res.status(404).json({ error: 'Timer not found' });
+  db.prepare('DELETE FROM timers WHERE id = ?').run(t.id);
   res.json({ ok: true });
 });
 
@@ -2682,8 +3693,10 @@ If the document is clearly not a receipt or invoice, respond with {"error": "Not
     const status = e && e.status;
     if (status === 401) return res.status(503).json({ error: 'Receipt reading is misconfigured (invalid API key)' });
     if (status === 429) return res.status(429).json({ error: 'Receipt reading is rate-limited — try again in a moment' });
-    console.error('Receipt extract error:', e.message);
-    res.status(502).json({ error: 'Receipt reading failed: ' + (e.message || 'unknown error') });
+    console.error('Receipt extract error:', e.stack || e.message);
+    // Don't forward the raw upstream error — it can include Anthropic account
+    // metadata or prompt fragments. Generic user-facing message; details in logs.
+    res.status(502).json({ error: 'Receipt reading failed. Please try again or enter the expense manually.' });
   }
 });
 
