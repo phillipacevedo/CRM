@@ -67,7 +67,7 @@ a:hover{text-decoration:underline}
 .topbar .search input{flex:1;border:none;background:none;outline:none;font-size:13.5px;min-width:0}
 .topbar .actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:flex-end;margin-left:auto}
 .topbar .actions > *{flex-shrink:0}
-#timer-widget{flex-shrink:0}
+#timer-widget{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
 
 .content{flex:1;overflow-y:auto;padding:24px}
 .content-inner{max-width:1400px;margin:0 auto}
@@ -117,6 +117,16 @@ a:hover{text-decoration:underline}
 @media (max-width:1100px){.grid-4{grid-template-columns:repeat(2,1fr)}.grid-3{grid-template-columns:repeat(2,1fr)}}
 @media (max-width:700px){.grid-4,.grid-3,.grid-2{grid-template-columns:1fr}}
 
+/* Narrow-viewport responsiveness: let wide data tables scroll horizontally
+   instead of blowing out the layout, and stack kanban columns instead of
+   forcing horizontal scroll on a small screen. */
+@media (max-width:768px){
+  table.data{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%;white-space:nowrap}
+  .kanban{flex-direction:column;overflow-x:visible;min-height:auto}
+  .kanban-col{width:100%;max-height:none}
+  .kanban-cards{max-height:50vh}
+}
+
 .stat-card{background:#fff;border:1px solid var(--border);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow)}
 .stat-card .stat-label{font-size:11px;font-weight:600;color:var(--text-light);text-transform:uppercase;letter-spacing:.5px}
 .stat-card .stat-value{font-size:26px;font-weight:700;color:var(--navy);margin-top:4px;letter-spacing:-.5px}
@@ -138,27 +148,27 @@ table.data tbody tr{cursor:pointer;transition:background .1s}
 table.data tbody tr:hover{background:var(--gold-bg)}
 table.data .num{text-align:right;font-variant-numeric:tabular-nums}
 
-/* Tags / badges */
+/* Tags / badges — grouped by color instead of one rule per semantic label so a
+   new badge just picks the right color group. Unique-color badges (judge,
+   expert, referral, vendor) stay on their own lines. */
 .badge{
   display:inline-block;padding:2px 8px;border-radius:3px;
   font-size:11px;font-weight:600;letter-spacing:.3px;
 }
-.badge-client{background:var(--green-bg);color:var(--green)}
-.badge-prospect{background:var(--gold-bg);color:#7a6119}
-.badge-opposing-counsel{background:var(--red-bg);color:var(--red)}
-.badge-co-counsel{background:var(--blue-bg);color:var(--blue)}
-.badge-judge{background:#eee;color:#333}
-.badge-expert{background:#e0dcf5;color:#3a2a8a}
+.badge-client, .badge-status-active, .badge-status-paid
+  {background:var(--green-bg);color:var(--green)}
+.badge-prospect, .badge-status-on-hold
+  {background:var(--gold-bg);color:#7a6119}
+.badge-opposing-counsel, .badge-status-void
+  {background:var(--red-bg);color:var(--red)}
+.badge-co-counsel, .badge-status-sent
+  {background:var(--blue-bg);color:var(--blue)}
+.badge-other, .badge-status-closed, .badge-status-draft
+  {background:var(--gray-bg);color:var(--text-muted)}
+.badge-judge   {background:#eee;   color:#333}
+.badge-expert  {background:#e0dcf5;color:#3a2a8a}
 .badge-referral{background:#e6f5dc;color:#3a6a1a}
-.badge-vendor{background:#f2e2cc;color:#7a4a0a}
-.badge-other{background:var(--gray-bg);color:var(--text-muted)}
-.badge-status-active{background:var(--green-bg);color:var(--green)}
-.badge-status-closed{background:var(--gray-bg);color:var(--text-muted)}
-.badge-status-on-hold{background:var(--gold-bg);color:#7a6119}
-.badge-status-draft{background:var(--gray-bg);color:var(--text-muted)}
-.badge-status-sent{background:var(--blue-bg);color:var(--blue)}
-.badge-status-paid{background:var(--green-bg);color:var(--green)}
-.badge-status-void{background:var(--red-bg);color:var(--red)}
+.badge-vendor  {background:#f2e2cc;color:#7a4a0a}
 .tag{
   display:inline-block;padding:2px 8px;background:var(--gray-bg);color:var(--text-muted);
   border-radius:3px;font-size:11px;font-weight:500;margin-right:4px;
@@ -291,28 +301,349 @@ table.data.contacts tbody tr.is-client td:first-child{box-shadow:inset 3px 0 0 v
 @keyframes spin{to{transform:rotate(360deg)}}
 
 /* Conflict check highlight */
-.cc-result{border-left:3px solid var(--gold);padding:10px 12px;background:var(--gold-bg);margin-bottom:8px;border-radius:4px;font-size:13px}
+.cc-result{border-left:6px solid var(--gold);padding:12px 14px;background:var(--gold-bg);margin-bottom:8px;border-radius:4px;font-size:13px;box-shadow:inset 0 0 0 1px rgba(122,97,25,.15),0 1px 3px rgba(122,97,25,.1)}
+.cc-result:hover{border-left-color:#a37d0d;box-shadow:inset 0 0 0 1px rgba(122,97,25,.22),0 2px 6px rgba(122,97,25,.18)}
 
 .checkbox-row{display:flex;align-items:center;gap:8px}
 .checkbox-row input{width:auto;flex:0}
 
 /* Timer pill */
 .timer-pill{
-  display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:20px;
-  background:var(--cream);border:1px solid var(--border);font-size:12.5px;
-  cursor:pointer;transition:all .15s;min-height:32px;
+  display:inline-flex;align-items:center;gap:10px;height:34px;
+  padding:0 5px 0 12px;border-radius:999px;
+  background:var(--cream);border:1px solid var(--border);
+  font-size:12.5px;transition:background .15s,border-color .15s;
 }
-.timer-pill:hover{background:#fff;border-color:var(--gold)}
+.timer-pill.idle{padding:0 14px;cursor:pointer;gap:8px}
+.timer-pill.idle:hover{background:#fff;border-color:var(--gold);color:var(--navy)}
 .timer-pill.running{background:var(--gold-bg);border-color:var(--gold)}
-.timer-pill.paused{background:#fff2cc;border-color:#dda520}
-.timer-pill .t-clock{font-variant-numeric:tabular-nums;font-weight:700;color:var(--navy);min-width:56px;text-align:center}
-.timer-pill .t-meta{color:var(--text-muted);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.timer-pill .t-btn{padding:2px 6px;border-radius:4px;background:transparent;color:var(--navy);font-weight:700;font-size:13px}
-.timer-pill .t-btn:hover{background:rgba(15,31,61,.08)}
-.timer-pill .dot{width:7px;height:7px;border-radius:50%;background:#c8c8c8}
+.timer-pill.paused{background:#fff6d6;border-color:#dda520}
+.timer-pill .t-info{display:inline-flex;align-items:center;gap:8px;min-width:0}
+.timer-pill .dot{width:7px;height:7px;border-radius:50%;background:#c8c8c8;flex-shrink:0}
 .timer-pill.running .dot{background:var(--red);animation:pulse 1.4s infinite}
 .timer-pill.paused .dot{background:var(--gold)}
+.timer-pill .t-clock{
+  font-variant-numeric:tabular-nums;font-weight:700;color:var(--navy);
+  font-size:13px;letter-spacing:.2px;min-width:44px;
+}
+.timer-pill .t-meta{
+  color:var(--text-muted);max-width:220px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;font-size:12px;
+}
+.timer-pill .t-divider{width:1px;height:18px;background:rgba(15,31,61,.15);flex-shrink:0}
+.timer-pill .t-icon{display:inline-flex;align-items:center;color:var(--navy)}
+.timer-pill .t-icon svg{width:14px;height:14px}
+.timer-pill .t-controls{display:inline-flex;align-items:center;gap:2px;flex-shrink:0}
+.timer-pill .t-btn{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:24px;height:24px;border-radius:50%;background:transparent;
+  color:var(--navy);transition:background .1s,color .1s;
+}
+.timer-pill .t-btn svg{width:12px;height:12px}
+.timer-pill .t-btn:hover{background:rgba(15,31,61,.1)}
+.timer-pill .t-btn.primary{background:var(--navy);color:#fff}
+.timer-pill .t-btn.primary:hover{background:var(--navy-light)}
+.timer-pill .t-btn.danger:hover{background:var(--red-bg);color:var(--red)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* Invoice settings — roomier vertical rhythm between fields */
+.invoice-settings .field{margin-bottom:20px}
+.invoice-settings .form-row{gap:20px;margin-bottom:20px}
+.invoice-settings .form-row .field{margin-bottom:0}
+.invoice-settings h4{margin-top:28px!important}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   INVOICE EDITOR CSS — START
+   All selectors in this block are prefixed `.inv-*` and are used ONLY inside
+   the invoice editor overlay, the invoice preview, or the invoice mockup.
+   CSS custom properties (`--inv-font`, `--inv-logo-scale`, `--inv-font-scale`,
+   `--inv-accent`) are declared on `.inv-editor-body` — NOT on :root — and are
+   set via element-scoped `style.setProperty` in `openInvoiceLayoutEditor`, so
+   they can't leak into the main app when the overlay closes. Do not introduce
+   un-prefixed rules here. Section ends before `/* Settings tabs */`.
+   ═══════════════════════════════════════════════════════════════════════ */
+/* Invoice layout editor — labels edited in place on a paper-like preview. */
+.inv-editor-overlay{
+  position:fixed;inset:0;z-index:1100;background:#e9e7de;
+  display:flex;flex-direction:column;
+}
+.inv-editor-header{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:12px 18px;background:#fff;border-bottom:1px solid var(--border);
+  position:sticky;top:0;z-index:2;
+}
+.inv-editor-header h3{font-size:15px;font-weight:700;color:var(--navy);margin:0}
+.inv-editor-header .hint{font-size:11.5px;color:var(--text-muted)}
+.inv-editor-header .actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.inv-color-group{
+  display:flex;align-items:center;gap:6px;padding:4px 8px;
+  background:var(--cream);border:1px solid var(--border);border-radius:20px;
+}
+.inv-color-group .lab{font-size:11px;color:var(--text-muted);font-weight:600}
+.inv-color-group input[type="color"]{
+  width:26px;height:26px;padding:0;border:1px solid var(--border);
+  border-radius:50%;cursor:pointer;background:none;
+}
+.inv-color-group input[type="color"]::-webkit-color-swatch-wrapper{padding:0}
+.inv-color-group input[type="color"]::-webkit-color-swatch{border:none;border-radius:50%}
+.inv-swatch{
+  width:18px;height:18px;border-radius:50%;cursor:pointer;
+  border:2px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.15);
+  transition:transform .1s, box-shadow .1s;
+}
+.inv-swatch:hover{transform:scale(1.15)}
+.inv-swatch.active{box-shadow:0 0 0 2px var(--navy)}
+
+/* Logo control in the editor header */
+.inv-logo-group{
+  display:flex;align-items:center;gap:8px;padding:4px 10px 4px 6px;
+  background:var(--cream);border:1px solid var(--border);border-radius:20px;
+}
+.inv-logo-group .lab{font-size:11px;color:var(--text-muted);font-weight:600}
+.inv-logo-group .thumb{
+  width:40px;height:28px;display:flex;align-items:center;justify-content:center;
+  background:#fff;border:1px solid var(--border);border-radius:4px;overflow:hidden;
+  font-size:9px;color:var(--text-muted);font-weight:700;text-align:center;line-height:1;padding:2px;
+}
+.inv-logo-group .thumb img{max-width:100%;max-height:100%;object-fit:contain}
+.inv-logo-group .mini-btn{
+  font-size:11px;padding:3px 8px;border:1px solid var(--border);border-radius:4px;
+  background:#fff;cursor:pointer;color:var(--navy);
+}
+.inv-logo-group .mini-btn:hover{background:var(--cream)}
+.inv-logo-group .mini-btn.danger{color:var(--red)}
+
+/* Logo slot inside the mock pages */
+.inv-logo-slot{display:flex;align-items:center}
+.inv-logo-slot img{
+  max-height:calc(50px * var(--inv-logo-scale, 1));
+  max-width:calc(260px * var(--inv-logo-scale, 1));
+  object-fit:contain;
+}
+.inv-logo-slot.short img{
+  max-height:calc(26px * var(--inv-logo-scale, 1));
+  max-width:calc(180px * var(--inv-logo-scale, 1));
+}
+.inv-editor-body{
+  flex:1;min-height:0;overflow-y:auto;padding:28px 24px 60px;
+  display:flex;flex-direction:column;align-items:center;gap:22px;
+  --inv-font: 'Helvetica', Arial, sans-serif;
+  --inv-logo-scale: 1;
+  --inv-font-scale: 1;
+}
+
+/* Floating font editor panel — appears on label focus */
+.inv-font-panel{
+  position:fixed;top:80px;right:20px;z-index:1150;
+  width:260px;background:#fff;border:1px solid var(--border);
+  border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.18);
+  padding:14px;font-size:12px;color:var(--navy);
+  transform:translateX(calc(100% + 40px));opacity:0;pointer-events:none;
+  transition:transform .18s ease-out, opacity .15s ease-out;
+}
+.inv-font-panel[data-open="1"]{transform:translateX(0);opacity:1;pointer-events:auto}
+.inv-font-panel .hdr{
+  display:flex;align-items:center;justify-content:space-between;
+  margin:-2px 0 10px;
+}
+.inv-font-panel .hdr .ttl{font-weight:700;font-size:13px}
+.inv-font-panel .hdr .close{
+  background:none;border:none;font-size:18px;color:var(--text-muted);cursor:pointer;
+  line-height:1;padding:2px 6px;border-radius:4px;
+}
+.inv-font-panel .hdr .close:hover{background:var(--cream);color:var(--navy)}
+.inv-font-panel .section{
+  margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--border);
+}
+.inv-font-panel .section:last-of-type{border-bottom:none}
+.inv-font-panel .section-ttl{
+  font-size:10.5px;font-weight:700;color:var(--text-muted);
+  text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;
+}
+.inv-font-panel .section-ttl .tgt{
+  font-family:ui-monospace,monospace;color:var(--navy);font-weight:600;
+  text-transform:none;letter-spacing:0;margin-left:4px;
+}
+.inv-font-panel .field{margin-bottom:10px}
+.inv-font-panel .field label{
+  display:flex;justify-content:space-between;align-items:center;
+  font-size:11px;color:var(--text-muted);font-weight:600;margin-bottom:4px;
+}
+.inv-font-panel .field label .ro{font-variant-numeric:tabular-nums;color:var(--navy)}
+.inv-font-panel .field select,
+.inv-font-panel .field input[type="number"],
+.inv-font-panel .field input[type="range"]{width:100%;box-sizing:border-box}
+.inv-font-panel .field select,
+.inv-font-panel .field input[type="number"]{
+  padding:6px 8px;border:1px solid var(--border);border-radius:4px;font-size:12px;
+}
+.inv-font-panel .preview{
+  background:var(--cream);border-radius:6px;padding:10px;margin-bottom:8px;
+  min-height:36px;
+}
+.inv-font-panel .preview .sample{
+  font-family:var(--inv-font,inherit);
+  font-size:calc(13px * var(--inv-font-scale, 1));
+  color:#111;line-height:1.3;
+}
+.inv-font-panel .hint{font-size:10.5px;color:var(--text-muted);line-height:1.3}
+
+/* Logo size slider (lives inside the logo pill) */
+.inv-logo-group .size-wrap{display:flex;align-items:center;gap:4px;margin:0 2px}
+.inv-logo-group .size-wrap input[type="range"]{width:70px}
+.inv-logo-group .size-wrap .sz{font-size:10px;color:var(--text-muted);min-width:28px;text-align:right;font-variant-numeric:tabular-nums}
+
+/* Paper */
+.inv-page{
+  width:min(816px, 100%);
+  background:#fff;box-shadow:0 4px 22px rgba(0,0,0,.14);
+  border-radius:2px;padding:48px 56px;color:#111;
+  font:calc(10.5px * var(--inv-font-scale, 1))/1.45 var(--inv-font);
+  box-sizing:border-box;
+}
+.inv-page .accent{color:var(--inv-accent)}
+
+/* Editable label (contenteditable span) */
+.inv-lbl{
+  outline:none;border-radius:2px;padding:0 2px;margin:0 -2px;
+  cursor:text;transition:background-color .12s, box-shadow .12s;
+  -webkit-user-modify:read-write-plaintext-only;
+}
+.inv-lbl:hover{background:rgba(212,175,55,.18)}
+.inv-lbl:focus{background:#fff1b8;box-shadow:0 0 0 2px rgba(212,175,55,.6)}
+.inv-lbl[data-empty="1"]:not(:focus)::before{
+  content:attr(data-placeholder);color:#aaa;font-style:italic;
+}
+
+/* Fake data — visually dim to signal "sample, not editable" */
+.inv-fake{color:#3a3a3a}
+.inv-fake-muted{color:#777}
+
+/* Invoice pieces */
+.inv-header-row{display:flex;justify-content:space-between;align-items:flex-start;gap:24px}
+.inv-logo{font:700 calc(22px * var(--inv-font-scale,1))/1.1 var(--inv-font);color:var(--inv-accent);letter-spacing:.3px}
+.inv-title{font:700 calc(26px * var(--inv-font-scale,1))/1.1 var(--inv-font);color:var(--inv-accent);text-align:right}
+.inv-title-sm{font:700 calc(15px * var(--inv-font-scale,1))/1.1 var(--inv-font);color:var(--inv-accent);text-align:right}
+.inv-divider{height:1.5px;background:var(--inv-accent);margin:10px 0 14px}
+.inv-divider-thin{height:.5px;background:var(--inv-accent);margin:6px 0 12px}
+.inv-meta{text-align:right;font-size:calc(10.5px * var(--inv-font-scale,1))}
+.inv-meta .num{font-weight:700}
+.inv-section-title{
+  font:700 calc(13px * var(--inv-font-scale,1))/1.2 var(--inv-font);color:var(--inv-accent);
+  text-align:center;margin:14px 0 4px;
+}
+.inv-section-title.left{text-align:left;font-size:calc(12px * var(--inv-font-scale,1))}
+.inv-subtitle{font-style:italic;color:#333;text-align:center;margin-bottom:12px}
+
+.inv-table{width:100%;border-collapse:collapse;margin:6px 0 0;font-size:calc(10px * var(--inv-font-scale,1))}
+.inv-table thead th{
+  background:var(--inv-accent);color:#fff;text-align:left;
+  padding:7px 6px;font-weight:700;font-size:calc(9.5px * var(--inv-font-scale,1));
+}
+.inv-table thead th.right{text-align:right}
+.inv-table tbody td{padding:5px 6px;border-bottom:.5px solid #c8d3e0;vertical-align:top}
+.inv-table tbody td.right{text-align:right}
+.inv-totals-row{background:#eef2f7;font-weight:700}
+.inv-totals-row td{padding:7px 6px;border:none}
+.inv-rule{height:1px;background:var(--inv-accent);margin:6px 0 8px}
+.inv-totals-line{display:flex;justify-content:flex-end;gap:40px;padding:4px 6px;font-weight:700;color:var(--inv-accent)}
+
+.inv-payment-note{font-style:italic;color:#777;text-align:center;margin-top:22px}
+
+.inv-bal{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:8px 14px;border-bottom:.5px solid #c8d3e0;font-size:calc(11.5px * var(--inv-font-scale,1));
+}
+.inv-bal.emph{
+  background:var(--inv-accent);color:#fff;font-weight:700;
+  border:none;padding:10px 14px;font-size:calc(12.5px * var(--inv-font-scale,1));margin-top:4px;
+}
+.inv-bal.emph .inv-lbl:hover{background:rgba(255,255,255,.2)}
+.inv-bal.emph .inv-lbl:focus{background:#fff1b8;color:#111}
+
+.inv-block-heading{font-weight:700;color:var(--inv-accent);margin:18px 0 8px;font-size:calc(11.5px * var(--inv-font-scale,1))}
+.inv-wire-row{
+  display:flex;background:#f5f7fb;border:.5px solid #c8d3e0;
+  padding:6px 10px;font-size:calc(10.5px * var(--inv-font-scale,1));
+}
+.inv-wire-row .k{font-weight:700;flex:0 0 170px}
+.inv-wire-row .v{flex:1;white-space:pre-line}
+
+.inv-footer{
+  font-weight:700;color:var(--inv-accent);text-align:center;
+  margin-top:28px;font-size:calc(11px * var(--inv-font-scale,1));letter-spacing:.3px;
+}
+.inv-client{font-size:calc(10.5px * var(--inv-font-scale,1));white-space:pre-line}
+/* ═══════════════════════════════════════════════════════════════════════
+   INVOICE EDITOR CSS — END
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* Settings tabs */
+.settings-tabs{
+  display:flex;gap:2px;border-bottom:1px solid var(--border);
+  margin-bottom:20px;flex-wrap:wrap;
+}
+.settings-tabs button{
+  padding:10px 18px;font-size:13px;font-weight:600;
+  color:var(--text-muted);background:transparent;border:none;
+  border-bottom:2px solid transparent;margin-bottom:-1px;
+  transition:color .15s,border-color .15s,background .15s;
+  cursor:pointer;
+}
+.settings-tabs button:hover{color:var(--navy);background:var(--cream)}
+.settings-tabs button.active{color:var(--navy);border-bottom-color:var(--gold)}
+
+/* Time-card timer control (top of new/edit time modal) */
+.tf-timer-box{
+  display:flex;align-items:center;justify-content:center;
+  padding:14px 12px;margin-bottom:10px;
+  background:linear-gradient(180deg,var(--cream),#fff);
+  border:1px solid var(--border);border-radius:10px;
+  min-height:92px;
+}
+.tf-timer-empty{color:var(--text-muted);font-size:13px}
+.tf-timer-wrap{display:flex;align-items:center;gap:14px}
+.tf-timer-main{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:64px;height:64px;border-radius:50%;
+  background:var(--navy);color:#fff;border:none;cursor:pointer;
+  box-shadow:0 4px 14px rgba(15,31,61,.18);
+  transition:transform .1s,background .15s,box-shadow .15s;
+}
+.tf-timer-main:hover{transform:scale(1.04);background:var(--navy-light);box-shadow:0 6px 18px rgba(15,31,61,.24)}
+.tf-timer-main:active{transform:scale(.97)}
+.tf-timer-main svg{width:22px;height:22px}
+.tf-timer-main.idle{background:var(--gold);color:var(--navy)}
+.tf-timer-main.idle:hover{background:#dda520}
+.tf-timer-main.running{background:var(--red)}
+.tf-timer-main.running:hover{filter:brightness(.95)}
+.tf-timer-main.paused{background:var(--navy)}
+.tf-timer-stop{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:36px;height:36px;border-radius:50%;
+  background:#fff;color:var(--red);border:1px solid var(--border);cursor:pointer;
+  transition:background .1s,color .1s,border-color .1s;
+}
+.tf-timer-stop svg{width:14px;height:14px;fill:currentColor}
+.tf-timer-stop:hover{background:var(--red);color:#fff;border-color:var(--red)}
+.tf-timer-label{display:flex;flex-direction:column;min-width:0}
+.tf-timer-time{
+  font-variant-numeric:tabular-nums;font-weight:700;color:var(--navy);
+  font-size:22px;letter-spacing:.5px;line-height:1.1;
+}
+.tf-timer-sub{font-size:12px;color:var(--text-muted);margin-top:2px}
+
+/* Row start-timer button (on time-entry rows) */
+.row-timer-btn{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:26px;height:26px;border-radius:50%;
+  background:transparent;color:var(--text-muted);
+  transition:background .1s,color .1s;
+}
+.row-timer-btn svg{width:12px;height:12px;fill:currentColor}
+.row-timer-btn:hover{background:var(--navy);color:#fff}
+table.data tbody tr:hover .row-timer-btn{color:var(--navy)}
+table.data tbody tr:hover .row-timer-btn:hover{color:#fff}
 </style>
 </head>
 <body>
@@ -331,7 +662,7 @@ table.data.contacts tbody tr.is-client td:first-child{box-shadow:inset 3px 0 0 v
       </div>
       <div class="user-name"><strong id="user-name-label"></strong><span id="user-role-label"></span></div>
       <button class="nav-item" onclick="logout()">
-        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        <svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
         Log out
       </button>
     </div>
@@ -341,8 +672,8 @@ table.data.contacts tbody tr.is-client td:first-child{box-shadow:inset 3px 0 0 v
     <div class="topbar">
       <h2 id="page-title">Dashboard</h2>
       <div class="search">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
-        <input id="global-search" placeholder="Search contacts, companies, notes…" />
+        <svg width="14" height="14" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+        <input id="global-search" aria-label="Search contacts, companies, notes" placeholder="Search contacts, companies, notes…" />
       </div>
       <div id="timer-widget" class="hidden"></div>
       <div class="actions" id="topbar-actions"></div>
@@ -366,7 +697,31 @@ const state = {
   companies: [],
   matters: [],
   currentView: 'dashboard',
+  _renderVersion: 0,
 };
+
+// Bumped on every navigate(). Render functions capture a version and bail if
+// it's superseded, so a slow fetch from the previous view can't overwrite the
+// new view's DOM.
+function isStaleRender(v) { return state._renderVersion !== v; }
+
+// Per-view cleanup registry. Render functions that wire document-level listeners
+// (e.g. mousemove during a drag) register a teardown here; navigate() runs them
+// before switching views so a mid-drag nav can't leave stale document handlers.
+// Returns an unregister function — drag handlers that complete normally should
+// call it so the registry doesn't grow unbounded.
+state._viewCleanups = new Set();
+function registerViewCleanup(fn) {
+  state._viewCleanups.add(fn);
+  return () => state._viewCleanups.delete(fn);
+}
+function runViewCleanups() {
+  const fns = [...state._viewCleanups];
+  state._viewCleanups.clear();
+  for (const fn of fns) {
+    try { fn(); } catch(e) { console.error('view cleanup failed:', e); }
+  }
+}
 
 // ── Utilities ────────────────────────────────────────────────────────────
 const $  = (s, el=document) => el.querySelector(s);
@@ -394,6 +749,18 @@ const fmt = { money: n => '$' + (Number(n)||0).toLocaleString('en-US', { minimum
               mdy: d => { if (!d) return ''; const m = String(d).match(/^(\d{4})-(\d{2})-(\d{2})/); if (m) return `${m[2]}/${m[3]}/${m[1]}`; const dt = new Date(d); return isNaN(dt) ? String(d) : dt.toLocaleDateString('en-US'); },
               datetime: d => d ? new Date(d).toLocaleString() : '' };
 
+// Date helpers for <input type="date"> (YYYY-MM-DD). Centralized so API responses
+// that include a time component or full ISO string still produce a valid input value.
+const toDateInput = d => {
+  if (!d) return '';
+  const s = String(d);
+  const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (m) return m[1];
+  const dt = new Date(s);
+  return isNaN(dt) ? '' : dt.toISOString().slice(0, 10);
+};
+const todayDateInput = () => new Date().toISOString().slice(0, 10);
+
 async function api(path, opts={}) {
   const res = await fetch(path, {
     credentials: 'include',
@@ -411,14 +778,33 @@ async function api(path, opts={}) {
   return ct.includes('application/json') ? res.json() : res.blob();
 }
 
+// Toasts queue so a rapid second call can't wipe an unread first message.
+// Consecutive duplicates collapse (e.g. two identical API errors show once).
+const _toastQueue = [];
+let _toastShowing = false;
 function toast(msg, isError=false) {
-  const t = $('#toast');
-  t.textContent = msg;
-  t.classList.toggle('err', isError);
-  t.classList.add('show');
-  clearTimeout(toast._t);
-  toast._t = setTimeout(() => t.classList.remove('show'), 2400);
+  const last = _toastQueue[_toastQueue.length - 1];
+  if (last && last.msg === msg && last.isError === isError) return;
+  _toastQueue.push({ msg, isError });
+  if (!_toastShowing) _flushToast();
 }
+function _flushToast() {
+  const next = _toastQueue.shift();
+  if (!next) { _toastShowing = false; return; }
+  _toastShowing = true;
+  const t = $('#toast');
+  t.textContent = next.msg;
+  t.classList.toggle('err', next.isError);
+  t.classList.add('show');
+  setTimeout(() => {
+    t.classList.remove('show');
+    setTimeout(_flushToast, 180);
+  }, 2400);
+}
+
+const FOCUSABLE_SELECTOR = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+let _modalPreviousFocus = null;
+let _modalKeyHandler = null;
 
 function openModal(title, bodyEl, footerEl, wide=false) {
   const overlay = $('#modal-overlay');
@@ -426,7 +812,7 @@ function openModal(title, bodyEl, footerEl, wide=false) {
   const modal = el('div', { class: 'modal' + (wide ? ' wide' : '') }, [
     el('div', { class: 'modal-header' }, [
       el('h3', {}, title),
-      el('button', { class: 'close-btn', onclick: closeModal }, '×'),
+      el('button', { class: 'close-btn', onclick: closeModal, 'aria-label': 'Close' }, '×'),
     ]),
     el('div', { class: 'modal-body' }, bodyEl),
     footerEl ? el('div', { class: 'modal-footer' }, footerEl) : null,
@@ -434,8 +820,34 @@ function openModal(title, bodyEl, footerEl, wide=false) {
   overlay.appendChild(modal);
   overlay.classList.add('open');
   overlay.onclick = (e) => { if (e.target === overlay) closeModal(); };
+
+  // Focus management: remember what had focus, trap Tab inside the modal,
+  // close on Escape. Focus the first interactive element so keyboard users
+  // don't have to tab in from the background.
+  _modalPreviousFocus = document.activeElement;
+  const focusables = () => [...modal.querySelectorAll(FOCUSABLE_SELECTOR)];
+  const first = focusables()[0];
+  if (first) setTimeout(() => first.focus(), 0);
+  _modalKeyHandler = (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); closeModal(); return; }
+    if (e.key !== 'Tab') return;
+    const items = focusables();
+    if (items.length === 0) { e.preventDefault(); return; }
+    const f = items[0], l = items[items.length - 1];
+    if (e.shiftKey && document.activeElement === f) { e.preventDefault(); l.focus(); }
+    else if (!e.shiftKey && document.activeElement === l) { e.preventDefault(); f.focus(); }
+  };
+  document.addEventListener('keydown', _modalKeyHandler);
 }
-function closeModal() { $('#modal-overlay').classList.remove('open'); $('#modal-overlay').innerHTML = ''; }
+function closeModal() {
+  $('#modal-overlay').classList.remove('open');
+  $('#modal-overlay').innerHTML = '';
+  if (_modalKeyHandler) { document.removeEventListener('keydown', _modalKeyHandler); _modalKeyHandler = null; }
+  if (_modalPreviousFocus && typeof _modalPreviousFocus.focus === 'function') {
+    try { _modalPreviousFocus.focus(); } catch {}
+  }
+  _modalPreviousFocus = null;
+}
 
 function can(cap) {
   const u = state.me;
@@ -468,18 +880,18 @@ const NAV_ITEMS = [
   { id: 'settings',  label: 'Settings',   icon: 'settings' },
 ];
 const ICONS = {
-  grid: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>',
-  users:'<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
-  trending:'<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>',
-  briefcase:'<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg>',
-  folder:'<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',
-  clock:'<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
-  file:'<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>',
-  receipt:'<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 2H4v20l4-3 4 3 4-3 4 3V2z"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>',
-  team:'<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
-  check:'<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>',
-  shield:'<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
-  settings:'<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
+  grid: '<svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>',
+  users:'<svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
+  trending:'<svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>',
+  briefcase:'<svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg>',
+  folder:'<svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',
+  clock:'<svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
+  file:'<svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>',
+  receipt:'<svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 2H4v20l4-3 4 3 4-3 4 3V2z"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>',
+  team:'<svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
+  check:'<svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>',
+  shield:'<svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
+  settings:'<svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
 };
 
 function renderNav() {
@@ -495,27 +907,52 @@ function renderNav() {
   });
 }
 
-async function navigate(view) {
+async function navigate(view, opts={}) {
+  runViewCleanups();
+  const v = ++state._renderVersion;
+  // Push to history on a distinct view change so browser back/forward works
+  // and the URL is deep-linkable. Same-view refreshes (after save, retry) and
+  // popstate-driven navs skip the push to avoid cluttering history.
+  if (!opts.skipPush && state.currentView !== view) {
+    try { history.pushState({ view }, '', '?view=' + view); } catch {}
+  }
   state.currentView = view;
   $('#page-title').textContent = NAV_ITEMS.find(v => v.id === view)?.label || view;
   $('#topbar-actions').innerHTML = '';
   renderNav();
   const mount = $('#view');
   mount.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-light)"><span class="loader"></span></div>';
+  // Safety net: if a render hangs past 15s (network stall, infinite loop, whatever),
+  // replace the spinner with a timeout + retry link and invalidate the in-flight
+  // render so its late response can't silently overwrite our message.
+  const loadTimeout = setTimeout(() => {
+    if (state._renderVersion !== v) return;
+    state._renderVersion++;
+    mount.innerHTML = '';
+    mount.appendChild(el('div', { class: 'empty' }, [
+      'Request is taking longer than expected. ',
+      el('a', { href: 'javascript:void(0)', onclick: () => navigate(state.currentView) }, 'Retry'),
+    ]));
+  }, 15000);
   try {
-    if      (view === 'dashboard') await renderDashboard(mount);
-    else if (view === 'contacts')  await renderContacts(mount);
-    else if (view === 'clients')   await renderClients(mount);
-    else if (view === 'conflicts') await renderConflicts(mount);
-    else if (view === 'pipeline')  await renderPipeline(mount);
-    else if (view === 'matters')   await renderMatters(mount);
-    else if (view === 'time')      await renderTime(mount);
-    else if (view === 'expenses')  await renderExpenses(mount);
-    else if (view === 'invoices')  await renderInvoices(mount);
-    else if (view === 'trust')     await renderTrust(mount);
-    else if (view === 'team')      await renderTeam(mount);
-    else if (view === 'settings')  await renderSettings(mount);
-  } catch(e) { console.error(e); mount.innerHTML = `<div class="empty">Error loading view: ${esc(e.message)}</div>`; }
+    if      (view === 'dashboard') await renderDashboard(mount, v);
+    else if (view === 'contacts')  await renderContacts(mount, v);
+    else if (view === 'clients')   await renderClients(mount, v);
+    else if (view === 'conflicts') await renderConflicts(mount, v);
+    else if (view === 'pipeline')  await renderPipeline(mount, v);
+    else if (view === 'matters')   await renderMatters(mount, v);
+    else if (view === 'time')      await renderTime(mount, v);
+    else if (view === 'expenses')  await renderExpenses(mount, v);
+    else if (view === 'invoices')  await renderInvoices(mount, v);
+    else if (view === 'trust')     await renderTrust(mount, v);
+    else if (view === 'team')      await renderTeam(mount, v);
+    else if (view === 'settings')  await renderSettings(mount, v);
+  } catch(e) {
+    if (isStaleRender(v)) return;
+    console.error(e); mount.innerHTML = `<div class="empty">Error loading view: ${esc(e.message)}</div>`;
+  } finally {
+    clearTimeout(loadTimeout);
+  }
 }
 
 // ── BOOT ─────────────────────────────────────────────────────────────────
@@ -529,9 +966,24 @@ async function boot() {
   $('#user-role-label').textContent = ROLE_LABELS[state.me.role] || state.me.role;
   $('#app').style.display = 'flex';
   $('#global-search').addEventListener('input', debounce(onGlobalSearch, 300));
-  if (can('logTime')) { $('#timer-widget').classList.remove('hidden'); initTimer(); }
-  navigate('dashboard');
+  // Await initTimer before navigating so the dashboard's first render sees a
+  // populated Timer.list (the dashboard subscribes to timer state for its widget).
+  if (can('logTime')) {
+    $('#timer-widget').classList.remove('hidden');
+    await initTimer();
+  }
+  // Deep link support: honor ?view= in the URL, falling back to dashboard.
+  // Replace (not push) so back doesn't leave the app.
+  const initialView = new URL(window.location.href).searchParams.get('view') || 'dashboard';
+  const validView = NAV_ITEMS.find(n => n.id === initialView && (!n.cap || can(n.cap))) ? initialView : 'dashboard';
+  try { history.replaceState({ view: validView }, '', '?view=' + validView); } catch {}
+  navigate(validView, { skipPush: true });
 }
+
+window.addEventListener('popstate', (e) => {
+  const v = (e.state && e.state.view) || 'dashboard';
+  navigate(v, { skipPush: true });
+});
 
 const ROLE_LABELS = { admin:'Admin', partner:'Partner', associate:'Associate', 'project-assistant':'Project Assistant', paralegal:'Paralegal', secretary:'Secretary', staff:'Staff' };
 
@@ -539,8 +991,14 @@ function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTi
 
 async function onGlobalSearch(e) {
   const q = e.target.value.trim();
+  // If we're already on contacts, update the filter in place — no re-fetch,
+  // no DOM teardown, and clearing the input correctly resets the filter.
+  if (state.currentView === 'contacts' && state._contactsView) {
+    state._contactsView.search = q;
+    if (typeof applyContactFilters === 'function') applyContactFilters();
+    return;
+  }
   if (!q) return;
-  // Jump to contacts view with filter applied
   state._pendingSearch = q;
   navigate('contacts');
 }
@@ -553,8 +1011,9 @@ async function logout() {
 // ─────────────────────────────────────────────────────────────────────────
 // DASHBOARD
 // ─────────────────────────────────────────────────────────────────────────
-async function renderDashboard(mount) {
+async function renderDashboard(mount, v) {
   const d = await api('/api/dashboard');
+  if (isStaleRender(v)) return;
   const rows = [];
 
   const actions = $('#topbar-actions');
@@ -736,10 +1195,11 @@ function contactMatchesQuery(c, qq) {
   return hay.includes(qq);
 }
 
-async function renderContacts(mount) {
+async function renderContacts(mount, v) {
   const q = state._pendingSearch || '';
   state._pendingSearch = null;
   state.contacts = await api('/api/contacts');
+  if (isStaleRender(v)) return;
 
   const actions = $('#topbar-actions');
   actions.innerHTML = '';
@@ -784,8 +1244,9 @@ async function renderContacts(mount) {
 // Dedicated clients-only tab. Shows only contacts with type='client' and reuses
 // the same row table + openContact/openContactForm flows as the Contacts tab so
 // row-click views and the Edit button still work unchanged.
-async function renderClients(mount) {
+async function renderClients(mount, v) {
   state.contacts = await api('/api/contacts?type=client');
+  if (isStaleRender(v)) return;
 
   const actions = $('#topbar-actions');
   actions.innerHTML = '';
@@ -947,13 +1408,24 @@ function buildContactsTable(rows, sortState, opts = {}) {
       el('th', {}, 'Tags'),
       editable ? el('th', { style: 'width:88px' }, '') : null,
     ])),
-    el('tbody', {}, rows.map(c => {
+    el('tbody', {
+      // Delegated click: one listener handles all rows. Row has a data-contact-id;
+      // the edit button sits in a cell tagged data-row-action so we can skip the
+      // row-open on its clicks. Keeps closures per-row from piling up on large tables.
+      onclick: (e) => {
+        if (e.target.closest('[data-row-action]')) return;
+        if (e.target.closest('a[href^="mailto:"]')) return;
+        const tr = e.target.closest('tr[data-contact-id]');
+        if (!tr) return;
+        openContact(tr.dataset.contactId);
+      },
+    }, rows.map(c => {
       const typeLabel = CONTACT_TYPES.find(t => t.id === c.type)?.label || c.type;
       const ownerShort = (c.owner_email || '').split('@')[0];
       const tags = c.tags || [];
       return el('tr', {
         class: c.type === 'client' ? 'is-client' : '',
-        onclick: () => openContact(c.id),
+        'data-contact-id': c.id,
       }, [
         el('td', { style: 'min-width:220px' }, el('div', { class: 'contact-cell' }, [
           avatarEl(c),
@@ -968,7 +1440,7 @@ function buildContactsTable(rows, sortState, opts = {}) {
         showTypeCol ? el('td', {}, el('span', { class: 'badge badge-' + c.type }, typeLabel)) : null,
         el('td', {}, c.company_name || el('span', { class: 'muted-cell' }, '—')),
         el('td', {}, el('div', { class: 'contact-info' }, [
-          c.email ? el('a', { href: 'mailto:' + c.email, onclick: (e) => e.stopPropagation(), title: c.email }, c.email) : null,
+          c.email ? el('a', { href: 'mailto:' + c.email, title: c.email }, c.email) : null,
           c.phone ? el('span', { class: 'phone' }, c.phone) : null,
           !c.email && !c.phone ? el('span', { class: 'muted-cell' }, '—') : null,
         ])),
@@ -979,7 +1451,7 @@ function buildContactsTable(rows, sortState, opts = {}) {
           ...tags.slice(0, 3).map(t => el('span', { class: 'tag' }, t)),
           tags.length > 3 ? el('span', { class: 'tag-more', title: tags.slice(3).join(', ') }, '+' + (tags.length - 3)) : null,
         ])),
-        editable ? el('td', { onclick: (ev) => ev.stopPropagation() }, [
+        editable ? el('td', { 'data-row-action': 'edit' }, [
           el('button', { class: 'btn btn-ghost btn-sm', onclick: () => openContactForm(c) }, 'Edit'),
         ]) : null,
       ]);
@@ -988,10 +1460,32 @@ function buildContactsTable(rows, sortState, opts = {}) {
   return tbl;
 }
 
+function firmDefaultIncMinutes() {
+  const v = parseInt(state.firm?.settings?.defaultIncrementMinutes, 10);
+  return [6, 15].includes(v) ? v : 6;
+}
+function firmDefaultIncLabel() {
+  const m = firmDefaultIncMinutes();
+  return m === 15 ? '0.25 hr / 15 min' : '0.1 hr / 6 min';
+}
+
 function contactTypeSelect(current) {
   return el('select', { name: 'type' }, CONTACT_TYPES.map(t =>
     el('option', { value: t.id, ...(current === t.id ? { selected: 'selected' } : {}) }, t.label)));
 }
+
+// Whitelist of fields the contact form is allowed to submit. Kept next to the
+// form so adding a field to one place forces a look at the other. Protects the
+// save payload from stray named inputs (autocomplete widgets, embedded search
+// boxes) that happen to sit in the modal body.
+const CONTACT_FORM_FIELDS = new Set([
+  'type', 'ownerEmail', 'firstName', 'lastName', 'email', 'phone',
+  'secondaryEmail', 'secondaryPhone', 'title', 'companyName', 'industry',
+  'preferredContact', 'address', 'mailingAddress', 'pipelineStage', 'tags',
+  'nextAction', 'nextActionAt', 'clientSince', 'dateOfBirth', 'taxIdLast4',
+  'billingIncrementMinutes', 'originatingAttorneyEmail', 'originationSplitPct',
+  'billingAttorneyEmail', 'linkedin', 'notes', 'privilege',
+]);
 
 async function openContactForm(existing) {
   const users = (state._users ||= (await api('/api/seats')).users);
@@ -1044,20 +1538,20 @@ async function openContactForm(existing) {
     ]),
     el('div', { class: 'form-row' }, [
       el('div', { class: 'field' }, [ el('label', {}, 'Next action'), el('input', { name: 'nextAction', value: c.next_action || '' }) ]),
-      el('div', { class: 'field' }, [ el('label', {}, 'Next action date'), el('input', { name: 'nextActionAt', type: 'date', value: (c.next_action_at||'').slice(0,10) }) ]),
+      el('div', { class: 'field' }, [ el('label', {}, 'Next action date'), el('input', { name: 'nextActionAt', type: 'date', value: toDateInput(c.next_action_at) }) ]),
     ]),
     el('div', { id: 'client-only-wrap', style: (c.type === 'client' ? '' : 'display:none') }, [
       el('div', { style: 'border-top:1px solid var(--border);margin:16px 0 12px;padding-top:12px;font-weight:600;color:var(--text-muted);font-size:12px;text-transform:uppercase;letter-spacing:0.5px' }, 'Client details'),
       el('div', { class: 'form-row' }, [
-        el('div', { class: 'field' }, [ el('label', {}, 'Client since'), el('input', { name: 'clientSince', type: 'date', value: (c.client_since||'').slice(0,10) }) ]),
-        el('div', { class: 'field' }, [ el('label', {}, 'Date of birth'), el('input', { name: 'dateOfBirth', type: 'date', value: (c.date_of_birth||'').slice(0,10) }) ]),
+        el('div', { class: 'field' }, [ el('label', {}, 'Client since'), el('input', { name: 'clientSince', type: 'date', value: toDateInput(c.client_since) }) ]),
+        el('div', { class: 'field' }, [ el('label', {}, 'Date of birth'), el('input', { name: 'dateOfBirth', type: 'date', value: toDateInput(c.date_of_birth) }) ]),
       ]),
       el('div', { class: 'form-row' }, [
         el('div', { class: 'field' }, [ el('label', {}, 'Tax ID — last 4 digits only'),
           el('input', { name: 'taxIdLast4', maxlength: '4', pattern: '\\d{0,4}', value: c.tax_id_last4 || '', placeholder: 'e.g. 1234' }) ]),
         el('div', { class: 'field' }, [ el('label', {}, 'Default billing increment'),
           el('select', { name: 'billingIncrementMinutes' }, [
-            el('option', { value: '',  ...(!c.billing_increment_minutes ? { selected: 'selected' } : {}) }, 'Firm default (0.1 hr / 6 min)'),
+            el('option', { value: '',  ...(!c.billing_increment_minutes ? { selected: 'selected' } : {}) }, 'Firm default (' + firmDefaultIncLabel() + ')'),
             el('option', { value: '6',  ...(c.billing_increment_minutes === 6  ? { selected: 'selected' } : {}) }, '0.1 hr (6 min)'),
             el('option', { value: '15', ...(c.billing_increment_minutes === 15 ? { selected: 'selected' } : {}) }, '0.25 hr (15 min)'),
           ]) ]),
@@ -1098,7 +1592,11 @@ async function openContactForm(existing) {
 
   const save = async () => {
     const data = {};
-    $$('input, select, textarea', body).forEach(i => {
+    // Whitelist by field name (see CONTACT_FORM_FIELDS) so a stray named input
+    // (from autocomplete, embedded search, etc.) can't smuggle data into the
+    // save payload.
+    $$('input[name], select[name], textarea[name]', body).forEach(i => {
+      if (!CONTACT_FORM_FIELDS.has(i.name)) return;
       if (i.type === 'checkbox') data[i.name] = i.checked;
       else data[i.name] = i.value;
     });
@@ -1107,11 +1605,21 @@ async function openContactForm(existing) {
     try {
       if (isNew) await api('/api/contacts', { method: 'POST', body: data });
       else       await api('/api/contacts/' + c.id, { method: 'PUT', body: data });
-      toast(isNew ? 'Contact created' : 'Contact saved');
-      closeModal();
-      if (state.currentView === 'contacts') navigate('contacts');
-      if (state.currentView === 'pipeline') navigate('pipeline');
-    } catch(e) {}
+    } catch(e) {
+      // api() already surfaced a toast — leave the modal open so the user can retry.
+      console.error('Contact save failed:', e);
+      return;
+    }
+    toast(isNew ? 'Contact created' : 'Contact saved');
+    closeModal();
+    // Always refresh whatever view the user is on so the edit shows up
+    // immediately. Previously this only refreshed the contacts + pipeline
+    // views, so edits made from the Clients view (or elsewhere) looked like
+    // they hadn't saved.
+    if (state.currentView) {
+      try { navigate(state.currentView); }
+      catch(e) { console.error('Post-save navigate failed:', e); }
+    }
   };
   const footer = el('div', {}, [
     !isNew && can('editContacts') ? el('button', { class: 'btn btn-danger btn-sm', onclick: async () => { if (!confirm('Delete this contact?')) return; await api('/api/contacts/' + c.id, { method: 'DELETE' }); toast('Deleted'); closeModal(); navigate(state.currentView); } }, 'Delete') : null,
@@ -1394,7 +1902,8 @@ async function runConflictCheck(query, opts = {}) {
   return await api('/api/conflict-check?' + params.toString());
 }
 
-async function renderConflicts(mount) {
+async function renderConflicts(mount, v) {
+  if (isStaleRender(v)) return;
   $('#topbar-actions').innerHTML = '';
   mount.innerHTML = '';
   mount.appendChild(el('div', { class: 'card mb-16' }, [
@@ -1605,7 +2114,7 @@ async function startClientIntake(opts = {}) {
         el('div', { class: 'field' }, [ el('label', {}, 'Phone'), el('input', { name: 'phone' }) ]),
         el('div', { class: 'field' }, [ el('label', {}, 'Default billing increment'),
           el('select', { name: 'billingIncrementMinutes' }, [
-            el('option', { value: '' }, 'Firm default (0.1 hr / 6 min)'),
+            el('option', { value: '' }, 'Firm default (' + firmDefaultIncLabel() + ')'),
             el('option', { value: '6' },  '0.1 hr (6 min)'),
             el('option', { value: '15' }, '0.25 hr (15 min)'),
           ]) ]),
@@ -1891,9 +2400,10 @@ function parseVcard(text) {
 // ─────────────────────────────────────────────────────────────────────────
 // PIPELINE (kanban for prospects)
 // ─────────────────────────────────────────────────────────────────────────
-async function renderPipeline(mount) {
+async function renderPipeline(mount, v) {
   const stages = state.firm.pipelineStages || [];
   const prospects = await api('/api/contacts?type=prospect');
+  if (isStaleRender(v)) return;
 
   const actions = $('#topbar-actions');
   actions.innerHTML = '';
@@ -1971,8 +2481,9 @@ async function renderPipeline(mount) {
 // ─────────────────────────────────────────────────────────────────────────
 // MATTERS
 // ─────────────────────────────────────────────────────────────────────────
-async function renderMatters(mount) {
+async function renderMatters(mount, v) {
   state.matters = await api('/api/matters');
+  if (isStaleRender(v)) return;
   const actions = $('#topbar-actions');
   actions.innerHTML = '';
   if (can('editContacts')) {
@@ -2043,9 +2554,16 @@ async function openMatterForm(existing) {
     const client = contacts.find(c => c.id === d.clientContactId);
     if (client) d.clientName = client.full_name;
     if (!d.name.trim()) return toast('Name required', true);
-    if (isNew) await api('/api/matters', { method: 'POST', body: d });
-    else       await api('/api/matters/' + m.id, { method: 'PUT', body: d });
-    toast('Saved'); closeModal(); navigate('matters');
+    try {
+      if (isNew) await api('/api/matters', { method: 'POST', body: d });
+      else       await api('/api/matters/' + m.id, { method: 'PUT', body: d });
+    } catch(e) {
+      console.error('Matter save failed:', e);
+      return;
+    }
+    toast('Saved'); closeModal();
+    try { navigate('matters'); }
+    catch(e) { console.error('Post-save navigate failed:', e); }
   };
 
   openModal(isNew ? 'New matter' : 'Edit matter', body, el('div', {}, [
@@ -2125,7 +2643,7 @@ function userShortName(email) { return email.split('@')[0]; }
 const todayYmd = () => new Date().toISOString().slice(0, 10);
 const todayYmm = () => new Date().toISOString().slice(0, 7);
 
-async function renderTime(mount) {
+async function renderTime(mount, v) {
   state._timeView ||= { mode: 'entries', month: todayYmm(), day: todayYmd(), userFilter: '' };
   const tv = state._timeView;
   // Migrate stale mode names from older builds
@@ -2135,6 +2653,7 @@ async function renderTime(mount) {
   if (!tv.day) tv.day = todayYmd();
 
   const matters = await api('/api/matters?status=active');
+  if (isStaleRender(v)) return;
   const actions = $('#topbar-actions');
   actions.innerHTML = '';
   actions.appendChild(el('button', { class: 'btn btn-primary btn-sm', onclick: () => openTimeForm(null, matters) }, '+ New time entry'));
@@ -2230,8 +2749,9 @@ function renderTimeEntries(mount, entries, matters) {
   const sum = entries.reduce((a, t) => { a.min += t.minutes; if (t.billable) a.bill += t.minutes; return a; }, { min: 0, bill: 0 });
   mount.appendChild(timeStatCards(sum.min, sum.bill, entries.length));
   if (entries.length === 0) { mount.appendChild(el('div', { class: 'card empty' }, 'No time entries this month.')); return; }
+  const canTime = can('logTime');
   mount.appendChild(el('table', { class: 'data' }, [
-    el('thead', {}, el('tr', {}, [ el('th', {}, 'Date'), el('th', {}, 'User'), el('th', {}, 'Client'), el('th', {}, 'Matter'), el('th', { class: 'num' }, 'Hours'), can('viewRates') ? el('th', { class: 'num' }, 'Rate') : null, can('viewRates') ? el('th', { class: 'num' }, 'Amount') : null, el('th', {}, 'Description'), el('th', {}, 'Status') ])),
+    el('thead', {}, el('tr', {}, [ el('th', {}, 'Date'), el('th', {}, 'User'), el('th', {}, 'Client'), el('th', {}, 'Matter'), el('th', { class: 'num' }, 'Hours'), can('viewRates') ? el('th', { class: 'num' }, 'Rate') : null, can('viewRates') ? el('th', { class: 'num' }, 'Amount') : null, el('th', {}, 'Description'), el('th', {}, 'Status'), canTime ? el('th', { style: 'width:36px' }, '') : null ])),
     el('tbody', {}, entries.map(t => {
       const matter = matters.find(m => m.id === t.matter_id);
       return el('tr', { onclick: t.status === 'draft' ? () => openTimeForm(t, matters) : null }, [
@@ -2244,6 +2764,12 @@ function renderTimeEntries(mount, entries, matters) {
         can('viewRates') ? el('td', { class: 'num' }, fmt.money((t.minutes/60) * (t.rate || 0))) : null,
         el('td', {}, t.description || '—'),
         el('td', {}, el('span', { class: 'badge badge-status-' + t.status }, t.status)),
+        canTime ? el('td', { style: 'text-align:center' }, el('button', {
+          class: 'row-timer-btn',
+          title: 'Start timer for this matter',
+          html: TIMER_ICONS.play,
+          onclick: (e) => { e.stopPropagation(); startTimerForMatter(t.matter_id, t.description || ''); },
+        })) : null,
       ]);
     })),
   ]));
@@ -2393,13 +2919,18 @@ function renderTimeDay(mount, weekEntries, matters, tv) {
     const { startMin, endMin } = computeRange(ev);
     drawGhost(startMin, endMin);
   };
-  const onUp = (ev) => {
-    if (dragStart == null) return;
-    const { startMin, endMin } = computeRange(ev);
+  let unregisterCreateDrag = null;
+  const endCreateDrag = () => {
     dragStart = null;
     document.removeEventListener('mousemove', onMove);
     document.removeEventListener('mouseup', onUp);
     removeGhost();
+    if (unregisterCreateDrag) { unregisterCreateDrag(); unregisterCreateDrag = null; }
+  };
+  const onUp = (ev) => {
+    if (dragStart == null) return;
+    const { startMin, endMin } = computeRange(ev);
+    endCreateDrag();
     openTimeForm(null, matters, {
       date: day,
       startTime: minutesToTimeStr(startMin),
@@ -2415,6 +2946,8 @@ function renderTimeDay(mount, weekEntries, matters, tv) {
     drawGhost(dragStart, Math.min(dragStart + 15, HOUR_END * 60));
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
+    // If the user navigates mid-drag, this tears down the doc listeners and ghost.
+    unregisterCreateDrag = registerViewCleanup(endCreateDrag);
   });
 
   // Today's now-line
@@ -2504,12 +3037,17 @@ function renderTimeDay(mount, weekEntries, matters, tv) {
         const newTop = Math.max(0, Math.min(maxTop, origTop + snappedDy));
         block.style.top = newTop + 'px';
       };
-      const onDragUp = async () => {
+      let unregisterMoveDrag = null;
+      const endMoveDrag = () => {
         document.removeEventListener('mousemove', onDragMove);
         document.removeEventListener('mouseup', onDragUp);
         block.style.cursor = 'grab';
         block.style.zIndex = '1';
         block.style.opacity = '1';
+        if (unregisterMoveDrag) { unregisterMoveDrag(); unregisterMoveDrag = null; }
+      };
+      const onDragUp = async () => {
+        endMoveDrag();
         if (!moved) {
           openTimeForm(t, matters);
           return;
@@ -2532,6 +3070,7 @@ function renderTimeDay(mount, weekEntries, matters, tv) {
       };
       document.addEventListener('mousemove', onDragMove);
       document.addEventListener('mouseup', onDragUp);
+      unregisterMoveDrag = registerViewCleanup(endMoveDrag);
     });
 
     grid.appendChild(block);
@@ -2563,9 +3102,15 @@ function renderTimeDay(mount, weekEntries, matters, tv) {
         const startMin = clampStart(yToMinutes(y));
         drawGhost(startMin, startMin + durationMin);
       };
-      const onUp = async (e) => {
+      let unregisterUntimedDrag = null;
+      const endUntimedDrag = () => {
         document.removeEventListener('mousemove', onMove);
         document.removeEventListener('mouseup', onUp);
+        removeGhost();
+        if (unregisterUntimedDrag) { unregisterUntimedDrag(); unregisterUntimedDrag = null; }
+      };
+      const onUp = async (e) => {
+        endUntimedDrag();
         if (!dragging) {
           // Treat as click → open edit
           openTimeForm(entry, matters);
@@ -2592,6 +3137,7 @@ function renderTimeDay(mount, weekEntries, matters, tv) {
       };
       document.addEventListener('mousemove', onMove);
       document.addEventListener('mouseup', onUp);
+      unregisterUntimedDrag = registerViewCleanup(endUntimedDrag);
     });
   }
 }
@@ -2752,8 +3298,9 @@ function clientsFromMattersList(matters) {
   const map = new Map();
   for (const m of matters) {
     if (!m.client_contact_id) continue;
+    if (!m.client_name || !m.client_name.trim()) continue;
     if (!map.has(m.client_contact_id)) {
-      map.set(m.client_contact_id, { id: m.client_contact_id, name: m.client_name || '(no name)' });
+      map.set(m.client_contact_id, { id: m.client_contact_id, name: m.client_name.trim() });
     }
   }
   return [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
@@ -2840,36 +3387,37 @@ function clientMatterPicker(initialMatters, opts = {}) {
   function render() {
     root.innerHTML = '';
     const clients = clientsFromMattersList(matters);
-    // Default: preselect first client if none chosen yet
     if (!clientId && clients.length) clientId = clients[0].id;
     const clientMatters = matters
       .filter(m => m.client_contact_id === clientId)
       .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
     if (!clientMatters.find(m => m.id === matterId)) matterId = clientMatters[0]?.id || null;
 
-    const clientCurrent = clients.find(c => c.id === clientId);
-    const clientCombo = comboInput({
-      items: clients.map(c => ({ id: c.id, label: c.name })),
-      initialLabel: clientCurrent?.name || '',
-      placeholder: 'Type to search clients…',
-      name: 'clientId',
-      onSelect: (item) => { clientId = item.id; matterId = null; render(); if (opts.onChange) opts.onChange({ clientId, matterId }); },
+    const clientSelect = el('select', { name: 'clientId' },
+      clients.length
+        ? clients.map(c => el('option', { value: c.id, ...(c.id === clientId ? { selected: 'selected' } : {}) }, c.name))
+        : [el('option', { value: '' }, 'No clients with matters yet')]
+    );
+    clientSelect.addEventListener('change', (e) => {
+      clientId = e.target.value || null;
+      matterId = null;
+      render();
+      if (opts.onChange) opts.onChange({ clientId, matterId });
     });
 
-    const matterCurrent = clientMatters.find(m => m.id === matterId);
-    const matterField = clientMatters.length
-      ? comboInput({
-          items: clientMatters.map(m => ({ id: m.id, label: m.name })),
-          initialLabel: matterCurrent?.name || '',
-          placeholder: 'Type to search matters…',
-          name: 'matterId',
-          onSelect: (item) => { matterId = item.id; if (opts.onChange) opts.onChange({ clientId, matterId }); },
-        })
-      : el('input', { type: 'hidden', name: 'matterId', value: '' });
+    const matterSelect = el('select', { name: 'matterId' },
+      clientMatters.length
+        ? clientMatters.map(m => el('option', { value: m.id, ...(m.id === matterId ? { selected: 'selected' } : {}) }, m.name))
+        : [el('option', { value: '' }, '— No matters for this client —')]
+    );
+    matterSelect.addEventListener('change', (e) => {
+      matterId = e.target.value || null;
+      if (opts.onChange) opts.onChange({ clientId, matterId });
+    });
 
     root.appendChild(el('div', { class: 'form-row' }, [
-      el('div', { class: 'field' }, [ el('label', {}, 'Client'), clientCombo ]),
-      el('div', { class: 'field' }, [ el('label', {}, 'Matter'), matterField ]),
+      el('div', { class: 'field' }, [ el('label', {}, 'Client'), clientSelect ]),
+      el('div', { class: 'field' }, [ el('label', {}, 'Matter'), matterSelect ]),
     ]));
 
     if (clientMatters.length === 0) {
@@ -2982,20 +3530,98 @@ function noMattersBanner(client, onCreated) {
 function openTimeForm(existing, matters, defaults = {}) {
   const isNew = !existing, t = existing || {};
   const hours = t.minutes ? (t.minutes / 60).toFixed(2) : '';
-  const picker = clientMatterPicker(matters, { selectedMatterId: t.matter_id || defaults.matterId || null });
-  const body = el('div', {}, [
+  const timerBox = el('div', { class: 'tf-timer-box' });
+  const picker = clientMatterPicker(matters, {
+    selectedMatterId: t.matter_id || defaults.matterId || null,
+    onChange: () => renderTimerBox(),
+  });
+  const descTextarea = el('textarea', { name: 'description', style: 'flex:1;min-height:140px' }, t.description || '');
+
+  function getCurrentMatterId() { return picker.getValues().matterId; }
+  // Any timer already running for the matter currently picked in this form.
+  function matchingTimer() {
+    const mid = getCurrentMatterId();
+    if (!mid) return null;
+    return Timer.list.find(x => x.matterId === mid) || null;
+  }
+
+  function renderTimerBox() {
+    timerBox.innerHTML = '';
+    const matterId = getCurrentMatterId();
+    const running = matchingTimer();
+    if (!matterId) {
+      timerBox.appendChild(el('div', { class: 'tf-timer-empty' }, 'Pick a matter to start a timer.'));
+      return;
+    }
+    if (!running) {
+      const startBtn = el('button', {
+        class: 'tf-timer-main idle',
+        title: 'Start timer for this matter',
+        onclick: async (e) => {
+          e.preventDefault();
+          await startTimerForMatter(matterId, descTextarea.value || '');
+          renderTimerBox();
+        },
+        html: TIMER_ICONS.play,
+      });
+      timerBox.appendChild(el('div', { class: 'tf-timer-wrap' }, [
+        startBtn,
+        el('div', { class: 'tf-timer-label' }, [
+          el('div', { class: 'tf-timer-time' }, '00:00'),
+          el('div', { class: 'tf-timer-sub' }, 'Start timer'),
+        ]),
+      ]));
+    } else {
+      const main = el('button', {
+        class: 'tf-timer-main ' + (running.running ? 'running' : 'paused'),
+        title: running.running ? 'Pause' : 'Resume',
+        onclick: async (e) => {
+          e.preventDefault();
+          if (running.running) await pauseTimer(running.id);
+          else await resumeTimer(running.id);
+          renderTimerBox();
+        },
+        html: running.running ? TIMER_ICONS.pause : TIMER_ICONS.play,
+      });
+      const stopBtn = el('button', {
+        class: 'tf-timer-stop',
+        title: 'Stop & save',
+        onclick: (e) => { e.preventDefault(); openTimerStopModal(running.id); },
+        html: TIMER_ICONS.stop,
+      });
+      timerBox.appendChild(el('div', { class: 'tf-timer-wrap' }, [
+        main,
+        stopBtn,
+        el('div', { class: 'tf-timer-label' }, [
+          el('div', { class: 'tf-timer-time' }, fmtClock(running.elapsedSeconds || 0)),
+          el('div', { class: 'tf-timer-sub' }, running.running ? 'Running — tap to pause' : 'Paused — tap to resume'),
+        ]),
+      ]));
+    }
+  }
+
+  const body = el('div', { style: 'min-height:440px;display:flex;flex-direction:column;gap:4px' }, [
+    timerBox,
     el('div', { class: 'form-row' }, [
-      el('div', { class: 'field' }, [ el('label', {}, 'Date'), el('input', { name: 'date', type: 'date', value: t.date || defaults.date || new Date().toISOString().slice(0,10) }) ]),
+      el('div', { class: 'field' }, [ el('label', {}, 'Date'), el('input', { name: 'date', type: 'date', value: toDateInput(t.date) || toDateInput(defaults.date) || todayDateInput() }) ]),
       el('div', { class: 'field' }, [ el('label', {}, 'Start time (optional)'), el('input', { name: 'startTime', type: 'time', step: '900', value: t.start_time || defaults.startTime || '' }) ]),
       el('div', { class: 'field' }, [ el('label', {}, 'Hours'), el('input', { name: 'hours', type: 'number', step: '0.25', min: '0', value: hours || defaults.hours || '' }) ]),
     ]),
     picker,
-    el('div', { class: 'field' }, [ el('label', {}, 'Description'), el('textarea', { name: 'description' }, t.description || '') ]),
+    el('div', { class: 'field', style: 'flex:1;display:flex;flex-direction:column' }, [
+      el('label', {}, 'Description'),
+      descTextarea,
+    ]),
     el('div', { class: 'checkbox-row' }, [
       el('input', { type: 'checkbox', name: 'billable', id: 'billable-cb', ...(t.billable !== 0 ? { checked: 'checked' } : {}) }),
       el('label', { for: 'billable-cb' }, 'Billable'),
     ]),
   ]);
+  renderTimerBox();
+
+  // Keep the time-card timer visualization in sync with the topbar widget.
+  const unsub = onTimerChange(renderTimerBox);
+
   const save = async () => {
     const d = {};
     $$('input[name=date], input[name=startTime], input[name=hours], textarea[name=description], input[name=billable]', body).forEach(i => {
@@ -3008,37 +3634,44 @@ function openTimeForm(existing, matters, defaults = {}) {
     if (!d.matterId || !d.minutes) return toast('Matter and hours required', true);
     if (isNew) await api('/api/time', { method: 'POST', body: d });
     else       await api('/api/time/' + t.id, { method: 'PUT', body: d });
+    unsub();
     toast('Saved'); closeModal(); navigate('time');
   };
   openModal(isNew ? 'New time entry' : 'Edit time entry', body, el('div', {}, [
-    !isNew ? el('button', { class: 'btn btn-danger btn-sm', onclick: async () => { if (!confirm('Delete?')) return; await api('/api/time/' + t.id, { method: 'DELETE' }); toast('Deleted'); closeModal(); navigate('time'); } }, 'Delete') : null,
+    !isNew ? el('button', { class: 'btn btn-danger btn-sm', onclick: async () => { if (!confirm('Delete?')) return; await api('/api/time/' + t.id, { method: 'DELETE' }); unsub(); toast('Deleted'); closeModal(); navigate('time'); } }, 'Delete') : null,
     el('div', { class: 'spacer' }),
-    el('button', { class: 'btn btn-ghost btn-sm', onclick: closeModal }, 'Cancel'),
+    el('button', { class: 'btn btn-ghost btn-sm', onclick: () => { unsub(); closeModal(); } }, 'Cancel'),
     el('button', { class: 'btn btn-primary btn-sm', onclick: save }, 'Save'),
   ]));
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// TIMER WIDGET (persistent topbar)
+// TIMER WIDGET (persistent topbar) — multi-timer
 // ─────────────────────────────────────────────────────────────────────────
-const Timer = { state: null, interval: null };
+const Timer = { list: [], interval: null, subs: new Set() };
+
+function timerById(id) { return Timer.list.find(x => String(x.id) === String(id)); }
+function notifyTimerChange() { Timer.subs.forEach(fn => { try { fn(); } catch(e) {} }); }
+function onTimerChange(fn) { Timer.subs.add(fn); return () => Timer.subs.delete(fn); }
 
 async function initTimer() {
-  try { Timer.state = await api('/api/timer'); } catch(e) { Timer.state = null; }
-  renderTimerPill();
-  // Tick every 1s to update the clock; refetch from server every 30s for drift correction.
+  try { Timer.list = await api('/api/timers') || []; } catch(e) { Timer.list = []; }
+  renderTimerWidget();
+  notifyTimerChange();
+  // Tick every 1s to update clocks; refetch from server every 30s for drift correction.
   clearInterval(Timer.interval);
   Timer.interval = setInterval(() => {
-    if (Timer.state?.running) {
-      Timer.state.elapsedSeconds = (Timer.state.elapsedSeconds || 0) + 1;
-      renderTimerPill(true);  // lightweight re-render
+    let anyRunning = false;
+    for (const t of Timer.list) {
+      if (t.running) { t.elapsedSeconds = (t.elapsedSeconds || 0) + 1; anyRunning = true; }
     }
+    if (anyRunning) { renderTimerWidget(true); notifyTimerChange(); }
   }, 1000);
   setInterval(refreshTimer, 30000);
 }
 
 async function refreshTimer() {
-  try { Timer.state = await api('/api/timer'); renderTimerPill(); } catch(e) {}
+  try { Timer.list = await api('/api/timers') || []; renderTimerWidget(); notifyTimerChange(); } catch(e) {}
 }
 
 function fmtClock(sec) {
@@ -3050,35 +3683,100 @@ function fmtClock(sec) {
   return `${m}:${String(r).padStart(2,'0')}`;
 }
 
-function renderTimerPill(clockOnly=false) {
+const TIMER_ICONS = {
+  play:  '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>',
+  pause: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>',
+  stop:  '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>',
+  edit:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>',
+  timer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2"/><path d="M9 2h6"/></svg>',
+};
+
+function renderTimerWidget(clockOnly=false) {
   const w = $('#timer-widget');
   if (!w) return;
-  const t = Timer.state;
-  if (!t || !t.matterId) {
-    w.innerHTML = '';
-    w.appendChild(el('button', { class: 'timer-pill', onclick: openTimerStartModal }, [
-      el('span', { class: 'dot' }),
-      el('span', {}, '⏱ Start timer'),
-    ]));
-    return;
-  }
-  if (clockOnly && w.querySelector('.t-clock')) {
-    w.querySelector('.t-clock').textContent = fmtClock(t.elapsedSeconds || 0);
+  if (clockOnly) {
+    // Fast path: update each pill's clock text in place.
+    w.querySelectorAll('[data-timer-id]').forEach(node => {
+      const t = timerById(node.getAttribute('data-timer-id'));
+      const clock = node.querySelector('.t-clock');
+      if (t && clock) clock.textContent = fmtClock(t.elapsedSeconds || 0);
+    });
     return;
   }
   w.innerHTML = '';
-  const pill = el('div', { class: 'timer-pill ' + (t.running ? 'running' : 'paused') }, [
-    el('span', { class: 'dot' }),
-    el('span', { class: 't-clock' }, fmtClock(t.elapsedSeconds || 0)),
-    el('span', { class: 't-meta', title: (t.clientName||'') + ' — ' + (t.matterName||'') },
-      (t.clientName ? t.clientName + ' · ' : '') + (t.matterName || '')),
-    t.running
-      ? el('button', { class: 't-btn', title: 'Pause', onclick: async () => { Timer.state = await api('/api/timer/pause', { method: 'POST' }); renderTimerPill(); } }, '⏸')
-      : el('button', { class: 't-btn', title: 'Resume', onclick: async () => { Timer.state = await api('/api/timer/resume', { method: 'POST' }); renderTimerPill(); } }, '▶'),
-    el('button', { class: 't-btn', title: 'Stop & save', onclick: openTimerStopModal }, '■'),
-    el('button', { class: 't-btn', title: 'Edit / switch matter', onclick: openTimerEditModal }, '⚙'),
+  // Always show the "Start timer" chip so users can add another concurrent timer.
+  w.appendChild(el('button', { class: 'timer-pill idle', onclick: openTimerStartModal, title: 'Start a new timer' }, [
+    el('span', { class: 't-icon', html: TIMER_ICONS.timer }),
+    el('span', {}, Timer.list.length ? '+ Timer' : 'Start timer'),
+  ]));
+  for (const t of Timer.list) w.appendChild(buildTimerPill(t));
+}
+
+function buildTimerPill(t) {
+  const metaText = (t.clientName ? t.clientName + ' · ' : '') + (t.matterName || '');
+  return el('div', {
+    class: 'timer-pill ' + (t.running ? 'running' : 'paused'),
+    'data-timer-id': String(t.id),
+  }, [
+    el('div', { class: 't-info' }, [
+      el('span', { class: 'dot' }),
+      el('span', { class: 't-clock' }, fmtClock(t.elapsedSeconds || 0)),
+      metaText ? el('span', { class: 't-meta', title: (t.clientName||'') + ' — ' + (t.matterName||'') }, metaText) : null,
+    ]),
+    el('span', { class: 't-divider' }),
+    el('div', { class: 't-controls' }, [
+      t.running
+        ? el('button', { class: 't-btn primary', title: 'Pause', html: TIMER_ICONS.pause, onclick: () => pauseTimer(t.id) })
+        : el('button', { class: 't-btn primary', title: 'Resume', html: TIMER_ICONS.play, onclick: () => resumeTimer(t.id) }),
+      el('button', { class: 't-btn', title: 'Edit / switch matter', html: TIMER_ICONS.edit, onclick: () => openTimerEditModal(t.id) }),
+      el('button', { class: 't-btn danger', title: 'Stop & save', html: TIMER_ICONS.stop, onclick: () => openTimerStopModal(t.id) }),
+    ]),
   ]);
-  w.appendChild(pill);
+}
+
+// Keep old pill-render name for any lingering callers.
+const renderTimerPill = renderTimerWidget;
+
+function upsertTimerLocal(tj) {
+  if (!tj) return;
+  const i = Timer.list.findIndex(x => String(x.id) === String(tj.id));
+  if (i >= 0) Timer.list[i] = tj; else Timer.list.unshift(tj);
+}
+function removeTimerLocal(id) {
+  Timer.list = Timer.list.filter(x => String(x.id) !== String(id));
+}
+
+async function pauseTimer(id) {
+  const tj = await api('/api/timers/' + id + '/pause', { method: 'POST' });
+  upsertTimerLocal(tj); renderTimerWidget(); notifyTimerChange();
+}
+// Resume auto-pauses every other running timer server-side, so refetch the full
+// list to reflect the state of every pill.
+async function resumeTimer(id) {
+  await api('/api/timers/' + id + '/resume', { method: 'POST' });
+  await refreshTimer();
+}
+
+// Starts a new timer for a matter. If a timer already exists for that matter,
+// resumes it (if paused) rather than creating a duplicate. Only one timer runs
+// at a time — the server auto-pauses any others — so we refetch the full list.
+async function startTimerForMatter(matterId, description) {
+  if (!matterId) return toast('No matter on this entry', true);
+  const existing = Timer.list.find(x => x.matterId === matterId);
+  if (existing) {
+    if (!existing.running) {
+      await api('/api/timers/' + existing.id + '/resume', { method: 'POST' });
+      toast('Timer resumed');
+    } else {
+      toast('Timer already running for this matter');
+    }
+    await refreshTimer();
+    return existing;
+  }
+  await api('/api/timers', { method: 'POST', body: { matterId, description: description || '' } });
+  toast('Timer started');
+  await refreshTimer();
+  return Timer.list.find(x => x.matterId === matterId) || null;
 }
 
 async function openTimerStartModal() {
@@ -3093,10 +3791,8 @@ async function openTimerStartModal() {
   const start = async () => {
     const { matterId } = picker.getValues();
     if (!matterId) return toast('Pick a matter', true);
-    Timer.state = await api('/api/timer/start', { method: 'POST', body: { matterId, description: descInput.value } });
-    toast('Timer started');
+    await startTimerForMatter(matterId, descInput.value);
     closeModal();
-    renderTimerPill();
   };
   openModal('Start timer', body, el('div', {}, [
     el('div', { class: 'spacer' }),
@@ -3105,9 +3801,10 @@ async function openTimerStartModal() {
   ]));
 }
 
-async function openTimerEditModal() {
+async function openTimerEditModal(id) {
+  const t = timerById(id);
+  if (!t) return;
   const matters = await api('/api/matters?status=active');
-  const t = Timer.state;
   const picker = clientMatterPicker(matters, { selectedMatterId: t.matterId });
   const descInput = el('input', { name: 'description', value: t.description || '' });
   const body = el('div', {}, [
@@ -3116,19 +3813,27 @@ async function openTimerEditModal() {
   ]);
   const save = async () => {
     const { matterId } = picker.getValues();
-    Timer.state = await api('/api/timer', { method: 'PATCH', body: { matterId, description: descInput.value } });
-    toast('Updated'); closeModal(); renderTimerPill();
+    const tj = await api('/api/timers/' + id, { method: 'PATCH', body: { matterId, description: descInput.value } });
+    upsertTimerLocal(tj);
+    toast('Updated'); closeModal(); renderTimerWidget(); notifyTimerChange();
+  };
+  const discard = async () => {
+    if (!confirm('Discard timer without saving?')) return;
+    await api('/api/timers/' + id, { method: 'DELETE' });
+    removeTimerLocal(id);
+    toast('Discarded'); closeModal(); renderTimerWidget(); notifyTimerChange();
   };
   openModal('Edit timer', body, el('div', {}, [
-    el('button', { class: 'btn btn-danger btn-sm', onclick: async () => { if (!confirm('Discard timer without saving?')) return; await api('/api/timer', { method: 'DELETE' }); Timer.state = null; toast('Discarded'); closeModal(); renderTimerPill(); } }, 'Discard'),
+    el('button', { class: 'btn btn-danger btn-sm', onclick: discard }, 'Discard'),
     el('div', { class: 'spacer' }),
     el('button', { class: 'btn btn-ghost btn-sm', onclick: closeModal }, 'Cancel'),
     el('button', { class: 'btn btn-primary btn-sm', onclick: save }, 'Save'),
   ]));
 }
 
-function openTimerStopModal() {
-  const t = Timer.state;
+function openTimerStopModal(id) {
+  const t = timerById(id);
+  if (!t) return;
   const inc = t.incrementMinutes || 6;
   const incLabel = inc === 15 ? '0.25 hr' : '0.1 hr';
   const hoursRaw = (t.elapsedSeconds / 3600).toFixed(2);
@@ -3141,7 +3846,7 @@ function openTimerStopModal() {
     ]),
     el('div', { class: 'field' }, [ el('label', {}, 'Description'), el('textarea', { name: 'description' }, t.description || '') ]),
     el('div', { class: 'form-row' }, [
-      el('div', { class: 'field' }, [ el('label', {}, 'Date'), el('input', { name: 'date', type: 'date', value: new Date().toISOString().slice(0,10) }) ]),
+      el('div', { class: 'field' }, [ el('label', {}, 'Date'), el('input', { name: 'date', type: 'date', value: todayDateInput() }) ]),
       el('div', { class: 'field checkbox-row', style: 'align-items:center;padding-top:24px' }, [
         el('input', { type: 'checkbox', id: 'stop-billable', checked: 'checked' }),
         el('label', { for: 'stop-billable' }, 'Billable'),
@@ -3159,15 +3864,22 @@ function openTimerStopModal() {
       billable: $('#stop-billable').checked,
     };
     const raw = $('#stop-raw').checked;
-    await api('/api/timer/stop' + (raw ? '?rounding=raw' : ''), { method: 'POST', body: d });
-    Timer.state = null;
+    await api('/api/timers/' + id + '/stop' + (raw ? '?rounding=raw' : ''), { method: 'POST', body: d });
+    removeTimerLocal(id);
     toast('Time entry saved');
     closeModal();
-    renderTimerPill();
+    renderTimerWidget();
+    notifyTimerChange();
     if (state.currentView === 'time') navigate('time');
   };
+  const discard = async () => {
+    if (!confirm('Discard without saving?')) return;
+    await api('/api/timers/' + id, { method: 'DELETE' });
+    removeTimerLocal(id);
+    toast('Discarded'); closeModal(); renderTimerWidget(); notifyTimerChange();
+  };
   openModal('Stop timer & save time entry', body, el('div', {}, [
-    el('button', { class: 'btn btn-danger btn-sm', onclick: async () => { if (!confirm('Discard without saving?')) return; await api('/api/timer', { method: 'DELETE' }); Timer.state = null; toast('Discarded'); closeModal(); renderTimerPill(); } }, 'Discard'),
+    el('button', { class: 'btn btn-danger btn-sm', onclick: discard }, 'Discard'),
     el('div', { class: 'spacer' }),
     el('button', { class: 'btn btn-ghost btn-sm', onclick: closeModal }, 'Cancel'),
     el('button', { class: 'btn btn-primary btn-sm', onclick: save }, 'Save time entry'),
@@ -3188,8 +3900,15 @@ const EXPENSE_CATEGORIES = [
   { id: 'other', label: 'Other' },
 ];
 
-async function renderExpenses(mount) {
-  const [expenses, matters] = await Promise.all([api('/api/expenses'), api('/api/matters?status=active')]);
+async function renderExpenses(mount, v) {
+  // .catch(() => []) on secondaries: if matters fetch fails, the +New expense
+  // button loses its dropdown but the expense list still renders. api() already
+  // toasted the failure.
+  const [expenses, matters] = await Promise.all([
+    api('/api/expenses').catch(() => []),
+    api('/api/matters?status=active').catch(() => []),
+  ]);
+  if (isStaleRender(v)) return;
   const actions = $('#topbar-actions');
   actions.innerHTML = '';
   actions.appendChild(el('button', { class: 'btn btn-primary btn-sm', onclick: () => openExpenseForm(null, matters) }, '+ New expense'));
@@ -3457,7 +4176,7 @@ function openExpenseForm(existing, matters) {
       el('select', { name: 'matterId' }, matters.map(m =>
         el('option', { value: m.id, ...(e.matter_id === m.id ? { selected: 'selected' } : {}) }, m.name + (m.client_name ? ` — ${m.client_name}` : '')))) ]),
     el('div', { class: 'form-row' }, [
-      el('div', { class: 'field' }, [ el('label', {}, 'Date'), el('input', { name: 'date', type: 'date', value: e.date || new Date().toISOString().slice(0,10) }) ]),
+      el('div', { class: 'field' }, [ el('label', {}, 'Date'), el('input', { name: 'date', type: 'date', value: toDateInput(e.date) || todayDateInput() }) ]),
       el('div', { class: 'field' }, [ el('label', {}, 'Category'),
         el('select', { name: 'category' }, EXPENSE_CATEGORIES.map(c =>
           el('option', { value: c.id, ...((e.category||'other') === c.id ? { selected: 'selected' } : {}) }, c.label))) ]),
@@ -3515,12 +4234,13 @@ function openExpenseForm(existing, matters) {
 // ─────────────────────────────────────────────────────────────────────────
 // INVOICES
 // ─────────────────────────────────────────────────────────────────────────
-async function renderInvoices(mount) {
+async function renderInvoices(mount, v) {
   const [invoices, matters, profile] = await Promise.all([
-    api('/api/invoices'),
-    api('/api/matters'),  // include closed/on-hold so historical invoices still show their matter
+    api('/api/invoices').catch(() => []),
+    api('/api/matters').catch(() => []),  // include closed/on-hold so historical invoices still show their matter
     api('/api/me/profile').catch(() => ({})),
   ]);
+  if (isStaleRender(v)) return;
   const actions = $('#topbar-actions');
   actions.innerHTML = '';
   actions.appendChild(el('button', { class: 'btn btn-primary btn-sm',
@@ -3664,7 +4384,7 @@ async function renderInvoices(mount) {
     el('div', { class: 'spacer' }),
     (view.clientId || view.matterId) ? el('button', {
       class: 'btn btn-ghost btn-sm',
-      onclick: () => { view.clientId = ''; view.matterId = ''; persist(); renderInvoices(mount); },
+      onclick: () => { view.clientId = ''; view.matterId = ''; persist(); renderInvoices(mount, ++state._renderVersion); },
     }, 'Clear filters') : null,
   ]);
   mount.appendChild(filterStrip);
@@ -3677,7 +4397,7 @@ function openInvoiceForm(matters) {
   const body = el('div', {}, [
     picker,
     el('div', { class: 'form-row' }, [
-      el('div', { class: 'field' }, [ el('label', {}, 'Issue date'), el('input', { name: 'issuedAt', type: 'date', value: new Date().toISOString().slice(0,10) }) ]),
+      el('div', { class: 'field' }, [ el('label', {}, 'Issue date'), el('input', { name: 'issuedAt', type: 'date', value: todayDateInput() }) ]),
       el('div', { class: 'field' }, [ el('label', {}, 'Due date'), el('input', { name: 'dueAt', type: 'date' }) ]),
       el('div', { class: 'field' }, [ el('label', {}, 'Tax rate (e.g. 0.08)'), el('input', { name: 'taxRate', type: 'number', step: '0.001', value: '0' }) ]),
     ]),
@@ -3732,9 +4452,38 @@ async function openInvoiceDetail(id) {
     inv.status === 'draft' ? el('button', { class: 'btn btn-danger btn-sm', onclick: async () => { if (!confirm('Delete draft?')) return; await api('/api/invoices/' + id, { method: 'DELETE' }); toast('Deleted'); closeModal(); navigate('invoices'); } }, 'Delete') : null,
     el('div', { class: 'spacer' }),
     inv.status === 'draft' ? el('button', { class: 'btn btn-ghost btn-sm', onclick: () => openInvoiceEdit(id) }, 'Edit') : null,
+    (can('manageBilling') && inv.status !== 'void' && inv.status !== 'paid')
+      ? el('button', { class: 'btn btn-ghost btn-sm', onclick: () => copyPayLinkForInvoice(id) }, 'Pay link')
+      : null,
     el('a', { class: 'btn btn-gold btn-sm', href: '/api/invoices/' + id + '/pdf', target: '_blank' }, 'Download PDF'),
     el('button', { class: 'btn btn-primary btn-sm', onclick: closeModal }, 'Close'),
   ]), true);
+}
+
+// Copies a pay link for the invoice to the clipboard. Reuses an unused,
+// unexpired link if one already exists so reloads don't pile up dead links.
+async function copyPayLinkForInvoice(id) {
+  let url = null;
+  try {
+    const existing = await api('/api/invoices/' + id + '/payment-links').catch(() => []);
+    const live = (existing || []).find(l => !l.used_at && !l.expired);
+    if (live) {
+      url = live.url;
+    } else {
+      const r = await api('/api/invoices/' + id + '/payment-link', { method: 'POST', body: { expiresInDays: 30 } });
+      url = r.url;
+    }
+  } catch {
+    // api() already surfaced the error via toast.
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(url);
+    toast('Pay link copied');
+  } catch {
+    // Fallback for browsers without clipboard permission.
+    window.prompt('Copy this pay link:', url);
+  }
 }
 
 async function openInvoiceEdit(id) {
@@ -3742,7 +4491,7 @@ async function openInvoiceEdit(id) {
   if (inv.status !== 'draft') { toast('Only draft invoices can be edited', true); return; }
   const currentTaxRate = inv.subtotal > 0 ? +(inv.tax / inv.subtotal).toFixed(4) : 0;
 
-  const toDate = (s) => (s || '').slice(0, 10);
+  const toDate = toDateInput;
   const lineRows = inv.lines.map(l => ({ ...l }));
 
   const totalsEl = el('div', { style: 'text-align:right;font-size:13px;color:var(--text-muted)' });
@@ -3832,10 +4581,14 @@ async function openInvoiceEdit(id) {
 // ─────────────────────────────────────────────────────────────────────────
 // TRUST (IOLTA)
 // ─────────────────────────────────────────────────────────────────────────
-async function renderTrust(mount) {
+async function renderTrust(mount, v) {
   // Source clients from matters via the shared helper — same universe as the
   // time-entry picker, so the two lists can't drift.
-  const [trust, matters] = await Promise.all([api('/api/trust'), api('/api/matters?status=active')]);
+  const [trust, matters] = await Promise.all([
+    api('/api/trust').catch(() => ({ entries: [], balances: [] })),
+    api('/api/matters?status=active').catch(() => []),
+  ]);
+  if (isStaleRender(v)) return;
   const clients = clientsFromMattersList(matters).map(c => ({ id: c.id, full_name: c.name }));
   const actions = $('#topbar-actions');
   actions.innerHTML = '';
@@ -4110,7 +4863,7 @@ function openTrustForm(clients) {
     el('div', { class: 'field' }, [ el('label', {}, 'Client *'),
       el('select', { name: 'clientContactId', required: '' }, [ el('option', { value: '' }, '— choose —'), ...clients.map(c => el('option', { value: c.id }, c.full_name)) ]) ]),
     el('div', { class: 'form-row' }, [
-      el('div', { class: 'field' }, [ el('label', {}, 'Date'), el('input', { name: 'occurredAt', type: 'date', value: new Date().toISOString().slice(0,10) }) ]),
+      el('div', { class: 'field' }, [ el('label', {}, 'Date'), el('input', { name: 'occurredAt', type: 'date', value: todayDateInput() }) ]),
       el('div', { class: 'field' }, [ el('label', {}, 'Reference (check #, wire)'), el('input', { name: 'reference' }) ]),
     ]),
     el('div', { class: 'field' }, [ el('label', {}, 'Notes'), el('textarea', { name: 'notes' }) ]),
@@ -4136,8 +4889,9 @@ function openTrustForm(clients) {
 // ─────────────────────────────────────────────────────────────────────────
 // TEAM (user list + edit)
 // ─────────────────────────────────────────────────────────────────────────
-async function renderTeam(mount) {
+async function renderTeam(mount, v) {
   const seats = await api('/api/seats');
+  if (isStaleRender(v)) return;
   state._users = seats.users;
   const canEdit = can('manageUsers');
   const seeRates = can('viewRates');
@@ -4183,9 +4937,201 @@ async function renderTeam(mount) {
 // ─────────────────────────────────────────────────────────────────────────
 // SETTINGS (profile, firm info, pipeline stages — team moved to its own tab)
 // ─────────────────────────────────────────────────────────────────────────
-async function renderSettings(mount) {
+async function renderSettings(mount, v) {
+  if (isStaleRender(v)) return;
   mount.innerHTML = '';
-  // Profile
+
+  // Tab bar — Profile is always visible; Firm/Team/Invoices/Payments are admin-only.
+  const tabs = [{ id: 'profile', label: 'Profile' }];
+  if (can('manageFirm'))  tabs.push({ id: 'firm', label: 'Firm' });
+  if (can('manageUsers')) tabs.push({ id: 'team', label: 'Team' });
+  if (can('manageFirm'))  tabs.push({ id: 'invoices', label: 'Invoices' });
+  if (can('manageFirm'))  tabs.push({ id: 'payments', label: 'Payments' });
+
+  state._settingsTab ||= 'profile';
+  if (!tabs.find(t => t.id === state._settingsTab)) state._settingsTab = tabs[0].id;
+  const active = state._settingsTab;
+
+  const tabBar = el('div', { class: 'settings-tabs' },
+    tabs.map(t => el('button', {
+      class: t.id === active ? 'active' : '',
+      onclick: () => { state._settingsTab = t.id; renderSettings(mount, ++state._renderVersion); },
+    }, t.label))
+  );
+  mount.appendChild(tabBar);
+
+  const panel = el('div');
+  mount.appendChild(panel);
+
+  if (active === 'profile') await renderSettingsProfile(panel);
+  else if (active === 'firm')     renderSettingsFirm(panel);
+  else if (active === 'team')     await renderSettingsTeam(panel);
+  else if (active === 'invoices') renderSettingsInvoices(panel);
+  else if (active === 'payments') await renderSettingsPayments(panel);
+}
+
+async function renderSettingsPayments(mount) {
+  const cfg = await api('/api/firm/payments').catch(() => null);
+  if (!cfg) return;
+
+  const kekMissing = !cfg.paymentsEnabled;
+  const stripeBadge = cfg.connected.stripe
+    ? el('span', { class: 'badge badge-status-active' }, 'Connected')
+    : el('span', { class: 'badge badge-status-closed' }, 'Not connected');
+  const mercuryBadge = cfg.connected.mercury
+    ? el('span', { class: 'badge badge-status-active' }, 'Connected')
+    : el('span', { class: 'badge badge-status-closed' }, 'Not connected');
+
+  mount.appendChild(el('div', { class: 'card mb-24' }, [
+    el('h3', {}, 'How payments work'),
+    el('div', { style: 'font-size:13px;color:var(--text-muted);line-height:1.55' },
+      'Clients pay invoices through a hosted Stripe page. Funds settle into your Mercury account. '
+      + 'The CRM reconciles Mercury activity against invoices and your IOLTA trust ledger. '
+      + 'Retainers are routed to your trust account; earned fees to operating.'),
+    kekMissing
+      ? el('div', { class: 'alert', style: 'margin-top:14px;background:#fff3cd;border:1px solid #ffeeba;color:#856404;padding:10px 12px;border-radius:6px;font-size:13px' },
+          'PAYMENTS_KEK is not set on the server. Payment credentials cannot be stored until an admin sets that environment variable and restarts. Generate with: ',
+          el('code', { style: 'background:#fbeec7;padding:2px 4px;border-radius:3px' }, "node -e \"console.log(require('crypto').randomBytes(32).toString('base64'))\""))
+      : null,
+  ]));
+
+  // ── Stripe card ───────────────────────────────────────────────────────
+  mount.appendChild(el('div', { class: 'card mb-24' }, [
+    el('div', { class: 'row mb-16', style: 'align-items:center' }, [
+      el('h3', { style: 'margin:0' }, 'Stripe'),
+      el('div', { style: 'margin-left:10px' }, stripeBadge),
+      el('div', { class: 'spacer' }),
+      el('a', { href: 'https://dashboard.stripe.com/apikeys', target: '_blank', rel: 'noopener',
+                style: 'font-size:12px;color:var(--text-muted)' }, 'Get your API keys \u2197'),
+    ]),
+    el('div', { style: 'font-size:12px;color:var(--text-muted);margin-bottom:12px' },
+      'Create a Stripe account, then paste your Secret key (sk_test_… or sk_live_…) and Publishable key below. '
+      + 'The Webhook secret comes from Stripe once you add a webhook pointing at /api/pay/stripe-webhook.'),
+    el('div', { class: 'field' }, [
+      el('label', {}, 'Publishable key'),
+      el('input', { id: 'pm-stripe-pub', placeholder: 'pk_test_...', value: cfg.stripePublishable || '' }),
+    ]),
+    el('div', { class: 'field' }, [
+      el('label', {}, 'Secret key' + (cfg.stripeSecretKeyMasked ? ' (currently ' + cfg.stripeSecretKeyMasked + ')' : '')),
+      el('input', { id: 'pm-stripe-sk', type: 'password', autocomplete: 'off',
+                    placeholder: cfg.stripeSecretKeyMasked ? 'Leave blank to keep existing' : 'sk_test_...' }),
+    ]),
+    el('div', { class: 'field' }, [
+      el('label', {}, 'Webhook signing secret' + (cfg.stripeWebhookSecretMasked ? ' (currently ' + cfg.stripeWebhookSecretMasked + ')' : '')),
+      el('input', { id: 'pm-stripe-wh', type: 'password', autocomplete: 'off',
+                    placeholder: cfg.stripeWebhookSecretMasked ? 'Leave blank to keep existing' : 'whsec_...' }),
+    ]),
+    el('div', { class: 'form-row' }, [
+      el('label', { style: 'display:flex;align-items:center;gap:6px;font-size:13px' }, [
+        el('input', { id: 'pm-ach', type: 'checkbox', ...(cfg.achEnabled ? { checked: 'checked' } : {}) }),
+        'Accept ACH (lower fees, 3–5 day settle)',
+      ]),
+      el('label', { style: 'display:flex;align-items:center;gap:6px;font-size:13px;margin-left:20px' }, [
+        el('input', { id: 'pm-card', type: 'checkbox', ...(cfg.cardEnabled ? { checked: 'checked' } : {}) }),
+        'Accept cards (~2.9% + 30\u00a2)',
+      ]),
+    ]),
+  ]));
+
+  // ── Mercury card ──────────────────────────────────────────────────────
+  mount.appendChild(el('div', { class: 'card mb-24' }, [
+    el('div', { class: 'row mb-16', style: 'align-items:center' }, [
+      el('h3', { style: 'margin:0' }, 'Mercury'),
+      el('div', { style: 'margin-left:10px' }, mercuryBadge),
+      el('div', { class: 'spacer' }),
+      el('a', { href: 'https://mercury.com/api', target: '_blank', rel: 'noopener',
+                style: 'font-size:12px;color:var(--text-muted)' }, 'Mercury API docs \u2197'),
+    ]),
+    el('div', { style: 'font-size:12px;color:var(--text-muted);margin-bottom:12px' },
+      'Generate a read-only API token in Mercury (Settings \u2192 API). Then enter your operating and IOLTA-trust account IDs so the reconciler knows which account is which. Run Test connection to list the accounts Mercury shows for this token.'),
+    el('div', { class: 'field' }, [
+      el('label', {}, 'API token' + (cfg.mercuryTokenMasked ? ' (currently ' + cfg.mercuryTokenMasked + ')' : '')),
+      el('input', { id: 'pm-merc-tok', type: 'password', autocomplete: 'off',
+                    placeholder: cfg.mercuryTokenMasked ? 'Leave blank to keep existing' : 'secret-token:...' }),
+    ]),
+    el('div', { class: 'form-row' }, [
+      el('div', { class: 'field' }, [
+        el('label', {}, 'Operating account ID'),
+        el('input', { id: 'pm-merc-op', value: cfg.mercuryOperatingAccountId || '', placeholder: 'UUID from Mercury' }),
+      ]),
+      el('div', { class: 'field' }, [
+        el('label', {}, 'IOLTA trust account ID'),
+        el('input', { id: 'pm-merc-tr', value: cfg.mercuryTrustAccountId || '', placeholder: 'UUID from Mercury' }),
+      ]),
+    ]),
+    el('div', { id: 'pm-merc-accts', style: 'font-size:12px;color:var(--text-muted);margin-top:6px' }),
+  ]));
+
+  // ── Actions ───────────────────────────────────────────────────────────
+  const testOut = el('div', { id: 'pm-test-out', style: 'font-size:13px;margin-top:12px' });
+  mount.appendChild(el('div', { class: 'card mb-24' }, [
+    el('div', { class: 'row', style: 'align-items:center' }, [
+      el('button', {
+        class: 'btn btn-primary btn-sm',
+        ...(kekMissing ? { disabled: 'disabled' } : {}),
+        onclick: async () => {
+          const body = {
+            stripePublishable:         $('#pm-stripe-pub').value.trim(),
+            stripeSecretKey:           $('#pm-stripe-sk').value || undefined,
+            stripeWebhookSecret:       $('#pm-stripe-wh').value || undefined,
+            mercuryToken:              $('#pm-merc-tok').value || undefined,
+            mercuryOperatingAccountId: $('#pm-merc-op').value.trim(),
+            mercuryTrustAccountId:     $('#pm-merc-tr').value.trim(),
+            achEnabled:  $('#pm-ach').checked,
+            cardEnabled: $('#pm-card').checked,
+          };
+          // Only send secret fields if user typed something. Empty string means "leave existing".
+          if (!body.stripeSecretKey)     delete body.stripeSecretKey;
+          if (!body.stripeWebhookSecret) delete body.stripeWebhookSecret;
+          if (!body.mercuryToken)        delete body.mercuryToken;
+          await api('/api/firm/payments', { method: 'PUT', body });
+          toast('Saved');
+          mount.innerHTML = '';
+          await renderSettingsPayments(mount);
+        },
+      }, 'Save'),
+      el('button', {
+        class: 'btn btn-ghost btn-sm',
+        style: 'margin-left:8px',
+        ...(kekMissing ? { disabled: 'disabled' } : {}),
+        onclick: async () => {
+          testOut.textContent = 'Testing…';
+          try {
+            const r = await api('/api/firm/payments/test', { method: 'POST' });
+            testOut.innerHTML = '';
+            testOut.appendChild(el('div', {}, [
+              el('strong', {}, 'Stripe: '),
+              r.stripe.ok
+                ? el('span', { style: 'color:#1a7a3a' }, 'OK' + (r.stripe.displayName ? ' — ' + r.stripe.displayName : '') + (r.stripe.accountId ? ' (' + r.stripe.accountId + ')' : ''))
+                : el('span', { style: 'color:#a02020' }, r.stripe.error || 'Failed'),
+            ]));
+            testOut.appendChild(el('div', {}, [
+              el('strong', {}, 'Mercury: '),
+              r.mercury.ok
+                ? el('span', { style: 'color:#1a7a3a' }, 'OK — ' + r.mercury.accountCount + ' account(s) visible')
+                : el('span', { style: 'color:#a02020' }, r.mercury.error || 'Failed'),
+            ]));
+            // If Mercury returned accounts, render a hint list so the user can copy the right IDs.
+            const acctBox = $('#pm-merc-accts');
+            if (acctBox && r.mercury.ok && Array.isArray(r.mercury.accounts)) {
+              acctBox.innerHTML = '';
+              acctBox.appendChild(el('div', { style: 'margin-top:8px;font-weight:600;color:var(--text)' }, 'Mercury accounts visible:'));
+              r.mercury.accounts.forEach(a => {
+                acctBox.appendChild(el('div', { style: 'font-family:monospace;font-size:12px' },
+                  (a.name || '(unnamed)') + (a.kind ? ' [' + a.kind + ']' : '') + ' — ' + a.id));
+              });
+            }
+          } catch (e) {
+            testOut.textContent = 'Test failed: ' + e.message;
+          }
+        },
+      }, 'Test connection'),
+    ]),
+    testOut,
+  ]));
+}
+
+async function renderSettingsProfile(mount) {
   const profile = await api('/api/me/profile').catch(() => ({}));
   const browserTz = (Intl.DateTimeFormat().resolvedOptions().timeZone) || 'UTC';
   const currentTz = profile.timezone || browserTz;
@@ -4215,22 +5161,95 @@ async function renderSettings(mount) {
       el('button', { class: 'btn btn-ghost btn-sm', onclick: changePasswordModal }, 'Change password'),
     ]),
   ]));
+}
 
-  // Firm settings (admin)
-  if (can('manageFirm')) {
-    mount.appendChild(el('div', { class: 'card mb-24' }, [
-      el('h3', {}, 'Firm'),
-      el('div', { class: 'field' }, [ el('label', {}, 'Firm name'), el('input', { id: 'firm-name-in', value: state.firm.name || '' }) ]),
-      el('button', { class: 'btn btn-primary btn-sm', onclick: async () => {
-        await api('/api/firm', { method: 'PUT', body: { name: $('#firm-name-in').value } });
-        toast('Saved'); state.firm.name = $('#firm-name-in').value; $('#firm-name-label').textContent = state.firm.name;
-      } }, 'Save'),
-    ]));
+function renderSettingsFirm(mount) {
+  const firmSettings = state.firm.settings || {};
+  const firmDefaultInc = parseInt(firmSettings.defaultIncrementMinutes, 10);
+  const curInc = [6, 15].includes(firmDefaultInc) ? firmDefaultInc : 6;
+  mount.appendChild(el('div', { class: 'card mb-24' }, [
+    el('h3', {}, 'Firm info'),
+    el('div', { class: 'field' }, [ el('label', {}, 'Firm name'), el('input', { id: 'firm-name-in', value: state.firm.name || '' }) ]),
+    el('div', { class: 'field' }, [
+      el('label', {}, 'Default billing increment'),
+      el('select', { id: 'firm-default-inc' }, [
+        el('option', { value: '6',  ...(curInc === 6  ? { selected: 'selected' } : {}) }, '0.1 hr (6 min)'),
+        el('option', { value: '15', ...(curInc === 15 ? { selected: 'selected' } : {}) }, '0.25 hr (15 min)'),
+      ]),
+      el('div', { style: 'font-size:12px;color:var(--text-muted);margin-top:4px' },
+        'Applied when a matter or client doesn\u2019t set its own increment. Timers round up to this.'),
+    ]),
+    el('button', { class: 'btn btn-primary btn-sm', onclick: async () => {
+      const newInc = parseInt($('#firm-default-inc').value, 10);
+      const merged = { ...firmSettings, defaultIncrementMinutes: newInc };
+      await api('/api/firm', { method: 'PUT', body: { name: $('#firm-name-in').value, settings: merged } });
+      state.firm.name = $('#firm-name-in').value;
+      state.firm.settings = merged;
+      $('#firm-name-label').textContent = state.firm.name;
+      toast('Saved');
+    } }, 'Save'),
+  ]));
 
-    // Invoice customization — all stored in firm.settings JSON
-    {
-      const s = state.firm.settings || {};
-      const collectInvoiceSettings = (base) => {
+  mount.appendChild(el('div', { class: 'card mb-24' }, [
+    el('h3', {}, 'Pipeline stages'),
+    el('div', { style: 'font-size:12px;color:var(--text-muted);margin-bottom:10px' }, 'Stages prospects move through. One per line: "id | label".'),
+    el('textarea', { id: 'stages-ta', style: 'width:100%;min-height:140px;font-family:monospace' },
+      (state.firm.pipelineStages || []).map(s => `${s.id} | ${s.label}`).join('\n')),
+    el('button', { class: 'btn btn-primary btn-sm mt-16', onclick: async () => {
+      const lines = $('#stages-ta').value.split('\n').map(l => l.trim()).filter(Boolean);
+      const stages = lines.map(l => {
+        const [id, label] = l.split('|').map(s => s.trim());
+        return { id: id || label.toLowerCase().replace(/\s+/g,'-'), label: label || id };
+      });
+      await api('/api/firm', { method: 'PUT', body: { pipelineStages: stages } });
+      state.firm.pipelineStages = stages;
+      toast('Saved');
+    } }, 'Save stages'),
+  ]));
+}
+
+async function renderSettingsTeam(mount) {
+  const seats = await api('/api/seats');
+  state._users = seats.users;
+  const seeRates = can('viewRates');
+  mount.appendChild(el('div', { class: 'card mb-24' }, [
+    el('div', { class: 'row mb-16', style: 'align-items:center' }, [
+      el('h3', { style: 'margin:0' }, 'Team members'),
+      el('div', { class: 'spacer' }),
+      el('button', { class: 'btn btn-primary btn-sm', onclick: () => inviteUserModal(seats.roles) }, '+ Invite team member'),
+    ]),
+    el('table', { class: 'data' }, [
+      el('thead', {}, el('tr', {}, [
+        el('th', {}, 'Name'),
+        el('th', {}, 'Email'),
+        el('th', {}, 'Role'),
+        seeRates ? el('th', { class: 'num' }, 'Base rate')     : null,
+        seeRates ? el('th', { class: 'num' }, 'Discount rate') : null,
+        el('th', {}, 'Status'),
+        el('th', {}, ''),
+      ])),
+      el('tbody', {}, seats.users.map(u => el('tr', {}, [
+        el('td', {}, [
+          el('strong', {}, u.name || '—'),
+          u.isAdmin ? el('span', { class: 'badge', style: 'margin-left:6px;background:var(--gold-bg);color:#7a6119' }, 'Admin') : null,
+        ]),
+        el('td', {}, u.email ? el('a', { href: 'mailto:' + u.email }, u.email) : '—'),
+        el('td', {}, ROLE_LABELS[u.role] || u.role),
+        seeRates ? el('td', { class: 'num' }, fmt.money(u.defaultRate || 0)) : null,
+        seeRates ? el('td', { class: 'num' }, u.discountRate != null ? fmt.money(u.discountRate) : '—') : null,
+        el('td', {}, u.active
+          ? el('span', { class: 'badge badge-status-active' }, 'Active')
+          : el('span', { class: 'badge badge-status-closed' }, 'Inactive')),
+        el('td', {}, el('button', { class: 'btn btn-ghost btn-sm', onclick: () => editUserModal(u, seats.roles) }, 'Edit')),
+      ]))),
+    ]),
+  ]));
+}
+
+function renderSettingsInvoices(mount) {
+  // Invoice customization — all stored in firm.settings JSON
+  const s = state.firm.settings || {};
+  const collectInvoiceSettings = (base) => {
         const v = (id) => $('#' + id).value;
         return {
           ...base,
@@ -4255,79 +5274,22 @@ async function renderSettings(mount) {
           ? el('textarea', { id, style: 'width:100%;min-height:' + (opts.rows ? (opts.rows * 20) : 60) + 'px' }, val || '')
           : el('input', { id, type: opts.type || 'text', value: val == null ? '' : String(val), ...(opts.placeholder ? { placeholder: opts.placeholder } : {}) }),
       ]);
-      mount.appendChild(el('div', { class: 'card mb-24' }, [
+      mount.appendChild(el('div', { class: 'card mb-24 invoice-settings' }, [
         el('h3', {}, 'Invoice customization'),
-        el('div', { style: 'font-size:12px;color:var(--text-muted);margin-bottom:14px' },
+        el('div', { style: 'font-size:12px;color:var(--text-muted);margin-bottom:20px' },
           'Controls how invoice PDFs look and what shows on the remittance page.'),
 
         el('div', { class: 'form-row' }, [
           el('div', { class: 'field' }, [
             el('label', {}, 'Template'),
             el('select', { id: 'inv-template' }, [
-              el('option', { value: 'ap', ...((s.invoiceTemplate || 'ap') === 'ap' ? { selected: 'selected' } : {}) }, 'AP — detailed (cover + services + remittance)'),
+              el('option', { value: 'ap', ...((s.invoiceTemplate || 'ap') === 'ap' ? { selected: 'selected' } : {}) }, 'Customized — detailed (cover + services + remittance)'),
               el('option', { value: 'simple', ...(s.invoiceTemplate === 'simple' ? { selected: 'selected' } : {}) }, 'Simple — single page'),
             ]),
           ]),
           mkField('inv-accent', 'Accent color', s.accentColor || '#1e3a5f', { type: 'color' }),
         ]),
-        mkField('inv-logo-text', 'Logo header text', s.invoiceLogoText || (state.firm.name || '').toUpperCase(), { placeholder: 'Fallback used only when no logo image is uploaded' }),
-
-        // ── Logo upload ─────────────────────────────────────────────────
-        (() => {
-          const wrap = el('div', { class: 'field' }, [ el('label', {}, 'Firm logo (PNG or JPEG, max 2 MB)') ]);
-          const preview = el('div', {
-            id: 'inv-logo-preview',
-            style: 'display:flex;align-items:center;gap:12px;min-height:72px;padding:10px;border:1px dashed var(--border);border-radius:6px;background:#fafbfc',
-          });
-          // Holds pending upload: null = no change, {data, mime} = new upload, false = remove
-          let pending = null;
-          const renderPreview = () => {
-            preview.innerHTML = '';
-            const hasSaved = !!state.firm.hasLogo;
-            if (pending && pending !== false) {
-              const img = el('img', { src: 'data:' + pending.mime + ';base64,' + pending.data, style: 'max-height:60px;max-width:240px;background:#fff;border:1px solid var(--border);padding:4px;border-radius:4px' });
-              preview.appendChild(img);
-              preview.appendChild(el('div', { style: 'font-size:12px;color:var(--text-muted)' }, 'New logo selected — save to apply'));
-            } else if (pending === false) {
-              preview.appendChild(el('div', { style: 'font-size:12px;color:var(--text-muted)' }, 'Logo will be removed on save'));
-            } else if (hasSaved) {
-              const img = el('img', { src: '/api/firm/logo?t=' + Date.now(), style: 'max-height:60px;max-width:240px;background:#fff;border:1px solid var(--border);padding:4px;border-radius:4px', onerror: (e) => e.target.remove() });
-              preview.appendChild(img);
-              preview.appendChild(el('div', { style: 'font-size:12px;color:var(--text-muted)' }, 'Current logo'));
-            } else {
-              preview.appendChild(el('div', { style: 'font-size:12px;color:var(--text-muted)' }, 'No logo — the "Logo header text" above will be used instead'));
-            }
-          };
-          const fileIn = el('input', {
-            id: 'inv-logo-file', type: 'file', accept: 'image/png,image/jpeg',
-            style: 'display:none',
-            onchange: (e) => {
-              const f = e.target.files[0]; if (!f) return;
-              if (!['image/png','image/jpeg','image/jpg'].includes(f.type)) { toast('PNG or JPEG only', true); return; }
-              if (f.size > 2 * 1024 * 1024) { toast('Logo must be under 2 MB', true); return; }
-              const reader = new FileReader();
-              reader.onload = () => {
-                const b64 = String(reader.result).split(',')[1] || '';
-                pending = { data: b64, mime: f.type === 'image/jpg' ? 'image/jpeg' : f.type };
-                renderPreview();
-              };
-              reader.readAsDataURL(f);
-              e.target.value = '';
-            },
-          });
-          const buttons = el('div', { class: 'row mt-8', style: 'gap:8px' }, [
-            el('button', { class: 'btn btn-ghost btn-sm', onclick: () => fileIn.click() }, 'Choose file…'),
-            el('button', { class: 'btn btn-ghost btn-sm', onclick: () => { pending = false; renderPreview(); } }, 'Remove logo'),
-            el('button', { class: 'btn btn-ghost btn-sm', onclick: () => { pending = null; renderPreview(); } }, 'Reset'),
-          ]);
-          // Expose the pending logo state so the save/preview handlers can use it
-          state.firm._logoPending = () => pending;
-          wrap.appendChild(preview);
-          wrap.appendChild(fileIn);
-          wrap.appendChild(buttons);
-          renderPreview();
-          return wrap;
-        })(),
+        mkField('inv-logo-text', 'Logo header text', s.invoiceLogoText || (state.firm.name || '').toUpperCase(), { placeholder: 'Fallback used only when no logo image is uploaded. Upload images from the layout editor.' }),
 
         mkField('inv-firm-address', 'Firm address', s.address, { multiline: true, rows: 3 }),
 
@@ -4349,27 +5311,25 @@ async function renderSettings(mount) {
 
         mkField('inv-footer', 'Footer text', s.invoiceFooterText || 'INVOICES ARE PAYABLE UPON RECEIPT'),
 
+        el('div', { class: 'row mt-16', style: 'gap:8px;align-items:center;padding:14px;background:#f7f5ee;border:1px solid var(--border);border-radius:6px' }, [
+          el('div', { style: 'flex:1' }, [
+            el('div', { style: 'font-weight:600;font-size:13px;color:var(--navy)' }, 'Customize form text & layout'),
+            el('div', { style: 'font-size:12px;color:var(--text-muted);margin-top:2px' },
+              'Open the layout editor to rename section titles, column headers, and other labels with a live preview.'),
+          ]),
+          el('button', { class: 'btn btn-ghost btn-sm', onclick: () => openInvoiceLayoutEditor(collectInvoiceSettings(s)) }, 'Open layout editor'),
+        ]),
+
         el('div', { class: 'row mt-16', style: 'gap:8px;align-items:center' }, [
           el('button', { class: 'btn btn-primary btn-sm', onclick: async () => {
             await api('/api/firm', { method: 'PUT', body: { settings: collectInvoiceSettings(s) } });
             state.firm.settings = collectInvoiceSettings(s);
-            const pending = state.firm._logoPending && state.firm._logoPending();
-            if (pending && pending !== false) {
-              await api('/api/firm/logo', { method: 'POST', body: { mimeType: pending.mime, dataBase64: pending.data } });
-              state.firm.hasLogo = true;
-            } else if (pending === false) {
-              await api('/api/firm/logo', { method: 'DELETE' });
-              state.firm.hasLogo = false;
-            }
             toast('Invoice settings saved');
-            renderSettings($('#main')); // re-render so the preview pane reflects the saved logo
+            navigate('settings');
           } }, 'Save invoice settings'),
           el('button', { class: 'btn btn-ghost btn-sm', onclick: async () => {
             try {
-              const pending = state.firm._logoPending && state.firm._logoPending();
               const body = { settings: collectInvoiceSettings(s) };
-              if (pending && pending !== false) body.logo = { mimeType: pending.mime, dataBase64: pending.data };
-              else if (pending === false) body.logo = null;
               const res = await fetch('/api/invoices/preview', {
                 method: 'POST', credentials: 'include',
                 headers: { 'Content-Type': 'application/json' },
@@ -4403,25 +5363,726 @@ async function renderSettings(mount) {
           el('span', { style: 'font-size:12px;color:var(--text-muted)' }, 'Preview uses current form values — no need to save first.'),
         ]),
       ]));
-    }
+}
 
-    mount.appendChild(el('div', { class: 'card mb-24' }, [
-      el('h3', {}, 'Pipeline stages'),
-      el('div', { style: 'font-size:12px;color:var(--text-muted);margin-bottom:10px' }, 'Stages prospects move through. One per line: "id | label".'),
-      el('textarea', { id: 'stages-ta', style: 'width:100%;min-height:140px;font-family:monospace' },
-        (state.firm.pipelineStages || []).map(s => `${s.id} | ${s.label}`).join('\n')),
-      el('button', { class: 'btn btn-primary btn-sm mt-16', onclick: async () => {
-        const lines = $('#stages-ta').value.split('\n').map(l => l.trim()).filter(Boolean);
-        const stages = lines.map(l => {
-          const [id, label] = l.split('|').map(s => s.trim());
-          return { id: id || label.toLowerCase().replace(/\s+/g,'-'), label: label || id };
-        });
-        await api('/api/firm', { method: 'PUT', body: { pipelineStages: stages } });
-        state.firm.pipelineStages = stages;
-        toast('Saved');
-      } }, 'Save stages'),
-    ]));
-  }
+// Defaults for customizable PDF labels. Must match server.js.
+const DEFAULT_INVOICE_LABELS = {
+  invoiceHeading:          'INVOICE',
+  invoiceNumberLabel:      'Invoice No.',
+  dueLabelPrefix:          'Due:',
+  billingSummaryTitle:     'BILLING SUMMARY',
+  servicesSubtitlePrefix:  'For Professional Services Rendered as of',
+  paymentDetailsNote:      'Payment Details on Last Page',
+  professionalServicesTitle: 'Summary of Professional Services',
+  totalServicesLabel:      'Total Professional Services Rendered',
+  summaryByTimekeeperTitle:'Summary by Timekeeper',
+  costsTitle:              'Summary of Costs',
+  totalCostsLabel:         'Total Costs',
+  remittanceTitle:         'REMITTANCE',
+  currentDueLabel:         'Current Balance Due This Invoice',
+  outstandingLabel:        'Outstanding Balance',
+  totalBalanceDueLabel:    'TOTAL BALANCE DUE',
+  checksPayableLabel:      'All checks should be made payable to:',
+  wireHeadingLabel:        'For payment by wire or ACH in USD:',
+  notesHeadingLabel:       'Notes',
+  invoiceTotalLabel:       'Invoice Total',
+  taxLabel:                'Tax',
+  subtotalLabel:           'Subtotal',
+  colMatter:               'Matter #',
+  colDescription:          'Description',
+  colFees:                 'Fees',
+  colCosts:                'Costs',
+  colTotal:                'Total',
+  colDate:                 'Date',
+  colTimekeeper:           'Timekeeper',
+  colHours:                'Hours',
+  colRate:                 'Rate',
+  colAmount:               'Amount',
+  wireBeneficiaryNameLabel:    'Beneficiary Name',
+  wireBeneficiaryAddressLabel: 'Beneficiary Address',
+  wireAccountNumberLabel:      'Account Number',
+  wireRoutingNumberLabel:      'ABA Routing Number',
+  wireBankNameLabel:           'Bank Name',
+  wireBankAddressLabel:        'Bank Address',
+};
+
+// Opens a fullscreen editor that renders a paper-like mock invoice with
+// every customizable label as a contenteditable span. Edits happen in place
+// on the "page" — no separate toolbar column. Saving writes the label map
+// to firm.settings; actual PDFs are still generated server-side by pdfkit,
+// so the mockup is a faithful look-alike rather than a byte-perfect render.
+function openInvoiceLayoutEditor(baseSettings) {
+  const saved = state.firm.settings || {};
+  const working = { ...DEFAULT_INVOICE_LABELS, ...(saved.labels || {}) };
+  const accent    = baseSettings.accentColor || '#1e3a5f';
+  const logoText  = baseSettings.invoiceLogoText || (state.firm?.name || '').toUpperCase() || 'YOUR FIRM';
+  const remitName = baseSettings.remitPayeeName || state.firm?.name || 'Your Firm LLP';
+  const firmAddr  = baseSettings.address || '';
+  const remitAddr = baseSettings.remitAddress || firmAddr || '1 Firm Way\nNew York, NY 10001';
+  const wire = {
+    beneficiaryName:    baseSettings.wireBeneficiaryName    || remitName,
+    beneficiaryAddress: baseSettings.wireBeneficiaryAddress || remitAddr,
+    accountNumber:      baseSettings.wireAccountNumber      || '000000000',
+    routingNumber:      baseSettings.wireRoutingNumber      || '000000000',
+    bankName:           baseSettings.wireBankName           || 'Bank of Example, N.A.',
+    bankAddress:        baseSettings.wireBankAddress        || '100 Bank Plaza\nNew York, NY 10005',
+  };
+  const footerText = baseSettings.invoiceFooterText || 'INVOICES ARE PAYABLE UPON RECEIPT';
+
+  // Sample data — mirrors /api/invoices/preview
+  const year  = new Date().getFullYear();
+  const today = new Date();
+  const longDate  = (d) => d.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+  const shortDate = (d) => `${d.getMonth()+1}/${d.getDate()}/${String(d.getFullYear()).slice(2)}`;
+  const dMinus = (n) => { const x = new Date(today); x.setDate(x.getDate() - n); return x; };
+  const s = {
+    invoiceNumber: `INV-${year}-SAMPLE`,
+    issuedLong:    longDate(today),
+    client:        ['Acme Holdings, Inc.', '1209 Orange Street', 'Wilmington, DE 19801', 'ap@acmeholdings.example'],
+    matterId:      'SAMPLE',
+    matterDesc:    'General Corporate Advisory Services',
+    servicesTotal: 2025,
+    costsTotal:    250,
+    subtotal:      2275,
+    total:         2275,
+    outstanding:   850,
+    timeEntries: [
+      { date: shortDate(dMinus(14)), tk: 'Jane Doe', desc: 'Draft and revise stock purchase agreement; circulate issues list to client.', hours: 3.50, rate: 450, amount: 1575 },
+      { date: shortDate(dMinus(10)), tk: 'Jane Doe', desc: 'Telephone conference with client regarding due diligence findings and next steps.', hours: 1.00, rate: 450, amount:  450 },
+    ],
+    expenses: [
+      { desc: 'Delaware franchise tax filing fee', amount: 175 },
+      { desc: 'Courier delivery (overnight)',      amount:  75 },
+    ],
+  };
+  s.totalDue   = s.total + s.outstanding;
+  s.totalHours = s.timeEntries.reduce((a, e) => a + e.hours, 0);
+  const fm = (n) => '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  // Editable label span. Paste strips formatting; Enter blurs instead of
+  // inserting a newline, because none of these labels are multi-line.
+  const lbl = (key, extraCls) => {
+    const span = el('span', {
+      class: 'inv-lbl' + (extraCls ? ' ' + extraCls : ''),
+      contenteditable: 'true',
+      spellcheck: 'false',
+      'data-label-key': key,
+      title: 'Click to edit — ' + key,
+    }, working[key] || '');
+    span.addEventListener('paste', (e) => {
+      e.preventDefault();
+      const text = (e.clipboardData || window.clipboardData).getData('text');
+      document.execCommand('insertText', false, text);
+    });
+    span.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); span.blur(); }
+    });
+    return span;
+  };
+
+  const readLabels = () => {
+    const out = {};
+    overlay.querySelectorAll('[data-label-key]').forEach(n => {
+      out[n.dataset.labelKey] = (n.textContent || '').replace(/\s+/g, ' ').trim();
+    });
+    return out;
+  };
+
+  const resetAll = () => {
+    if (!confirm('Reset all labels back to defaults? Unsaved changes will be lost.')) return;
+    overlay.querySelectorAll('[data-label-key]').forEach(n => {
+      n.textContent = DEFAULT_INVOICE_LABELS[n.dataset.labelKey] || '';
+    });
+  };
+
+  const close = () => overlay.remove();
+
+  // Font family stacks — the PDF renderer maps each to the nearest PDFKit
+  // builtin (Helvetica / Times / Courier) since those are the only families
+  // guaranteed to render without bundling TTF files.
+  const FONT_STACKS = {
+    helvetica: `'Helvetica Neue', Helvetica, Arial, sans-serif`,
+    arial:     `Arial, Helvetica, sans-serif`,
+    verdana:   `Verdana, Geneva, sans-serif`,
+    trebuchet: `'Trebuchet MS', Tahoma, sans-serif`,
+    times:     `'Times New Roman', Times, serif`,
+    georgia:   `Georgia, 'Times New Roman', serif`,
+    palatino:  `'Palatino Linotype', Palatino, 'Book Antiqua', serif`,
+    garamond:  `Garamond, 'EB Garamond', 'Times New Roman', serif`,
+    courier:   `'Courier New', Courier, monospace`,
+    monaco:    `Monaco, Consolas, 'Courier New', monospace`,
+  };
+  const FONT_LABELS = {
+    helvetica: 'Helvetica',  arial: 'Arial',  verdana: 'Verdana',  trebuchet: 'Trebuchet MS',
+    times: 'Times New Roman', georgia: 'Georgia', palatino: 'Palatino', garamond: 'Garamond',
+    courier: 'Courier New',   monaco: 'Monaco',
+  };
+  // Legacy settings from earlier iterations:
+  const normalizeFont = (f) => {
+    if (f === 'serif') return 'times';
+    if (f === 'sans')  return 'helvetica';
+    return FONT_STACKS[f] ? f : 'helvetica';
+  };
+  // Global default family — used when a label has no per-label override.
+  let currentFont = normalizeFont(baseSettings.invoiceFontFamily);
+  const applyFont = (f) => {
+    f = normalizeFont(f);
+    currentFont = f;
+    const body = overlay.querySelector('.inv-editor-body');
+    if (body) body.style.setProperty('--inv-font', FONT_STACKS[f]);
+  };
+
+  // Per-label style overrides: { [key]: { family?, size? } }. Applied as
+  // inline styles on the corresponding contenteditable spans in the mockup,
+  // and passed to the PDF renderer via firmSettings.labelStyles.
+  const labelStyles = JSON.parse(JSON.stringify(baseSettings.labelStyles || {}));
+  const normalizeStyle = (key) => {
+    const s = labelStyles[key];
+    if (!s) return;
+    if (s.family != null && !FONT_STACKS[s.family]) delete s.family;
+    if (s.size != null) {
+      const n = Number(s.size);
+      if (!Number.isFinite(n) || n <= 0) delete s.size;
+      else s.size = n;
+    }
+    if (!s.family && s.size == null) delete labelStyles[key];
+  };
+  // Apply one label's styles to all matching spans in the mockup.
+  const applyLabelStyleToDom = (key) => {
+    const s = labelStyles[key] || {};
+    overlay.querySelectorAll(`[data-label-key="${key}"]`).forEach(span => {
+      span.style.fontFamily = s.family ? FONT_STACKS[s.family] : '';
+      span.style.fontSize   = s.size   ? (s.size + 'pt')       : '';
+    });
+  };
+  // Apply all stored label styles (called once on open).
+  const applyAllLabelStyles = () => {
+    Object.keys(labelStyles).forEach(applyLabelStyleToDom);
+  };
+
+  // Live logo scale — multiplier (0.5–2.0), default 1.0. Drives --inv-logo-scale.
+  const clampScale = (n) => Math.max(0.5, Math.min(2.0, Number(n) || 1));
+  let currentLogoScale = clampScale(baseSettings.invoiceLogoScale);
+  const applyLogoScale = (n) => {
+    currentLogoScale = clampScale(n);
+    const body = overlay.querySelector('.inv-editor-body');
+    if (body) body.style.setProperty('--inv-logo-scale', String(currentLogoScale));
+    const slider = overlay.querySelector('#inv-logo-size');
+    if (slider && Number(slider.value) !== currentLogoScale) slider.value = String(currentLogoScale);
+    const readout = overlay.querySelector('.inv-logo-group .sz');
+    if (readout) readout.textContent = Math.round(currentLogoScale * 100) + '%';
+  };
+
+  // Live logo state — null = no change, {data, mime} = new upload, false = remove-on-save.
+  let logoPending = null;
+  const logoSrc = () => {
+    if (logoPending && logoPending !== false) return 'data:' + logoPending.mime + ';base64,' + logoPending.data;
+    if (logoPending === false) return null;
+    return state.firm?.hasLogo ? ('/api/firm/logo?t=' + (state.firm._logoCacheBust || Date.now())) : null;
+  };
+  const renderLogos = () => {
+    const src = logoSrc();
+    overlay.querySelectorAll('.inv-logo-slot').forEach(slot => {
+      slot.innerHTML = '';
+      const isShort = slot.classList.contains('short');
+      if (src) {
+        slot.appendChild(el('img', { src, alt: 'Firm logo', onerror: (e) => { e.target.remove(); slot.appendChild(el('span', { class: 'inv-logo' + (isShort ? ' short-text' : ''), style: isShort ? 'font-size:14px' : '' }, logoText)); } }));
+      } else {
+        slot.appendChild(el('span', { class: 'inv-logo', style: isShort ? 'font-size:14px' : '' }, logoText));
+      }
+    });
+    // Update the header thumbnail too.
+    const thumb = overlay.querySelector('.inv-logo-group .thumb');
+    if (thumb) {
+      thumb.innerHTML = '';
+      if (src) thumb.appendChild(el('img', { src, onerror: (e) => { e.target.remove(); thumb.textContent = 'NO\nLOGO'; } }));
+      else thumb.textContent = 'NO\nLOGO';
+    }
+    // Toggle the Remove button visibility based on whether a logo is currently showing.
+    const removeBtn = overlay.querySelector('.inv-logo-group .mini-btn.danger');
+    if (removeBtn) removeBtn.style.display = src ? '' : 'none';
+  };
+  const pickLogo = () => {
+    const fileIn = overlay.querySelector('#inv-logo-file-picker');
+    if (fileIn) fileIn.click();
+  };
+  const removeLogo = () => {
+    logoPending = false;
+    renderLogos();
+  };
+
+  // Live accent color — updates the mockup via CSS var and is persisted on save.
+  let currentAccent = accent;
+  const applyAccent = (c) => {
+    if (!/^#[0-9a-fA-F]{6}$/.test(c)) return;
+    currentAccent = c;
+    const body = overlay.querySelector('.inv-editor-body');
+    if (body) body.style.setProperty('--inv-accent', c);
+    const picker = overlay.querySelector('#inv-accent-picker');
+    if (picker && picker.value !== c) picker.value = c;
+    overlay.querySelectorAll('.inv-swatch').forEach(s => {
+      s.classList.toggle('active', s.dataset.color.toLowerCase() === c.toLowerCase());
+    });
+  };
+
+  const save = async () => {
+    try {
+      const labels = readLabels();
+      // Strip empty style entries so labelStyles stays tidy on disk.
+      Object.keys(labelStyles).forEach(normalizeStyle);
+      const newSettings = { ...(state.firm.settings || {}), ...baseSettings,
+        accentColor: currentAccent,
+        invoiceFontFamily: currentFont,
+        invoiceLogoScale: currentLogoScale,
+        labels,
+        labelStyles };
+      await api('/api/firm', { method: 'PUT', body: { settings: newSettings } });
+      state.firm.settings = newSettings;
+      if (logoPending && logoPending !== false) {
+        await api('/api/firm/logo', { method: 'POST', body: { mimeType: logoPending.mime, dataBase64: logoPending.data } });
+        state.firm.hasLogo = true;
+        state.firm._logoCacheBust = Date.now();
+      } else if (logoPending === false) {
+        await api('/api/firm/logo', { method: 'DELETE' });
+        state.firm.hasLogo = false;
+      }
+      toast('Invoice layout saved');
+      close();
+      navigate('settings');
+    } catch (e) { /* api() already surfaces the error via toast */ }
+  };
+
+  const openRealPdf = async () => {
+    try {
+      Object.keys(labelStyles).forEach(normalizeStyle);
+      const body = { settings: { ...baseSettings,
+        accentColor: currentAccent,
+        invoiceFontFamily: currentFont,
+        invoiceLogoScale: currentLogoScale,
+        labels: readLabels(),
+        labelStyles } };
+      if (logoPending && logoPending !== false) body.logo = { mimeType: logoPending.mime, dataBase64: logoPending.data };
+      else if (logoPending === false) body.logo = null;
+      const res = await fetch('/api/invoices/preview', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) { toast('Preview failed (' + res.status + ')'); return; }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      window.open(url, '_blank');
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } catch (e) { toast('Preview failed: ' + (e.message || 'network error')); }
+  };
+
+  // Short header used on pages 2–4.
+  const shortHeader = () => el('div', {}, [
+    el('div', { class: 'inv-header-row' }, [
+      el('div', { class: 'inv-logo-slot short' }, [
+        el('span', { class: 'inv-logo', style: 'font-size:14px' }, logoText),
+      ]),
+      el('div', {}, [
+        el('div', { class: 'inv-title-sm' }, [ lbl('invoiceHeading') ]),
+        el('div', { class: 'inv-fake-muted', style: 'text-align:right;margin-top:2px' }, `${s.invoiceNumber}  ·  ${s.issuedLong}`),
+      ]),
+    ]),
+    el('div', { class: 'inv-divider-thin' }),
+  ]);
+
+  // ── Page 1: Cover + Billing Summary ─────────────────────────────────────
+  const page1 = el('div', { class: 'inv-page' }, [
+    el('div', { class: 'inv-header-row' }, [
+      el('div', { class: 'inv-logo-slot' }, [
+        el('span', { class: 'inv-logo' }, logoText),
+      ]),
+      el('div', { class: 'inv-title' }, [ lbl('invoiceHeading') ]),
+    ]),
+    el('div', { class: 'inv-divider' }),
+    el('div', { style: 'display:flex;justify-content:space-between;gap:24px;align-items:flex-start' }, [
+      el('div', { class: 'inv-client inv-fake' }, s.client.join('\n')),
+      el('div', { class: 'inv-meta' }, [
+        el('div', { class: 'num' }, [ lbl('invoiceNumberLabel'), ' ', el('span', { class: 'inv-fake' }, s.invoiceNumber) ]),
+        el('div', { class: 'inv-fake-muted' }, s.issuedLong),
+      ]),
+    ]),
+    el('div', { class: 'inv-section-title' }, [ lbl('billingSummaryTitle') ]),
+    el('div', { class: 'inv-subtitle' }, [
+      lbl('servicesSubtitlePrefix'), ' ',
+      el('span', { class: 'inv-fake' }, s.issuedLong),
+    ]),
+    el('table', { class: 'inv-table' }, [
+      el('thead', {}, el('tr', {}, [
+        el('th', {}, [ lbl('colMatter') ]),
+        el('th', {}, [ lbl('colDescription') ]),
+        el('th', { class: 'right' }, [ lbl('colFees') ]),
+        el('th', { class: 'right' }, [ lbl('colCosts') ]),
+        el('th', { class: 'right' }, [ lbl('colTotal') ]),
+      ])),
+      el('tbody', {}, [
+        el('tr', {}, [
+          el('td', { class: 'inv-fake' }, s.matterId),
+          el('td', { class: 'inv-fake' }, s.matterDesc),
+          el('td', { class: 'right inv-fake' }, fm(s.servicesTotal)),
+          el('td', { class: 'right inv-fake' }, fm(s.costsTotal)),
+          el('td', { class: 'right inv-fake' }, fm(s.subtotal)),
+        ]),
+        el('tr', { class: 'inv-totals-row' }, [
+          el('td', { colspan: 2 }, [ lbl('colTotal') ]),
+          el('td', { class: 'right inv-fake' }, fm(s.servicesTotal)),
+          el('td', { class: 'right inv-fake' }, fm(s.costsTotal)),
+          el('td', { class: 'right inv-fake' }, fm(s.subtotal)),
+        ]),
+      ]),
+    ]),
+    el('div', { class: 'inv-payment-note' }, [ lbl('paymentDetailsNote') ]),
+  ]);
+
+  // ── Page 2: Professional Services ───────────────────────────────────────
+  const page2 = el('div', { class: 'inv-page' }, [
+    shortHeader(),
+    el('div', { class: 'inv-section-title left' }, [
+      lbl('professionalServicesTitle'), ' — ',
+      el('span', { class: 'inv-fake' }, s.matterDesc),
+    ]),
+    el('table', { class: 'inv-table' }, [
+      el('thead', {}, el('tr', {}, [
+        el('th', {}, [ lbl('colDate') ]),
+        el('th', {}, [ lbl('colTimekeeper') ]),
+        el('th', {}, [ lbl('colDescription') ]),
+        el('th', { class: 'right' }, [ lbl('colHours') ]),
+        el('th', { class: 'right' }, [ lbl('colRate') ]),
+        el('th', { class: 'right' }, [ lbl('colAmount') ]),
+      ])),
+      el('tbody', {}, s.timeEntries.map(e => el('tr', {}, [
+        el('td', { class: 'inv-fake' }, e.date),
+        el('td', { class: 'inv-fake' }, e.tk),
+        el('td', { class: 'inv-fake' }, e.desc),
+        el('td', { class: 'right inv-fake' }, e.hours.toFixed(2)),
+        el('td', { class: 'right inv-fake' }, fm(e.rate)),
+        el('td', { class: 'right inv-fake' }, fm(e.amount)),
+      ]))),
+    ]),
+    el('div', { class: 'inv-rule' }),
+    el('div', { class: 'inv-totals-line' }, [
+      el('span', {}, [ lbl('totalServicesLabel') ]),
+      el('span', { class: 'inv-fake' }, s.totalHours.toFixed(2)),
+      el('span', { class: 'inv-fake' }, fm(s.servicesTotal)),
+    ]),
+    el('div', { class: 'inv-section-title left', style: 'margin-top:20px' }, [ lbl('summaryByTimekeeperTitle') ]),
+    el('table', { class: 'inv-table' }, [
+      el('thead', {}, el('tr', {}, [
+        el('th', {}, [ lbl('colTimekeeper') ]),
+        el('th', { class: 'right' }, [ lbl('colHours') ]),
+        el('th', { class: 'right' }, [ lbl('colAmount') ]),
+      ])),
+      el('tbody', {}, [ el('tr', {}, [
+        el('td', { class: 'inv-fake' }, 'Jane Doe'),
+        el('td', { class: 'right inv-fake' }, s.totalHours.toFixed(2)),
+        el('td', { class: 'right inv-fake' }, fm(s.servicesTotal)),
+      ]) ]),
+    ]),
+    el('div', { class: 'inv-rule' }),
+    el('div', { class: 'inv-totals-line' }, [
+      el('span', {}, [ lbl('colTotal') ]),
+      el('span', { class: 'inv-fake' }, s.totalHours.toFixed(2)),
+      el('span', { class: 'inv-fake' }, fm(s.servicesTotal)),
+    ]),
+  ]);
+
+  // ── Page 3: Costs ───────────────────────────────────────────────────────
+  const page3 = el('div', { class: 'inv-page' }, [
+    shortHeader(),
+    el('div', { class: 'inv-section-title left' }, [
+      lbl('costsTitle'), ' — ',
+      el('span', { class: 'inv-fake' }, s.matterDesc),
+    ]),
+    el('table', { class: 'inv-table' }, [
+      el('thead', {}, el('tr', {}, [
+        el('th', {}, [ lbl('colDescription') ]),
+        el('th', { class: 'right' }, [ lbl('colAmount') ]),
+      ])),
+      el('tbody', {}, s.expenses.map(x => el('tr', {}, [
+        el('td', { class: 'inv-fake' }, x.desc),
+        el('td', { class: 'right inv-fake' }, fm(x.amount)),
+      ]))),
+    ]),
+    el('div', { class: 'inv-rule' }),
+    el('div', { class: 'inv-totals-line' }, [
+      el('span', {}, [ lbl('totalCostsLabel') ]),
+      el('span', { class: 'inv-fake' }, fm(s.costsTotal)),
+    ]),
+  ]);
+
+  // ── Page 4: Remittance ──────────────────────────────────────────────────
+  const wireRow = (key, value) => el('div', { class: 'inv-wire-row' }, [
+    el('div', { class: 'k' }, [ lbl(key) ]),
+    el('div', { class: 'v inv-fake' }, value || '—'),
+  ]);
+  const page4 = el('div', { class: 'inv-page' }, [
+    shortHeader(),
+    el('div', { class: 'inv-section-title' }, [ lbl('remittanceTitle') ]),
+    el('div', { class: 'inv-bal' }, [
+      el('span', {}, [ lbl('currentDueLabel') ]),
+      el('span', { class: 'inv-fake' }, fm(s.total)),
+    ]),
+    el('div', { class: 'inv-bal' }, [
+      el('span', {}, [ lbl('outstandingLabel') ]),
+      el('span', { class: 'inv-fake' }, fm(s.outstanding)),
+    ]),
+    el('div', { class: 'inv-bal emph' }, [
+      el('span', {}, [ lbl('totalBalanceDueLabel') ]),
+      el('span', {}, fm(s.totalDue)),
+    ]),
+    el('div', { class: 'inv-block-heading' }, [ lbl('checksPayableLabel') ]),
+    el('div', { class: 'inv-fake', style: 'padding-left:14px;white-space:pre-line' }, `${remitName}\n${remitAddr}`),
+    el('div', { class: 'inv-block-heading' }, [ lbl('wireHeadingLabel') ]),
+    wireRow('wireBeneficiaryNameLabel',    wire.beneficiaryName),
+    wireRow('wireBeneficiaryAddressLabel', wire.beneficiaryAddress),
+    wireRow('wireAccountNumberLabel',      wire.accountNumber),
+    wireRow('wireRoutingNumberLabel',      wire.routingNumber),
+    wireRow('wireBankNameLabel',           wire.bankName),
+    wireRow('wireBankAddressLabel',        wire.bankAddress),
+    el('div', { class: 'inv-block-heading' }, [ lbl('notesHeadingLabel') ]),
+    el('div', { class: 'inv-fake', style: 'padding-left:14px' }, 'Sample invoice for preview purposes only.'),
+    el('div', { class: 'inv-footer' }, footerText),
+  ]);
+
+  const presets = [
+    { name: 'Navy',     color: '#1e3a5f' },
+    { name: 'Forest',   color: '#2f5d3e' },
+    { name: 'Burgundy', color: '#7a1f2b' },
+    { name: 'Charcoal', color: '#333333' },
+    { name: 'Teal',     color: '#0d6b6b' },
+    { name: 'Plum',     color: '#4a2a5e' },
+    { name: 'Copper',   color: '#a0522d' },
+  ];
+  const logoFileInput = el('input', {
+    id: 'inv-logo-file-picker', type: 'file', accept: 'image/png,image/jpeg',
+    style: 'display:none',
+    onchange: (e) => {
+      const f = e.target.files[0]; if (!f) return;
+      if (!['image/png','image/jpeg','image/jpg'].includes(f.type)) { toast('PNG or JPEG only', true); return; }
+      if (f.size > 2 * 1024 * 1024) { toast('Logo must be under 2 MB', true); return; }
+      const reader = new FileReader();
+      reader.onload = () => {
+        const b64 = String(reader.result).split(',')[1] || '';
+        logoPending = { data: b64, mime: f.type === 'image/jpg' ? 'image/jpeg' : f.type };
+        renderLogos();
+      };
+      reader.readAsDataURL(f);
+      e.target.value = '';
+    },
+  });
+  const logoGroup = el('div', { class: 'inv-logo-group', title: 'Firm logo (PNG/JPEG, max 2 MB)' }, [
+    el('span', { class: 'lab' }, 'Logo'),
+    el('div', { class: 'thumb' }),
+    el('button', { type: 'button', class: 'mini-btn', onclick: pickLogo }, 'Upload'),
+    el('button', { type: 'button', class: 'mini-btn danger', onclick: removeLogo }, 'Remove'),
+    el('div', { class: 'size-wrap', title: 'Logo size' }, [
+      el('input', {
+        id: 'inv-logo-size', type: 'range',
+        min: '0.5', max: '2', step: '0.05',
+        value: String(currentLogoScale),
+        oninput: (e) => applyLogoScale(e.target.value),
+      }),
+      el('span', { class: 'sz' }, Math.round(currentLogoScale * 100) + '%'),
+    ]),
+    logoFileInput,
+  ]);
+
+  // Floating font editor — appears when any contenteditable label gets focus.
+  // Has two sections: Default font (global), and Selected label (per-label).
+  let focusedLabelKey = null;
+
+  const defaultFontSelect = el('select', {
+    id: 'inv-default-font',
+    onchange: (e) => applyFont(e.target.value),
+  }, Object.keys(FONT_STACKS).map(k => el('option', {
+    value: k,
+    ...(k === currentFont ? { selected: 'selected' } : {}),
+    style: `font-family:${FONT_STACKS[k]}`,
+  }, FONT_LABELS[k])));
+
+  const labelFamilySelect = el('select', {
+    id: 'inv-label-font',
+    onchange: (e) => {
+      if (!focusedLabelKey) return;
+      labelStyles[focusedLabelKey] = labelStyles[focusedLabelKey] || {};
+      const v = e.target.value;
+      if (v === '') delete labelStyles[focusedLabelKey].family;
+      else labelStyles[focusedLabelKey].family = v;
+      normalizeStyle(focusedLabelKey);
+      applyLabelStyleToDom(focusedLabelKey);
+    },
+  }, [
+    el('option', { value: '' }, 'Use default'),
+    ...Object.keys(FONT_STACKS).map(k => el('option', {
+      value: k, style: `font-family:${FONT_STACKS[k]}`,
+    }, FONT_LABELS[k])),
+  ]);
+
+  const labelSizeInput = el('input', {
+    id: 'inv-label-size', type: 'number', min: '4', max: '72', step: '0.5',
+    placeholder: 'default',
+    oninput: (e) => {
+      if (!focusedLabelKey) return;
+      labelStyles[focusedLabelKey] = labelStyles[focusedLabelKey] || {};
+      const v = e.target.value;
+      if (v === '') delete labelStyles[focusedLabelKey].size;
+      else labelStyles[focusedLabelKey].size = Number(v);
+      normalizeStyle(focusedLabelKey);
+      applyLabelStyleToDom(focusedLabelKey);
+    },
+  });
+
+  const resetLabelBtn = el('button', {
+    type: 'button', class: 'btn btn-ghost btn-sm',
+    onclick: () => {
+      if (!focusedLabelKey) return;
+      delete labelStyles[focusedLabelKey];
+      applyLabelStyleToDom(focusedLabelKey);
+      labelFamilySelect.value = '';
+      labelSizeInput.value = '';
+    },
+  }, 'Reset this label');
+
+  const fontPanel = el('div', { class: 'inv-font-panel', 'data-open': '0' }, [
+    el('div', { class: 'hdr' }, [
+      el('div', { class: 'ttl' }, 'Text'),
+      el('button', {
+        type: 'button', class: 'close', title: 'Close', onclick: () => hideFontPanel(true),
+      }, '×'),
+    ]),
+    el('div', { class: 'section' }, [
+      el('div', { class: 'section-ttl' }, 'Default font'),
+      el('div', { class: 'field' }, [
+        el('label', { for: 'inv-default-font' }, 'Family'),
+        defaultFontSelect,
+      ]),
+      el('div', { class: 'hint' }, 'Used for every label without its own override.'),
+    ]),
+    el('div', { class: 'section label-section', id: 'inv-label-section' }, [
+      el('div', { class: 'section-ttl' }, [
+        'This label ',
+        el('span', { id: 'inv-font-target', class: 'tgt' }, ''),
+      ]),
+      el('div', { class: 'field' }, [
+        el('label', { for: 'inv-label-font' }, 'Family'),
+        labelFamilySelect,
+      ]),
+      el('div', { class: 'field' }, [
+        el('label', { for: 'inv-label-size' }, 'Size (pt)'),
+        labelSizeInput,
+      ]),
+      el('div', { class: 'preview' }, [
+        el('div', { id: 'inv-font-preview', class: 'sample' }, 'The quick brown fox'),
+      ]),
+      resetLabelBtn,
+    ]),
+    el('div', { class: 'hint', style: 'margin-top:10px' }, 'Click any label on the page to edit it. Preview actual PDF to verify.'),
+  ]);
+
+  const refreshLabelPanel = (key) => {
+    focusedLabelKey = key;
+    const sec = overlay.querySelector('#inv-label-section');
+    const tgt = overlay.querySelector('#inv-font-target');
+    const sample = overlay.querySelector('#inv-font-preview');
+    if (!key) {
+      if (sec) sec.style.display = 'none';
+      return;
+    }
+    if (sec) sec.style.display = '';
+    if (tgt) tgt.textContent = `· ${key}`;
+    const s = labelStyles[key] || {};
+    labelFamilySelect.value = s.family || '';
+    labelSizeInput.value    = s.size != null ? String(s.size) : '';
+    if (sample) {
+      const span = overlay.querySelector(`[data-label-key="${key}"]`);
+      sample.textContent = (span?.textContent || '').trim() || 'The quick brown fox';
+      sample.style.fontFamily = s.family ? FONT_STACKS[s.family] : FONT_STACKS[currentFont];
+      sample.style.fontSize   = s.size   ? (s.size + 'pt')       : '';
+    }
+  };
+
+  let fontPanelHideTimer = null;
+  const showFontPanel = (labelEl) => {
+    clearTimeout(fontPanelHideTimer);
+    fontPanel.dataset.open = '1';
+    refreshLabelPanel(labelEl?.dataset?.labelKey || null);
+  };
+  const hideFontPanel = (immediate) => {
+    clearTimeout(fontPanelHideTimer);
+    if (immediate) { fontPanel.dataset.open = '0'; return; }
+    fontPanelHideTimer = setTimeout(() => { fontPanel.dataset.open = '0'; }, 180);
+  };
+
+  const colorGroup = el('div', { class: 'inv-color-group', title: 'Accent color' }, [
+    el('span', { class: 'lab' }, 'Color'),
+    ...presets.map(p => el('button', {
+      type: 'button',
+      class: 'inv-swatch',
+      'data-color': p.color,
+      style: `background:${p.color}`,
+      title: p.name,
+      onclick: () => applyAccent(p.color),
+    })),
+    el('input', {
+      id: 'inv-accent-picker',
+      type: 'color',
+      value: accent,
+      title: 'Custom color',
+      oninput: (e) => applyAccent(e.target.value),
+    }),
+  ]);
+
+  const overlay = el('div', { class: 'inv-editor-overlay' }, [
+    el('div', { class: 'inv-editor-header' }, [
+      el('div', {}, [
+        el('h3', {}, 'Invoice layout editor'),
+        el('div', { class: 'hint' }, 'Click any highlighted label to edit it in place.'),
+      ]),
+      el('div', { class: 'actions' }, [
+        logoGroup,
+        colorGroup,
+        el('button', { class: 'btn btn-ghost btn-sm', onclick: openRealPdf }, 'Preview actual PDF'),
+        el('button', { class: 'btn btn-ghost btn-sm', onclick: resetAll }, 'Reset to defaults'),
+        el('button', { class: 'btn btn-ghost btn-sm', onclick: close }, 'Cancel'),
+        el('button', { class: 'btn btn-primary btn-sm', onclick: save }, 'Save layout'),
+      ]),
+    ]),
+    el('div', { class: 'inv-editor-body', style: `--inv-accent:${accent}` }, [
+      page1, page2, page3, page4,
+    ]),
+    fontPanel,
+  ]);
+
+  // Show the panel when a label gains focus; hide shortly after it blurs,
+  // unless focus moves into the panel (so the user can click controls).
+  overlay.addEventListener('focusin', (e) => {
+    const tgt = e.target;
+    if (tgt && tgt.classList && tgt.classList.contains('inv-lbl')) {
+      showFontPanel(tgt);
+    } else if (fontPanel.contains(tgt)) {
+      clearTimeout(fontPanelHideTimer);
+    }
+  });
+  overlay.addEventListener('focusout', (e) => {
+    const next = e.relatedTarget;
+    if (next && (next.classList?.contains('inv-lbl') || fontPanel.contains(next))) return;
+    hideFontPanel(false);
+  });
+
+  document.body.appendChild(overlay);
+  // Initialize active-swatch highlight if the current accent matches a preset.
+  overlay.querySelectorAll('.inv-swatch').forEach(sw => {
+    sw.classList.toggle('active', sw.dataset.color.toLowerCase() === accent.toLowerCase());
+  });
+  applyFont(currentFont);
+  applyLogoScale(currentLogoScale);
+  applyAllLabelStyles();
+  refreshLabelPanel(null);
+  renderLogos();
 }
 
 function changePasswordModal() {
@@ -4435,8 +6096,11 @@ function changePasswordModal() {
     el('button', { class: 'btn btn-primary btn-sm', onclick: async () => {
       try {
         await api('/api/auth/change-password', { method: 'POST', body: { currentPassword: $('#cp-cur').value, newPassword: $('#cp-new').value } });
-        toast('Password updated'); closeModal();
-      } catch(e) {}
+      } catch(e) {
+        console.error('Password change failed:', e);
+        return;
+      }
+      toast('Password updated'); closeModal();
     } }, 'Update'),
   ]));
 }
@@ -4456,7 +6120,7 @@ function inviteUserModal(roles) {
     el('button', { class: 'btn btn-ghost btn-sm', onclick: closeModal }, 'Cancel'),
     el('button', { class: 'btn btn-primary btn-sm', onclick: async () => {
       await api('/api/seats/invite', { method: 'POST', body: { email: $('#inv-email').value, role: $('#inv-role').value, isAdmin: $('#inv-admin').checked } });
-      toast('Invite sent'); closeModal(); navigate('settings');
+      toast('Invite sent'); closeModal(); state._users = null; navigate(state.currentView || 'team');
     } }, 'Send invite'),
   ]));
 }
@@ -4505,7 +6169,7 @@ function editUserModal(u, roles) {
       if (u.email !== state.me.email) {
         await api('/api/seats/' + encodeURIComponent(u.email), { method: 'PATCH', body: { isAdmin: $('#eu-admin').checked } });
       }
-      toast('Saved'); closeModal(); state._users = null; navigate('team');
+      toast('Saved'); closeModal(); state._users = null; navigate(state.currentView || 'team');
     } }, 'Save'),
   ]));
 }
