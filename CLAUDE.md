@@ -17,6 +17,10 @@ node reset-password.js <email> <new-password>   # Reset a user's password locall
 **First-boot seed:** set `SEED_ADMIN_PASSWORD` and (optionally) `SEED_ADMIN_EMAIL`, `SEED_FIRM_NAME`. These create the first admin + firm on initial deploy; remove after first boot.
 **Optional env vars:** `DB_PATH`, `ALLOWED_ORIGIN`, `DT_URL`, `SPV_URL`, `LB_URL`, `PORT`, SMTP vars (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`), `ANTHROPIC_API_KEY` (enables the "Read receipt to autofill" button on expenses — without it, `POST /api/expenses/extract` returns 503), `PAYMENTS_KEK` (32-byte base64; encrypts Stripe/Mercury credentials in `firm_payment_config`. Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`. Without it, the Payments settings tab loads read-only and `PUT /api/firm/payments` returns 503 — the rest of the app runs normally). See `PAYMENTS_DESIGN.md` for the full payments architecture.
 
+### Receipt Reader — Prefer pdf.js for PDFs
+
+The "Read receipt to autofill" flow must try **pdf.js first** for any uploaded PDF before falling back to `ANTHROPIC_API_KEY`. pdf.js runs in the browser, extracts embedded text for free, and handles digitally-generated receipts (the common case). Only when pdf.js returns no text (i.e. scanned-image PDFs or non-PDF images like JPG/PNG) should the request hit `POST /api/expenses/extract` and burn API credits. Goal: don't charge the API key for receipts we can parse locally.
+
 ## Architecture
 
 **Single-server monolith** — `server.js` handles Express REST API, JWT auth, SQLite, static file serving, and PDF generation. Matches the DealTracker pattern.

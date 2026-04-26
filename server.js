@@ -555,6 +555,22 @@ db.exec(`
     last_synced_at TEXT,
     last_cursor    TEXT
   );
+
+  -- Invoice adjustments: write-downs (courtesy discounts, bad debt) and write-ups.
+  -- Stored signed (writedown=negative). Original invoices.total stays immutable;
+  -- net billed = total + sum(adjustments). Append-only conceptually — admins can
+  -- void via a reversing entry, no in-place edits, so the audit trail is clean.
+  CREATE TABLE IF NOT EXISTS invoice_adjustments (
+    id           TEXT PRIMARY KEY,
+    firm_id      TEXT NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
+    invoice_id   TEXT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+    amount       REAL NOT NULL,                -- signed: negative = writedown
+    kind         TEXT NOT NULL,                -- writedown|writeup|courtesy|bad_debt
+    occurred_at  TEXT DEFAULT (datetime('now')),
+    reason       TEXT,
+    created_by   TEXT,
+    created_at   TEXT DEFAULT (datetime('now'))
+  );
 `);
 
 // ── MIGRATIONS (idempotent ALTERs) ──────────────────────────────────────
@@ -578,6 +594,21 @@ const migrations = [
   `ALTER TABLE contacts ADD COLUMN originating_attorney_email TEXT`,
   `ALTER TABLE contacts ADD COLUMN origination_split_pct REAL`,
   `ALTER TABLE contacts ADD COLUMN billing_attorney_email TEXT`,
+  `ALTER TABLE contacts ADD COLUMN client_number INTEGER`,
+  `ALTER TABLE matters  ADD COLUMN matter_number INTEGER`,
+  `ALTER TABLE contacts ADD COLUMN primary_contact_name TEXT`,
+  `ALTER TABLE contacts ADD COLUMN primary_contact_title TEXT`,
+  `ALTER TABLE contacts ADD COLUMN primary_contact_email TEXT`,
+  `ALTER TABLE contacts ADD COLUMN primary_contact_phone TEXT`,
+  // Manual payments + write-downs. invoice_payments existed for Stripe-only;
+  // the next three columns let it serve as the source of truth for all cash
+  // (check, wire, ach, cash, trust-applied, manual). amount_writedown is the
+  // denormalized sum of invoice_adjustments per invoice — kept for fast filter
+  // queries on the dashboard.
+  `ALTER TABLE invoice_payments ADD COLUMN reference TEXT`,
+  `ALTER TABLE invoice_payments ADD COLUMN notes TEXT`,
+  `ALTER TABLE invoice_payments ADD COLUMN created_by TEXT`,
+  `ALTER TABLE invoices ADD COLUMN amount_writedown REAL DEFAULT 0`,
 ];
 // Only swallow "duplicate column" errors (idempotency). Anything else — syntax
 // typos, missing table, permission issues — is a real problem and should fail
@@ -648,6 +679,52 @@ try {
   }
 } catch(e) { console.error('owner_email backfill failed:', e.message); }
 
+// Backfill: assign per-firm sequential client_number to any existing
+// type='client' contact missing one. Order by created_at so the oldest client
+// gets #1. Subsequent inserts continue from MAX+1 (see POST /api/contacts).
+try {
+  const firms = db.prepare(`SELECT DISTINCT firm_id FROM contacts WHERE type = 'client' AND client_number IS NULL`).all();
+  for (const f of firms) {
+    const maxRow = db.prepare(`SELECT COALESCE(MAX(client_number), 0) AS m FROM contacts WHERE firm_id = ?`).get(f.firm_id);
+    let next = (maxRow?.m || 0) + 1;
+    const rows = db.prepare(`SELECT id FROM contacts WHERE firm_id = ? AND type = 'client' AND client_number IS NULL ORDER BY created_at, id`).all(f.firm_id);
+    const upd = db.prepare(`UPDATE contacts SET client_number = ? WHERE id = ?`);
+    for (const r of rows) { upd.run(next, r.id); next++; }
+    if (rows.length) console.log(`[migration] Assigned client_number to ${rows.length} contacts in firm ${f.firm_id}`);
+  }
+} catch(e) { console.error('client_number backfill failed:', e.message); }
+
+// Backfill: assign per-client sequential matter_number to any existing matter
+// with a client_contact_id but no matter_number. Order by opened_at so the
+// oldest matter under a client gets 00001.
+try {
+  const clients = db.prepare(`SELECT DISTINCT client_contact_id FROM matters WHERE client_contact_id IS NOT NULL AND matter_number IS NULL`).all();
+  for (const c of clients) {
+    const maxRow = db.prepare(`SELECT COALESCE(MAX(matter_number), 0) AS m FROM matters WHERE client_contact_id = ?`).get(c.client_contact_id);
+    let next = (maxRow?.m || 0) + 1;
+    const rows = db.prepare(`SELECT id FROM matters WHERE client_contact_id = ? AND matter_number IS NULL ORDER BY opened_at, id`).all(c.client_contact_id);
+    const upd = db.prepare(`UPDATE matters SET matter_number = ? WHERE id = ?`);
+    for (const r of rows) { upd.run(next, r.id); next++; }
+    if (rows.length) console.log(`[migration] Assigned matter_number to ${rows.length} matters under client ${c.client_contact_id}`);
+  }
+} catch(e) { console.error('matter_number backfill failed:', e.message); }
+
+// Backfill: clientless matters also get a number (per-firm sequence) so the
+// invoice can always print a real matter no. instead of falling back to the
+// internal uuid. The number is independent of the per-client sequence — the
+// display logic in fmtMatterFullId just shows it without a "{client#}-" prefix.
+try {
+  const firms = db.prepare(`SELECT DISTINCT firm_id FROM matters WHERE client_contact_id IS NULL AND matter_number IS NULL`).all();
+  for (const f of firms) {
+    const maxRow = db.prepare(`SELECT COALESCE(MAX(matter_number), 0) AS m FROM matters WHERE firm_id = ? AND client_contact_id IS NULL`).get(f.firm_id);
+    let next = (maxRow?.m || 0) + 1;
+    const rows = db.prepare(`SELECT id FROM matters WHERE firm_id = ? AND client_contact_id IS NULL AND matter_number IS NULL ORDER BY opened_at, id`).all(f.firm_id);
+    const upd = db.prepare(`UPDATE matters SET matter_number = ? WHERE id = ?`);
+    for (const r of rows) { upd.run(next, r.id); next++; }
+    if (rows.length) console.log(`[migration] Assigned matter_number to ${rows.length} clientless matters in firm ${f.firm_id}`);
+  }
+} catch(e) { console.error('clientless matter_number backfill failed:', e.message); }
+
 // ── INDEXES ─────────────────────────────────────────────────────────────
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_users_firm ON users(firm_id);
@@ -662,6 +739,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_interactions_firm_time ON interactions(firm_id, occurred_at);
   CREATE INDEX IF NOT EXISTS idx_matters_firm ON matters(firm_id);
   CREATE INDEX IF NOT EXISTS idx_matters_client ON matters(client_contact_id);
+  CREATE INDEX IF NOT EXISTS idx_matters_client_num ON matters(client_contact_id, matter_number);
+  CREATE INDEX IF NOT EXISTS idx_contacts_firm_clinum ON contacts(firm_id, client_number);
   CREATE INDEX IF NOT EXISTS idx_time_firm_date ON time_entries(firm_id, date);
   CREATE INDEX IF NOT EXISTS idx_time_user_date ON time_entries(user_email, date);
   CREATE INDEX IF NOT EXISTS idx_time_matter ON time_entries(matter_id);
@@ -688,6 +767,9 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_paylinks_invoice ON payment_links(invoice_id);
   CREATE INDEX IF NOT EXISTS idx_banktx_firm   ON bank_transactions(firm_id, posted_at);
   CREATE INDEX IF NOT EXISTS idx_banktx_unrec  ON bank_transactions(firm_id) WHERE reconciled_payment_id IS NULL;
+  CREATE INDEX IF NOT EXISTS idx_invadj_invoice ON invoice_adjustments(invoice_id);
+  CREATE INDEX IF NOT EXISTS idx_invadj_firm    ON invoice_adjustments(firm_id, occurred_at);
+  CREATE INDEX IF NOT EXISTS idx_invpay_firm_occ ON invoice_payments(firm_id, occurred_at);
 `);
 
 // ── SEED FIRM + ADMIN (first boot only) ─────────────────────────────────
@@ -910,11 +992,53 @@ function handleChargeRefunded(firmId, ch) {
   })();
 }
 
+// Recompute an invoice's amount_paid + amount_writedown + status from the
+// underlying invoice_payments + invoice_adjustments rows. Single source of
+// truth for invoice math — manual payment, adjustment, and reversal endpoints
+// all funnel through this so the row stays in sync with its ledger.
+//
+// The Stripe webhook handlers above intentionally do not call this — they know
+// the delta (added or refunded amount) and do an inline UPDATE to keep the
+// race window small. Both paths converge on the same columns.
+function recomputeInvoiceTotals(invoiceId, firmId) {
+  const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?').get(invoiceId, firmId);
+  if (!inv) return null;
+
+  const paidRow = db.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM invoice_payments
+                              WHERE invoice_id = ? AND firm_id = ? AND status = 'succeeded'`).get(invoiceId, firmId);
+  const adjRow  = db.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM invoice_adjustments
+                              WHERE invoice_id = ? AND firm_id = ?`).get(invoiceId, firmId);
+
+  const amountPaid      = Math.round(Number(paidRow.s || 0) * 100) / 100;
+  const amountWritedown = Math.round(Number(adjRow.s  || 0) * 100) / 100; // signed; negative = writedown
+  const netBilled       = Math.round((Number(inv.total || 0) + amountWritedown) * 100) / 100;
+  const fullySettled    = netBilled > 0 && amountPaid >= netBilled - 0.005;
+
+  // Void stays void. Otherwise: paid when settled (or when adjustments zero
+  // out the bill); sent when partial cash has hit a draft; otherwise leave
+  // status alone (admin can still PATCH manually).
+  let nextStatus = inv.status;
+  if (inv.status !== 'void') {
+    if (fullySettled) nextStatus = 'paid';
+    else if (netBilled <= 0 && (amountPaid > 0 || amountWritedown !== 0)) nextStatus = 'paid';
+    else if (inv.status === 'draft' && amountPaid > 0) nextStatus = 'sent';
+    else if (inv.status === 'paid' && !fullySettled) nextStatus = amountPaid > 0 ? 'sent' : 'draft';
+  }
+
+  db.prepare(`UPDATE invoices SET amount_paid = ?, amount_writedown = ?, status = ?, updated_at = datetime('now')
+              WHERE id = ?`).run(amountPaid, amountWritedown, nextStatus, invoiceId);
+  return { amountPaid, amountWritedown, netBilled, status: nextStatus };
+}
+
 app.use(express.json({ limit: '20mb' }));
 app.use(express.static(path.join(__dirname, 'public'), {
+  etag: false,
+  lastModified: false,
   setHeaders(res, filePath) {
-    if (filePath.endsWith('.html') || filePath.endsWith('.js')) {
-      res.setHeader('Cache-Control', 'no-cache');
+    if (filePath.endsWith('.html') || filePath.endsWith('.js') || filePath.endsWith('.css')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
     }
   }
 }));
@@ -1119,6 +1243,32 @@ app.put('/api/me/profile', authRequired, (req, res) => {
   res.json({ ok: true });
 });
 
+// Effective hourly rate for the caller, optionally for a specific matter:
+// matter override → user default → 0. Lets the time-entry form preview
+// hours × rate before save and surface a $0/hr warning when the user has no
+// rate configured (currently a silent failure that produces $0 WIP entries).
+//
+// Roles without `viewRates` (associate/paralegal/etc.) get rate=null so the
+// dollar amount stays hidden — but `hasRate` is always returned so the form
+// can still warn them when their rate is unset, since that's a misconfiguration
+// they need to flag to an admin, not confidential rate info.
+app.get('/api/me/rate', authRequired, verifyFirmMembership, (req, res) => {
+  const matterId = req.query.matterId ? String(req.query.matterId) : null;
+  let rate, inc;
+  if (matterId) {
+    const m = db.prepare('SELECT id FROM matters WHERE id = ? AND firm_id = ?').get(matterId, req.user.firmId);
+    if (!m) return res.status(404).json({ error: 'Matter not found' });
+    rate = effectiveRate(req.user.email, matterId);
+    inc = effectiveIncrementMinutes(matterId);
+  } else {
+    const u = db.prepare('SELECT default_rate FROM users WHERE email = ?').get(req.user.email);
+    rate = u?.default_rate || 0;
+    inc = firmDefaultIncrementMinutes(req.user.firmId);
+  }
+  const canSee = CAPS.viewRates(req.user);
+  res.json({ matterId, rate: canSee ? rate : null, hasRate: rate > 0, incrementMinutes: inc });
+});
+
 app.put('/api/me', authRequired, (req, res) => {
   const { firstName, lastName } = req.body;
   if (!firstName || !lastName) return res.status(400).json({ error: 'First and last name required' });
@@ -1286,7 +1436,10 @@ app.put('/api/firm', authRequired, requireCap('manageFirm'), (req, res) => {
 // Firm logo (used in invoice PDFs). Stored as a BLOB on the firms row — same
 // pattern as expense_attachments. GET is auth-required so logos don't leak.
 const LOGO_MIME_WHITELIST = new Set(['image/png', 'image/jpeg', 'image/jpg']);
-const LOGO_MAX_BYTES = 2 * 1024 * 1024;
+// Generous defense-in-depth cap: the SPA pre-compresses large logos to ~1.5 MB
+// via Canvas before posting, so a 5 MB ceiling here only kicks in for clients
+// that bypass the browser flow.
+const LOGO_MAX_BYTES = 5 * 1024 * 1024;
 app.get('/api/firm/logo', authRequired, verifyFirmMembership, (req, res) => {
   const row = db.prepare('SELECT logo_data, logo_mime FROM firms WHERE id = ?').get(req.user.firmId);
   if (!row || !row.logo_data) return res.status(404).json({ error: 'No logo set' });
@@ -1545,6 +1698,51 @@ function normalizeEmail(v) {
   return s || null;
 }
 
+// Next per-firm sequential client number. Called inside the POST/PUT handler so
+// it sees the latest MAX. Concurrent inserts in better-sqlite3 are serialized
+// by the single-writer SQLite lock, so MAX+1 is safe without an explicit BEGIN.
+function nextClientNumber(firmId) {
+  const row = db.prepare(`SELECT COALESCE(MAX(client_number), 0) + 1 AS n FROM contacts WHERE firm_id = ?`).get(firmId);
+  return row.n;
+}
+// Next per-client sequential matter number (1 → 00001 in the UI).
+function nextMatterNumber(clientContactId) {
+  const row = db.prepare(`SELECT COALESCE(MAX(matter_number), 0) + 1 AS n FROM matters WHERE client_contact_id = ?`).get(clientContactId);
+  return row.n;
+}
+
+// Next per-firm sequential matter number for matters that have no client.
+// Independent of the per-client sequence — they live in distinct rows
+// (client_contact_id IS NULL vs IS NOT NULL) so they never collide.
+function nextFirmMatterNumber(firmId) {
+  const row = db.prepare(`SELECT COALESCE(MAX(matter_number), 0) + 1 AS n FROM matters WHERE firm_id = ? AND client_contact_id IS NULL`).get(firmId);
+  return row.n;
+}
+
+// Fetches a matter joined with its client's client_number, and lazily
+// backfills matter_number for any matter that lacks one — whether it has a
+// client (per-client sequence) or not (per-firm clientless sequence). The
+// WHERE matter_number IS NULL guard makes concurrent calls idempotent.
+// Returns null if the matter doesn't exist or doesn't belong to firmId.
+function fetchMatterForInvoice(matterId, firmId) {
+  if (!matterId) return null;
+  let m = db.prepare(`SELECT m.*, c.client_number AS client_number
+                      FROM matters m LEFT JOIN contacts c ON c.id = m.client_contact_id
+                      WHERE m.id = ? AND m.firm_id = ?`).get(matterId, firmId);
+  if (!m) return null;
+  if (m.matter_number == null) {
+    const n = m.client_contact_id ? nextMatterNumber(m.client_contact_id) : nextFirmMatterNumber(firmId);
+    const r = db.prepare(`UPDATE matters SET matter_number = ? WHERE id = ? AND matter_number IS NULL`).run(n, m.id);
+    if (r.changes) m.matter_number = n;
+    else {
+      // Another request beat us to it; re-read so the caller sees the assigned number.
+      const fresh = db.prepare('SELECT matter_number FROM matters WHERE id = ?').get(m.id);
+      if (fresh) m.matter_number = fresh.matter_number;
+    }
+  }
+  return m;
+}
+
 app.post('/api/contacts', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
   const b = req.body || {};
   const id = uid('c_');
@@ -1556,6 +1754,8 @@ app.post('/api/contacts', authRequired, verifyFirmMembership, requireCap('editCo
   try { inc = validateIncrement(b.billingIncrementMinutes); } catch(e) { return res.status(400).json({ error: e.message }); }
   try { splitPct = validateSplitPct(b.originationSplitPct); } catch(e) { return res.status(400).json({ error: e.message }); }
   const last4 = b.taxIdLast4 ? String(b.taxIdLast4).replace(/\D/g, '').slice(-4) : null;
+  const type = b.type || 'prospect';
+  const clientNumber = (type === 'client') ? nextClientNumber(req.user.firmId) : null;
   db.prepare(`INSERT INTO contacts (
       id, firm_id, type, first_name, last_name, full_name, email, phone, title,
       company_id, company_name, address, linkedin, referred_by_id, pipeline_stage,
@@ -1564,9 +1764,11 @@ app.post('/api/contacts', authRequired, verifyFirmMembership, requireCap('editCo
       mailing_address, date_of_birth, client_since, secondary_email, secondary_phone,
       industry, tax_id_last4, preferred_contact,
       originating_attorney_email, origination_split_pct, billing_attorney_email,
+      client_number,
+      primary_contact_name, primary_contact_title, primary_contact_email, primary_contact_phone,
       created_by, created_at, updated_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-    id, req.user.firmId, b.type || 'prospect', first, last, full,
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    id, req.user.firmId, type, first, last, full,
     b.email || null, b.phone || null, b.title || null,
     b.companyId || null, b.companyName || null, b.address || null, b.linkedin || null,
     b.referredById || null, b.pipelineStage || null,
@@ -1577,6 +1779,9 @@ app.post('/api/contacts', authRequired, verifyFirmMembership, requireCap('editCo
     b.secondaryEmail || null, b.secondaryPhone || null,
     b.industry || null, last4, b.preferredContact || null,
     normalizeEmail(b.originatingAttorneyEmail), splitPct, normalizeEmail(b.billingAttorneyEmail),
+    clientNumber,
+    b.primaryContactName || null, b.primaryContactTitle || null,
+    normalizeEmail(b.primaryContactEmail) || null, b.primaryContactPhone || null,
     req.user.email, now, now
   );
   const c = db.prepare('SELECT * FROM contacts WHERE id = ?').get(id);
@@ -1608,6 +1813,14 @@ app.put('/api/contacts/:id', authRequired, verifyFirmMembership, requireCap('edi
   const billAttyEmail = 'billingAttorneyEmail' in b
     ? normalizeEmail(b.billingAttorneyEmail)
     : existing.billing_attorney_email;
+  // Assign a client_number the first time a contact becomes type='client'.
+  // Once assigned, the number is permanent — converting back to prospect and
+  // forward again reuses the original number.
+  const newType = b.type ?? existing.type;
+  let clientNumber = existing.client_number;
+  if (newType === 'client' && clientNumber == null) {
+    clientNumber = nextClientNumber(req.user.firmId);
+  }
   db.prepare(`UPDATE contacts SET
       type = COALESCE(?, type),
       first_name = ?, last_name = ?, full_name = ?,
@@ -1621,6 +1834,9 @@ app.put('/api/contacts/:id', authRequired, verifyFirmMembership, requireCap('edi
       secondary_email = ?, secondary_phone = ?,
       industry = ?, tax_id_last4 = ?, preferred_contact = ?,
       originating_attorney_email = ?, origination_split_pct = ?, billing_attorney_email = ?,
+      client_number = ?,
+      primary_contact_name = ?, primary_contact_title = ?,
+      primary_contact_email = ?, primary_contact_phone = ?,
       updated_at = datetime('now')
     WHERE id = ? AND firm_id = ?`).run(
     b.type || null, (first||'').trim(), (last||'').trim(), full,
@@ -1642,6 +1858,11 @@ app.put('/api/contacts/:id', authRequired, verifyFirmMembership, requireCap('edi
     last4,
     b.preferredContact ?? existing.preferred_contact,
     origAttyEmail, splitPct, billAttyEmail,
+    clientNumber,
+    b.primaryContactName ?? existing.primary_contact_name,
+    b.primaryContactTitle ?? existing.primary_contact_title,
+    'primaryContactEmail' in b ? (normalizeEmail(b.primaryContactEmail) || null) : existing.primary_contact_email,
+    b.primaryContactPhone ?? existing.primary_contact_phone,
     req.params.id, req.user.firmId
   );
   const c = db.prepare('SELECT * FROM contacts WHERE id = ?').get(req.params.id);
@@ -1819,13 +2040,20 @@ app.delete('/api/interactions/:id', authRequired, verifyFirmMembership, (req, re
 // MATTERS (CRM-local, optional link to DealTracker)
 // ═══════════════════════════════════════════════════════════════════════
 
+// Matter rows expose the parent client's client_number alongside their own
+// matter_number so the UI can render the combined identifier (e.g. "42-00001")
+// without a second round-trip per row.
+const MATTER_SELECT = `SELECT m.*, c.client_number AS client_number
+  FROM matters m
+  LEFT JOIN contacts c ON c.id = m.client_contact_id`;
+
 app.get('/api/matters', authRequired, verifyFirmMembership, (req, res) => {
   const { status, clientId } = req.query;
-  let sql = 'SELECT * FROM matters WHERE firm_id = ?';
+  let sql = MATTER_SELECT + ' WHERE m.firm_id = ?';
   const params = [req.user.firmId];
-  if (status)   { sql += ' AND status = ?';            params.push(status); }
-  if (clientId) { sql += ' AND client_contact_id = ?'; params.push(clientId); }
-  sql += ' ORDER BY opened_at DESC';
+  if (status)   { sql += ' AND m.status = ?';            params.push(status); }
+  if (clientId) { sql += ' AND m.client_contact_id = ?'; params.push(clientId); }
+  sql += ' ORDER BY m.opened_at DESC';
   res.json(db.prepare(sql).all(...params));
 });
 
@@ -1836,10 +2064,15 @@ app.post('/api/matters', authRequired, verifyFirmMembership, requireCap('editCon
   let inc;
   try { inc = validateIncrement(b.billingIncrementMinutes); } catch(e) { return res.status(400).json({ error: e.message }); }
   const id = uid('m_');
-  db.prepare(`INSERT INTO matters (id, firm_id, dt_matter_id, client_contact_id, client_name, name, description, billing_type, flat_fee, status, billing_increment_minutes, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-    id, req.user.firmId, b.dtMatterId || null, b.clientContactId || null, b.clientName || null,
-    b.name.trim(), b.description || null, b.billingType || 'hourly', b.flatFee || 0, b.status || 'active', inc, req.user.email);
-  res.json(db.prepare('SELECT * FROM matters WHERE id = ?').get(id));
+  const clientId = b.clientContactId || null;
+  // Always assign a matter_number — per-client sequence when a client is set,
+  // per-firm clientless sequence otherwise — so every matter has a real number
+  // to print on invoices instead of falling back to the internal uuid.
+  const matterNumber = clientId ? nextMatterNumber(clientId) : nextFirmMatterNumber(req.user.firmId);
+  db.prepare(`INSERT INTO matters (id, firm_id, dt_matter_id, client_contact_id, client_name, name, description, billing_type, flat_fee, status, billing_increment_minutes, matter_number, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    id, req.user.firmId, b.dtMatterId || null, clientId, b.clientName || null,
+    b.name.trim(), b.description || null, b.billingType || 'hourly', b.flatFee || 0, b.status || 'active', inc, matterNumber, req.user.email);
+  res.json(db.prepare(MATTER_SELECT + ' WHERE m.id = ?').get(id));
 });
 
 app.put('/api/matters/:id', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
@@ -1850,20 +2083,33 @@ app.put('/api/matters/:id', authRequired, verifyFirmMembership, requireCap('edit
   let inc;
   try { inc = 'billingIncrementMinutes' in b ? validateIncrement(b.billingIncrementMinutes) : existing.billing_increment_minutes; }
   catch(e) { return res.status(400).json({ error: e.message }); }
+  // Matter numbers are scoped per-client (with a separate per-firm sequence
+  // for clientless matters). If the matter's client changes, re-issue from the
+  // appropriate sequence so it doesn't collide with the new bucket. If the
+  // matter still has no number on a no-op edit, assign one now.
+  const newClientId = ('clientContactId' in b) ? (b.clientContactId || null) : existing.client_contact_id;
+  let matterNumber = existing.matter_number;
+  if (newClientId !== existing.client_contact_id) {
+    matterNumber = newClientId ? nextMatterNumber(newClientId) : nextFirmMatterNumber(req.user.firmId);
+  } else if (matterNumber == null) {
+    matterNumber = newClientId ? nextMatterNumber(newClientId) : nextFirmMatterNumber(req.user.firmId);
+  }
   db.prepare(`UPDATE matters SET
       name = COALESCE(?, name), description = ?, billing_type = COALESCE(?, billing_type),
       flat_fee = COALESCE(?, flat_fee), status = COALESCE(?, status),
       client_contact_id = ?, client_name = ?, dt_matter_id = ?,
       billing_increment_minutes = ?,
+      matter_number = ?,
       closed_at = CASE WHEN ? = 'closed' AND status != 'closed' THEN datetime('now') ELSE closed_at END,
       updated_at = datetime('now')
     WHERE id = ? AND firm_id = ?`).run(
     b.name?.trim() || null, b.description ?? null, b.billingType || null,
     typeof b.flatFee === 'number' ? b.flatFee : null, b.status || null,
-    b.clientContactId ?? null, b.clientName ?? null, b.dtMatterId ?? null,
+    newClientId, b.clientName ?? existing.client_name, b.dtMatterId ?? null,
     inc,
+    matterNumber,
     b.status || '', req.params.id, req.user.firmId);
-  res.json(db.prepare('SELECT * FROM matters WHERE id = ?').get(req.params.id));
+  res.json(db.prepare(MATTER_SELECT + ' WHERE m.id = ?').get(req.params.id));
 });
 
 app.delete('/api/matters/:id', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
@@ -1880,11 +2126,15 @@ app.get('/api/matters/:id/rates', authRequired, verifyFirmMembership, requireCap
 
 app.put('/api/matters/:id/rates', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
   // body: [{ userEmail, rate }]
-  const list = Array.isArray(req.body) ? req.body : [];
+  // Drop rows without a positive rate so we never persist bogus 0 overrides
+  // (those would short-circuit the user's default rate at lookup time).
+  const list = (Array.isArray(req.body) ? req.body : [])
+    .map(it => ({ userEmail: String(it.userEmail || '').toLowerCase(), rate: Number(it.rate) }))
+    .filter(it => it.userEmail && Number.isFinite(it.rate) && it.rate > 0);
   const tx = db.transaction((items) => {
     db.prepare('DELETE FROM matter_rates WHERE matter_id = ?').run(req.params.id);
     const ins = db.prepare('INSERT INTO matter_rates (matter_id, user_email, rate) VALUES (?,?,?)');
-    items.forEach(it => ins.run(req.params.id, String(it.userEmail).toLowerCase(), Number(it.rate) || 0));
+    items.forEach(it => ins.run(req.params.id, it.userEmail, it.rate));
   });
   tx(list);
   res.json({ ok: true });
@@ -1909,8 +2159,12 @@ app.get('/api/dt/matters', authRequired, verifyFirmMembership, async (req, res) 
 // ═══════════════════════════════════════════════════════════════════════
 
 function effectiveRate(userEmail, matterId) {
+  // A matter_rates row is treated as a real override only if its rate is > 0.
+  // Stale/blank rows can sneak in (e.g. PUT round-trips that defaulted missing
+  // values to 0); without this guard those silently zero out an entry's value.
+  // Pro-bono should be expressed via billable=false on the entry, not a 0 rate.
   const override = db.prepare('SELECT rate FROM matter_rates WHERE matter_id = ? AND user_email = ?').get(matterId, userEmail);
-  if (override) return override.rate;
+  if (override && override.rate > 0) return override.rate;
   const u = db.prepare('SELECT default_rate FROM users WHERE email = ?').get(userEmail);
   return u?.default_rate || 0;
 }
@@ -2042,7 +2296,23 @@ app.get('/api/invoices/:id', authRequired, verifyFirmMembership, requireCap('man
   const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
   if (!inv) return res.status(404).json({ error: 'Not found' });
   const lines = db.prepare('SELECT * FROM invoice_lines WHERE invoice_id = ? ORDER BY sort_order, id').all(req.params.id);
-  res.json({ ...inv, lines });
+  // Inline matter_number + client_number so the SPA detail view can render the
+  // "{client#}-{matter#}" identifier without a second round-trip. Also lazily
+  // backfills matter_number for old rows that missed the boot migration.
+  const matter = fetchMatterForInvoice(inv.matter_id, req.user.firmId);
+  const payments = db.prepare(`SELECT id, amount, method, status, occurred_at, reference, notes, destination,
+                                      stripe_payment_intent_id, trust_ledger_id, created_by, created_at
+                               FROM invoice_payments WHERE invoice_id = ? AND firm_id = ?
+                               ORDER BY occurred_at DESC, created_at DESC`).all(req.params.id, req.user.firmId);
+  const adjustments = db.prepare(`SELECT * FROM invoice_adjustments
+                                  WHERE invoice_id = ? AND firm_id = ?
+                                  ORDER BY occurred_at DESC, created_at DESC`).all(req.params.id, req.user.firmId);
+  res.json({
+    ...inv, lines, payments, adjustments,
+    matter_number: matter?.matter_number ?? null,
+    client_number: matter?.client_number ?? null,
+    matter_name:   matter?.name ?? null,
+  });
 });
 
 // Draft an invoice from time entries + optional flat-fee lines
@@ -2059,7 +2329,9 @@ app.post('/api/invoices', authRequired, verifyFirmMembership, requireCap('manage
   const now = new Date().toISOString();
 
   // Build lines: include all unbilled billable time for this matter (if billing hourly),
-  // plus the matter's flat fee (if type=flat and not yet billed), plus any b.extraLines provided.
+  // plus the matter's flat fee whenever flat_fee > 0 (independent of billing_type
+  // — so the flat fee always appears in the total even if hourly entries are
+  // also coded against the matter), plus any b.extraLines provided.
   const lines = [];
   let sort = 0;
   if (matter) {
@@ -2076,7 +2348,8 @@ app.post('/api/invoices', authRequired, verifyFirmMembership, requireCap('manage
           time_entry_id: t.id, quantity: +hours.toFixed(2), rate: t.rate, amount, sort_order: sort++
         });
       });
-    } else if (matter.billing_type === 'flat' && matter.flat_fee > 0) {
+    }
+    if (matter.flat_fee > 0) {
       lines.push({ id: uid('il_'), kind: 'flat', description: `Flat fee — ${matter.name}`,
         time_entry_id: null, quantity: 1, rate: matter.flat_fee, amount: matter.flat_fee, sort_order: sort++ });
     }
@@ -2198,6 +2471,167 @@ app.delete('/api/invoices/:id', authRequired, verifyFirmMembership, requireCap('
     db.prepare(`UPDATE time_entries SET invoice_id = NULL, status = 'draft', updated_at = datetime('now') WHERE invoice_id = ?`).run(req.params.id);
     db.prepare(`UPDATE expenses     SET invoice_id = NULL, status = 'draft', updated_at = datetime('now') WHERE invoice_id = ?`).run(req.params.id);
     db.prepare('DELETE FROM invoices WHERE id = ?').run(req.params.id);
+  })();
+  res.json({ ok: true });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// MANUAL PAYMENTS + ADJUSTMENTS (per invoice)
+// ═══════════════════════════════════════════════════════════════════════
+// Source of truth for cash on an invoice is invoice_payments. Stripe writes
+// rows via webhook; this section lets a partner/admin record off-channel
+// receipts (check, wire, ach, cash) and apply trust-on-deposit to a bill.
+// Adjustments table tracks write-downs (and the rare write-up) without
+// mutating invoices.total — original gross is preserved for realization
+// reporting.
+
+const PAYMENT_METHODS = ['check', 'wire', 'ach', 'cash', 'trust', 'manual'];
+const ADJUSTMENT_KINDS = ['writedown', 'writeup', 'courtesy', 'bad_debt'];
+
+app.get('/api/invoices/:id/payments', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const inv = db.prepare('SELECT id FROM invoices WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  if (!inv) return res.status(404).json({ error: 'Not found' });
+  const rows = db.prepare(`SELECT id, amount, method, status, occurred_at, reference, notes, destination,
+                                  trust_ledger_id, stripe_payment_intent_id, created_by, created_at
+                           FROM invoice_payments WHERE invoice_id = ? AND firm_id = ?
+                           ORDER BY occurred_at DESC, created_at DESC`).all(req.params.id, req.user.firmId);
+  res.json(rows);
+});
+
+// Record a manual payment against a specific invoice. method='trust' also
+// posts a fee-applied trust_ledger row in the same transaction so the IOLTA
+// audit trail stays in sync. Refuses to overpay (amount > balance + 0.005).
+app.post('/api/invoices/:id/payments', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const b = req.body || {};
+  const amount = Number(b.amount);
+  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: 'Positive amount required' });
+  const method = String(b.method || '').toLowerCase();
+  if (!PAYMENT_METHODS.includes(method)) return res.status(400).json({ error: `Invalid method (use: ${PAYMENT_METHODS.join(', ')})` });
+
+  const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  if (!inv) return res.status(404).json({ error: 'Not found' });
+  if (inv.status === 'void') return res.status(400).json({ error: 'Cannot record payment on a void invoice' });
+
+  const writedown = Number(inv.amount_writedown || 0);
+  const balance = +(Number(inv.total || 0) + writedown - Number(inv.amount_paid || 0)).toFixed(2);
+  if (amount > balance + 0.005) {
+    return res.status(400).json({ error: `Amount exceeds balance due (${fmtMoney(balance)}). Adjust or void first.` });
+  }
+
+  const occurredAt = b.occurredAt || new Date().toISOString();
+  const reference  = b.reference || null;
+  const notes      = b.notes || null;
+  const id         = uid('pay_');
+
+  try {
+    const result = db.transaction(() => {
+      let trustLedgerId = null;
+      if (method === 'trust') {
+        if (!inv.client_contact_id) throw new Error('Trust-applied payments require an invoice with a client');
+        const cur = db.prepare('SELECT COALESCE(SUM(amount),0) AS bal FROM trust_ledger WHERE firm_id = ? AND client_contact_id = ?')
+          .get(req.user.firmId, inv.client_contact_id).bal;
+        if (cur < amount - 0.001) throw new Error(`Insufficient trust balance for client (${fmtMoney(cur)})`);
+        trustLedgerId = uid('tr_');
+        db.prepare(`INSERT INTO trust_ledger (id, firm_id, client_contact_id, client_name, matter_id, kind, amount, reference, occurred_at, notes, created_by)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
+          trustLedgerId, req.user.firmId, inv.client_contact_id, inv.client_name, inv.matter_id,
+          'fee-applied', -amount, inv.number || inv.id, occurredAt,
+          `Applied to invoice ${inv.number || inv.id}`, req.user.email);
+      }
+
+      db.prepare(`INSERT INTO invoice_payments
+                    (id, firm_id, invoice_id, client_contact_id, destination, amount, currency,
+                     method, status, occurred_at, reference, notes, trust_ledger_id, created_by)
+                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        id, req.user.firmId, inv.id, inv.client_contact_id, 'operating',
+        amount, 'usd', method, 'succeeded', occurredAt, reference, notes, trustLedgerId, req.user.email);
+
+      return recomputeInvoiceTotals(inv.id, req.user.firmId);
+    })();
+    res.json({ id, ...result });
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'Could not record payment' });
+  }
+});
+
+// Reverse a payment. Trust-method payments also reverse the matching trust
+// ledger row (append-only invariant — posts a refund entry, not a delete).
+// Stripe payments are not deletable here — refund them via Stripe.
+app.delete('/api/invoices/:id/payments/:pid', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const pay = db.prepare('SELECT * FROM invoice_payments WHERE id = ? AND firm_id = ? AND invoice_id = ?')
+    .get(req.params.pid, req.user.firmId, req.params.id);
+  if (!pay) return res.status(404).json({ error: 'Payment not found' });
+  if (pay.stripe_payment_intent_id) return res.status(400).json({ error: 'Refund Stripe payments via Stripe — they sync back through the webhook' });
+  if (pay.status !== 'succeeded') return res.status(400).json({ error: 'Only succeeded payments can be reversed' });
+
+  try {
+    const result = db.transaction(() => {
+      db.prepare(`UPDATE invoice_payments SET status = 'refunded' WHERE id = ?`).run(pay.id);
+      if (pay.method === 'trust' && pay.trust_ledger_id) {
+        const orig = db.prepare('SELECT * FROM trust_ledger WHERE id = ? AND firm_id = ?')
+          .get(pay.trust_ledger_id, req.user.firmId);
+        if (orig) {
+          db.prepare(`INSERT INTO trust_ledger (id, firm_id, client_contact_id, client_name, matter_id, kind, amount, reference, occurred_at, notes, created_by)
+                      VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
+            uid('tr_'), req.user.firmId, orig.client_contact_id, orig.client_name, orig.matter_id,
+            'refund', -orig.amount, `REVERSE ${orig.id}`, new Date().toISOString(),
+            `Reversal of payment ${pay.id}`, req.user.email);
+        }
+      }
+      return recomputeInvoiceTotals(pay.invoice_id, req.user.firmId);
+    })();
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'Could not reverse payment' });
+  }
+});
+
+// ───────────────────── Adjustments (write-downs / write-ups) ─────────────
+app.get('/api/invoices/:id/adjustments', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const inv = db.prepare('SELECT id FROM invoices WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  if (!inv) return res.status(404).json({ error: 'Not found' });
+  const rows = db.prepare(`SELECT * FROM invoice_adjustments
+                           WHERE invoice_id = ? AND firm_id = ?
+                           ORDER BY occurred_at DESC, created_at DESC`).all(req.params.id, req.user.firmId);
+  res.json(rows);
+});
+
+app.post('/api/invoices/:id/adjustments', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const b = req.body || {};
+  const kind = String(b.kind || '').toLowerCase();
+  if (!ADJUSTMENT_KINDS.includes(kind)) return res.status(400).json({ error: `Invalid kind (use: ${ADJUSTMENT_KINDS.join(', ')})` });
+  const raw = Number(b.amount);
+  if (!Number.isFinite(raw) || raw <= 0) return res.status(400).json({ error: 'Positive amount required (sign is set by kind)' });
+
+  const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  if (!inv) return res.status(404).json({ error: 'Not found' });
+  if (inv.status === 'void') return res.status(400).json({ error: 'Cannot adjust a void invoice' });
+
+  // writeup adds to billed total; everything else reduces it
+  const signed = kind === 'writeup' ? +raw : -raw;
+  const id = uid('adj_');
+  const occurredAt = b.occurredAt || new Date().toISOString();
+
+  try {
+    const result = db.transaction(() => {
+      db.prepare(`INSERT INTO invoice_adjustments (id, firm_id, invoice_id, amount, kind, occurred_at, reason, created_by)
+                  VALUES (?,?,?,?,?,?,?,?)`).run(
+        id, req.user.firmId, inv.id, signed, kind, occurredAt, b.reason || null, req.user.email);
+      return recomputeInvoiceTotals(inv.id, req.user.firmId);
+    })();
+    res.json({ id, ...result });
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'Could not record adjustment' });
+  }
+});
+
+app.delete('/api/invoices/:id/adjustments/:aid', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const adj = db.prepare('SELECT * FROM invoice_adjustments WHERE id = ? AND firm_id = ? AND invoice_id = ?')
+    .get(req.params.aid, req.user.firmId, req.params.id);
+  if (!adj) return res.status(404).json({ error: 'Not found' });
+  db.transaction(() => {
+    db.prepare('DELETE FROM invoice_adjustments WHERE id = ?').run(adj.id);
+    recomputeInvoiceTotals(adj.invoice_id, req.user.firmId);
   })();
   res.json({ ok: true });
 });
@@ -2514,7 +2948,7 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
   const F_ITALIC  = FONT_PACKS[fontKey].italic;
   doc.font(F_REGULAR); // default for branches (e.g. simple template) that don't set font explicitly
 
-  // Per-label overrides: { [key]: { family?, size? } }.
+  // Per-label overrides: { [key]: { family?, size?, color? } }.
   const labelStyles = firmSettings.labelStyles || {};
   // Apply a label's style (font family + size). `weight` selects 'regular' /
   // 'bold' / 'italic' within the chosen pack. `defaultSize` is the hardcoded
@@ -2527,9 +2961,44 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
     doc.font(pack[weight] || pack.regular).fontSize(size);
     return labels[key];
   };
+  // Per-label color override. Caller passes the hardcoded fallback color;
+  // returns the user override (if any valid hex was set) else the fallback.
+  // Use as: doc.fillColor(colorFor('myKey', accent)).text(labels.myKey, ...)
+  const colorFor = (key, fallback) => {
+    const c = (labelStyles[key] || {}).color;
+    return (typeof c === 'string' && /^#[0-9a-fA-F]{6}$/.test(c)) ? c : fallback;
+  };
 
   // Logo scale — clamp to [0.5, 2.0] to avoid layout blowups.
   const logoScale = Math.max(0.5, Math.min(2.0, Number(firmSettings.invoiceLogoScale) || 1));
+  // "Invoice" heading scale — independent of the logo so users can tune the
+  // heading size without distorting the firm mark. Clamped to the same range.
+  const titleScale = Math.max(0.5, Math.min(2.0, Number(firmSettings.invoiceTitleScale) || 1));
+
+  // Per-block layout offsets — { [blockId]: { dx, dy, w, h } } in editor pixels.
+  // The editor renders the page at 96 DPI / 816px wide; PDFKit uses 72pt /
+  // 612pt wide. Both ratios reduce to 0.75. We honor only `dx`/`dy` here —
+  // resize (`w`/`h`) is preview-only since most block content reflows
+  // automatically in the PDF. `currentPageId` lets `drawHeader` (which is
+  // shared across all four pages) pick up the right per-page offset.
+  const blockLayout = (firmSettings.blockLayout && typeof firmSettings.blockLayout === 'object') ? firmSettings.blockLayout : {};
+  const PX_TO_PT = 0.75;
+  const blockOff = (id) => {
+    const lay = blockLayout[id];
+    if (!lay) return { dx: 0, dy: 0 };
+    return {
+      dx: (Number(lay.dx) || 0) * PX_TO_PT,
+      dy: (Number(lay.dy) || 0) * PX_TO_PT,
+    };
+  };
+  const withOffset = (id, draw) => {
+    const off = blockOff(id);
+    if (!off.dx && !off.dy) { draw(); return; }
+    doc.save();
+    doc.translate(off.dx, off.dy);
+    try { draw(); } finally { doc.restore(); }
+  };
+  let currentPageId = 'p1';
 
   // Branding / customization
   const template   = firmSettings.invoiceTemplate || 'ap';
@@ -2550,12 +3019,28 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
   const muted = '#666';
   const border = '#c8d3e0';
 
+  // Firm-internal "{client#}-{matter#}" identifier (e.g. "42-00001"). Shared by
+  // both templates so the invoice carries the same matter number the firm uses
+  // elsewhere. Falls back to the linked DealTracker id; if neither exists we
+  // intentionally show '—' rather than the raw internal uuid (matter ids look
+  // like "m_<hex>", which leaks an implementation detail onto the invoice).
+  const fmtMatNo = (n) => (n == null || n === '') ? '' : String(n).padStart(5, '0');
+  let matterLabel = '—';
+  if (matter?.matter_number != null) {
+    const mn = fmtMatNo(matter.matter_number);
+    matterLabel = matter.client_number != null ? `${matter.client_number}-${mn}` : mn;
+  } else if (matter?.dt_matter_id) {
+    matterLabel = matter.dt_matter_id;
+  }
+  const matterDesc = matter?.name || matter?.description || '';
+
   // Customizable text labels. Every string the PDF prints that isn't data is
   // overridable via firmSettings.labels so admins can tweak wording (e.g.
   // rename "BILLING SUMMARY" to "STATEMENT OF ACCOUNT") without code edits.
   const labels = Object.assign({
     invoiceHeading:          'INVOICE',
     invoiceNumberLabel:      'Invoice No.',
+    matterNumberLabel:       'Matter No.',
     dueLabelPrefix:          'Due:',
     billingSummaryTitle:     'BILLING SUMMARY',
     servicesSubtitlePrefix:  'For Professional Services Rendered as of',
@@ -2597,8 +3082,12 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
   if (template === 'simple') {
     doc.fontSize(20).fillColor(accent).text(firm.name, 50, 50);
     if (firmAddr) doc.fontSize(10).fillColor(muted).text(firmAddr);
-    doc.fontSize(24).fillColor(accent).text(labels.invoiceHeading, 400, 50, { align: 'right' });
+    doc.fontSize(24 * titleScale).fillColor(accent).text(labels.invoiceHeading, 400, 50, { align: 'right' });
     doc.fontSize(10).fillColor('#333').text(inv.number || '', 400, 80, { align: 'right' });
+    if (matter && matterLabel && matterLabel !== '—') {
+      doc.fontSize(9).fillColor(muted)
+         .text(`${labels.matterNumberLabel} ${matterLabel}`, 400, 96, { align: 'right' });
+    }
     doc.moveTo(50, 130).lineTo(562, 130).strokeColor('#ddd').stroke();
     doc.fontSize(9).fillColor('#888').text('BILL TO', 50, 150);
     doc.fontSize(11).fillColor('#111').text(inv.client_name || '—', 50, 165);
@@ -2690,75 +3179,102 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
   // subsequent pages. Both now *measure* their content rather than using
   // hard-coded magic numbers, so tall logos / long client blocks don't clip.
   const drawHeader = (short) => {
+    const headerId = currentPageId + '-header';
     if (short) {
       const topY = 40;
-      const logoH = (short ? 26 : 50) * logoScale;
-      if (!tryImage(PAGE_LEFT, topY, { fit: [180 * logoScale, logoH] })) {
-        doc.font(F_BOLD).fontSize(12).fillColor(accent)
-           .text(logoText, PAGE_LEFT, topY + 4, { width: 260, lineBreak: false, ellipsis: true });
-      }
-      forLabel('invoiceHeading', 16, 'bold');
-      doc.fillColor(accent)
-         .text(labels.invoiceHeading, PAGE_LEFT, topY, { width: PAGE_WIDTH, align: 'right' });
-      doc.font(F_REGULAR).fontSize(9).fillColor(muted)
-         .text(`${inv.number || ''}  ·  ${longDate(inv.issued_at)}`, PAGE_LEFT, topY + 18, { width: PAGE_WIDTH, align: 'right' });
+      const logoH = 26 * logoScale;
+      let endY = topY + logoH + 8;
+      // The whole short-header block — logo, INVOICE heading, short meta line,
+      // client lines, and divider — translates as one unit, mirroring the
+      // single `data-block-id` wrapper in the editor.
+      withOffset(headerId, () => {
+        if (!tryImage(PAGE_LEFT, topY, { fit: [180 * logoScale, logoH] })) {
+          doc.font(F_BOLD).fontSize(12).fillColor(accent)
+             .text(logoText, PAGE_LEFT, topY + 4, { width: 260, lineBreak: false, ellipsis: true });
+        }
+        forLabel('invoiceHeading', 16 * titleScale, 'bold');
+        doc.fillColor(colorFor('invoiceHeading', accent))
+           .text(labels.invoiceHeading, PAGE_LEFT, topY, { width: PAGE_WIDTH, align: 'right' });
+        const shortMeta = matter && matterLabel && matterLabel !== '—'
+          ? `${inv.number || ''}  ·  ${labels.matterNumberLabel} ${matterLabel}  ·  ${longDate(inv.issued_at)}`
+          : `${inv.number || ''}  ·  ${longDate(inv.issued_at)}`;
+        doc.font(F_REGULAR).fontSize(9).fillColor(muted)
+           .text(shortMeta, PAGE_LEFT, topY + 18, { width: PAGE_WIDTH, align: 'right' });
 
-      let y = topY + logoH + 8;
-      doc.font(F_REGULAR).fontSize(9).fillColor('#222');
-      for (const line of clientLines) {
-        doc.text(line, PAGE_LEFT, y, { width: PAGE_WIDTH * 0.6 });
-        y += 11;
-      }
-      y = Math.max(y, topY + logoH + 8);
-      doc.moveTo(PAGE_LEFT, y + 6).lineTo(PAGE_RIGHT, y + 6).strokeColor(accent).lineWidth(0.5).stroke();
-      return y + 22;
+        let cy = topY + logoH + 8;
+        doc.font(F_REGULAR).fontSize(9).fillColor('#222');
+        for (const line of clientLines) {
+          doc.text(line, PAGE_LEFT, cy, { width: PAGE_WIDTH * 0.6 });
+          cy += 11;
+        }
+        cy = Math.max(cy, topY + logoH + 8);
+        doc.moveTo(PAGE_LEFT, cy + 6).lineTo(PAGE_RIGHT, cy + 6).strokeColor(accent).lineWidth(0.5).stroke();
+        endY = cy;
+      });
+      // Subsequent content lays out from the natural endY — drag offsets only
+      // shift the header itself, not the content beneath it.
+      return endY + 22;
     }
 
     // Full header (cover page)
     const topY = 50;
     const logoMaxH = 60 * logoScale, logoMaxW = 280 * logoScale;
     let logoBottom = topY;
-    if (tryImage(PAGE_LEFT, topY, { fit: [logoMaxW, logoMaxH] })) {
-      logoBottom = topY + logoMaxH;
-    } else {
-      doc.font(F_BOLD).fontSize(24).fillColor(accent)
-         .text(logoText, PAGE_LEFT, topY + 10, { width: logoMaxW, lineBreak: false, ellipsis: true });
-      logoBottom = topY + 44;
-    }
-    forLabel('invoiceHeading', 28, 'bold');
-    doc.fillColor(accent)
-       .text(labels.invoiceHeading, PAGE_LEFT, topY + 12, { width: PAGE_WIDTH, align: 'right' });
+    withOffset(headerId, () => {
+      if (tryImage(PAGE_LEFT, topY, { fit: [logoMaxW, logoMaxH] })) {
+        logoBottom = topY + logoMaxH;
+      } else {
+        doc.font(F_BOLD).fontSize(24).fillColor(accent)
+           .text(logoText, PAGE_LEFT, topY + 10, { width: logoMaxW, lineBreak: false, ellipsis: true });
+        logoBottom = topY + 44;
+      }
+      forLabel('invoiceHeading', 28 * titleScale, 'bold');
+      doc.fillColor(colorFor('invoiceHeading', accent))
+         .text(labels.invoiceHeading, PAGE_LEFT, topY + 12, { width: PAGE_WIDTH, align: 'right' });
+    });
 
     const dividerY = Math.max(logoBottom + 6, topY + 58);
     doc.moveTo(PAGE_LEFT, dividerY).lineTo(PAGE_RIGHT, dividerY).strokeColor(accent).lineWidth(1.5).stroke();
 
-    // Bill-to (left) and invoice meta (right)
+    // Bill-to (left) and invoice meta (right) — independent drag targets.
     const blockTop = dividerY + 16;
-    doc.font(F_REGULAR).fontSize(10).fillColor('#111');
     let ly = blockTop;
-    for (const line of clientLines) {
-      doc.text(line, PAGE_LEFT, ly, { width: PAGE_WIDTH * 0.55 });
-      ly += 13;
-    }
+    withOffset('p1-client', () => {
+      doc.font(F_REGULAR).fontSize(10).fillColor('#111');
+      for (const line of clientLines) {
+        doc.text(line, PAGE_LEFT, ly, { width: PAGE_WIDTH * 0.55 });
+        ly += 13;
+      }
+    });
 
     const metaX = PAGE_LEFT + PAGE_WIDTH * 0.58;
     const metaW = PAGE_WIDTH - PAGE_WIDTH * 0.58;
-    forLabel('invoiceNumberLabel', 10, 'bold');
-    doc.fillColor('#111')
-       .text(`${labels.invoiceNumberLabel} ${inv.number || ''}`, metaX, blockTop, { width: metaW, align: 'right' });
-    doc.font(F_REGULAR).fontSize(10).fillColor('#333')
-       .text(longDate(inv.issued_at), metaX, blockTop + 14, { width: metaW, align: 'right' });
-    if (inv.due_at) {
-      const prevFont = doc._font && doc._font.name;
-      const prevSize = doc._fontSize;
-      forLabel('dueLabelPrefix', 10, 'regular');
-      doc.fillColor('#333').text(labels.dueLabelPrefix + ' ' + longDate(inv.due_at), metaX, blockTop + 28, { width: metaW, align: 'right' });
-      if (prevFont) doc.font(prevFont);
-      if (prevSize) doc.fontSize(prevSize);
-    }
+    let metaY = blockTop + 14;
+    withOffset('p1-meta', () => {
+      forLabel('invoiceNumberLabel', 10, 'bold');
+      doc.fillColor(colorFor('invoiceNumberLabel', '#111'))
+         .text(`${labels.invoiceNumberLabel} ${inv.number || ''}`, metaX, blockTop, { width: metaW, align: 'right' });
+      if (matter && matterLabel && matterLabel !== '—') {
+        forLabel('matterNumberLabel', 10, 'bold');
+        doc.fillColor(colorFor('matterNumberLabel', '#111'))
+           .text(`${labels.matterNumberLabel} ${matterLabel}`, metaX, metaY, { width: metaW, align: 'right' });
+        metaY += 14;
+      }
+      doc.font(F_REGULAR).fontSize(10).fillColor('#333')
+         .text(longDate(inv.issued_at), metaX, metaY, { width: metaW, align: 'right' });
+      metaY += 14;
+      if (inv.due_at) {
+        const prevFont = doc._font && doc._font.name;
+        const prevSize = doc._fontSize;
+        forLabel('dueLabelPrefix', 10, 'regular');
+        doc.fillColor(colorFor('dueLabelPrefix', '#333')).text(labels.dueLabelPrefix + ' ' + longDate(inv.due_at), metaX, metaY, { width: metaW, align: 'right' });
+        if (prevFont) doc.font(prevFont);
+        if (prevSize) doc.fontSize(prevSize);
+        metaY += 14;
+      }
+    });
 
-    const metaBottom = blockTop + (inv.due_at ? 44 : 28);
-    return Math.max(ly, metaBottom) + 20;
+    return Math.max(ly, metaY) + 6;
   };
 
   // Render a table (header + rows). Handles auto-sized header and rows, and
@@ -2784,7 +3300,7 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
       doc.save().rect(PAGE_LEFT, y, PAGE_WIDTH, rowH).fill(accent).restore();
       for (const c of cols) {
         setColHeaderStyle(c);
-        doc.fillColor('#fff');
+        doc.fillColor(c.key ? colorFor(c.key, '#fff') : '#fff');
         doc.text(c.label, c.x + cellPad, y + headerPad, { width: c.w - cellPad * 2, align: c.align || 'left' });
       }
       y += rowH;
@@ -2819,32 +3335,34 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
   };
 
   // Write a title, advancing y by the measured height. If `key` is supplied,
-  // the title adopts per-label family + size from labelStyles.
-  const writeTitle = (text, size, align = 'left', key = null) => {
+  // the title adopts per-label family + size from labelStyles. If `blockId`
+  // is supplied, the title shifts by that block's drag offset (without
+  // disturbing the natural y advance for following content).
+  const writeTitle = (text, size, align = 'left', key = null, blockId = null) => {
     if (key) forLabel(key, size, 'bold');
     else doc.font(F_BOLD).fontSize(size);
-    doc.fillColor(accent);
+    doc.fillColor(key ? colorFor(key, accent) : accent);
     const h = doc.heightOfString(text, { width: PAGE_WIDTH, align });
-    doc.text(text, PAGE_LEFT, y, { width: PAGE_WIDTH, align });
+    if (blockId) withOffset(blockId, () => doc.text(text, PAGE_LEFT, y, { width: PAGE_WIDTH, align }));
+    else doc.text(text, PAGE_LEFT, y, { width: PAGE_WIDTH, align });
     y += h + 8;
   };
 
   // ═══ Page 1: Cover + Billing Summary ════════════════════════════════════
+  currentPageId = 'p1';
   let y = drawHeader(false);
 
-  writeTitle(labels.billingSummaryTitle, 14, 'center', 'billingSummaryTitle');
+  writeTitle(labels.billingSummaryTitle, 14, 'center', 'billingSummaryTitle', 'p1-summary-title');
   forLabel('servicesSubtitlePrefix', 10, 'italic');
-  doc.fillColor('#333');
+  doc.fillColor(colorFor('servicesSubtitlePrefix', '#333'));
   const subtitleText = `${labels.servicesSubtitlePrefix} ${longDate(inv.issued_at)}`;
   const subtitleH = doc.heightOfString(subtitleText, { width: PAGE_WIDTH, align: 'center' });
-  doc.text(subtitleText, PAGE_LEFT, y, { width: PAGE_WIDTH, align: 'center' });
+  withOffset('p1-subtitle', () => doc.text(subtitleText, PAGE_LEFT, y, { width: PAGE_WIDTH, align: 'center' }));
   y += subtitleH + 16;
 
   // Totals
   const servicesTotal = lines.filter(l => l.kind === 'time' || l.kind === 'flat').reduce((s, l) => s + (Number(l.amount) || 0), 0);
   const costsTotal    = lines.filter(l => l.kind === 'expense').reduce((s, l) => s + (Number(l.amount) || 0), 0);
-  const matterLabel   = matter?.dt_matter_id || (inv.matter_id ? inv.matter_id.replace(/^mat_/, '').slice(0, 8) : '—');
-  const matterDesc    = matter?.name || matter?.description || '';
 
   // Summary table: balanced columns so no header wraps awkwardly
   const sumCols = [
@@ -2862,7 +3380,7 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
   const totalsH = 24;
   doc.save().rect(PAGE_LEFT, y, PAGE_WIDTH, totalsH).fill('#eef2f7').restore();
   forLabel('colTotal', 10, 'bold');
-  doc.fillColor('#111')
+  doc.fillColor(colorFor('colTotal', '#111'))
      .text(labels.colTotal, sumCols[0].x + 5, y + 7, { width: sumCols[1].x + sumCols[1].w - sumCols[0].x - 10 });
   doc.text(fmtMoney(servicesTotal), sumCols[2].x + 5, y + 7, { width: sumCols[2].w - 10, align: 'right' });
   doc.text(fmtMoney(costsTotal),    sumCols[3].x + 5, y + 7, { width: sumCols[3].w - 10, align: 'right' });
@@ -2871,26 +3389,27 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
 
   if (inv.tax > 0) {
     forLabel('taxLabel', 10, 'regular');
-    doc.fillColor('#333');
+    doc.fillColor(colorFor('taxLabel', '#333'));
     doc.text(labels.taxLabel, sumCols[3].x - 80, y, { width: 140 + 80, align: 'right' });
     doc.text(fmtMoney(inv.tax), sumCols[4].x + 5, y, { width: sumCols[4].w - 10, align: 'right' });
     y += 16;
     forLabel('invoiceTotalLabel', 11, 'bold');
-    doc.fillColor(accent);
+    doc.fillColor(colorFor('invoiceTotalLabel', accent));
     doc.text(labels.invoiceTotalLabel || 'Invoice Total', sumCols[3].x - 80, y, { width: 140 + 80, align: 'right' });
     doc.text(fmtMoney(inv.total), sumCols[4].x + 5, y, { width: sumCols[4].w - 10, align: 'right' });
     y += 20;
   }
 
   forLabel('paymentDetailsNote', 10, 'italic');
-  doc.fillColor(muted)
-     .text(labels.paymentDetailsNote, PAGE_LEFT, PAGE_BOTTOM - 20, { width: PAGE_WIDTH, align: 'center', lineBreak: false });
+  doc.fillColor(colorFor('paymentDetailsNote', muted));
+  withOffset('p1-payment-note', () => doc.text(labels.paymentDetailsNote, PAGE_LEFT, PAGE_BOTTOM - 20, { width: PAGE_WIDTH, align: 'center', lineBreak: false }));
 
   // ═══ Professional Services detail ═══════════════════════════════════════
   if (timeEntries.length > 0) {
     doc.addPage();
+    currentPageId = 'p2';
     y = drawHeader(true);
-    writeTitle(`${labels.professionalServicesTitle} — ${matterDesc || matterLabel}`, 12, 'left', 'professionalServicesTitle');
+    writeTitle(`${labels.professionalServicesTitle} — ${matterDesc || matterLabel}`, 12, 'left', 'professionalServicesTitle', 'p2-services-title');
 
     const tCols = [
       { key: 'colDate',        label: labels.colDate,        x: PAGE_LEFT,       w: 58,  align: 'left'  },
@@ -2923,7 +3442,7 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
     doc.moveTo(PAGE_LEFT, y).lineTo(PAGE_RIGHT, y).strokeColor(accent).lineWidth(1).stroke();
     y += 8;
     forLabel('totalServicesLabel', 10, 'bold');
-    doc.fillColor(accent)
+    doc.fillColor(colorFor('totalServicesLabel', accent))
        .text(labels.totalServicesLabel, PAGE_LEFT, y, { width: tCols[3].x - PAGE_LEFT - 5, align: 'right' });
     doc.text(totalHours.toFixed(2), tCols[3].x + 5, y, { width: tCols[3].w - 10, align: 'right' });
     doc.text(fmtMoney(total),       tCols[5].x + 5, y, { width: tCols[5].w - 10, align: 'right' });
@@ -2937,7 +3456,7 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
         doc.addPage();
         y = drawHeader(true);
       }
-      writeTitle(labels.summaryByTimekeeperTitle, 12, 'left', 'summaryByTimekeeperTitle');
+      writeTitle(labels.summaryByTimekeeperTitle, 12, 'left', 'summaryByTimekeeperTitle', 'p2-timekeeper-title');
       const tkCols = [
         { key: 'colTimekeeper', label: labels.colTimekeeper, x: PAGE_LEFT,       w: 300, align: 'left'  },
         { key: 'colHours',      label: labels.colHours,      x: PAGE_LEFT + 300, w: 100, align: 'right' },
@@ -2952,7 +3471,7 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
       doc.moveTo(PAGE_LEFT, y).lineTo(PAGE_RIGHT, y).strokeColor(accent).lineWidth(1).stroke();
       y += 8;
       forLabel('colTotal', 10, 'bold');
-      doc.fillColor(accent)
+      doc.fillColor(colorFor('colTotal', accent))
          .text(labels.colTotal, PAGE_LEFT, y, { width: tkCols[1].x - PAGE_LEFT - 5, align: 'right' });
       doc.text(totalHours.toFixed(2), tkCols[1].x + 5, y, { width: tkCols[1].w - 10, align: 'right' });
       doc.text(fmtMoney(total),       tkCols[2].x + 5, y, { width: tkCols[2].w - 10, align: 'right' });
@@ -2964,8 +3483,9 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
   const expenseLines = lines.filter(l => l.kind === 'expense');
   if (expenseLines.length > 0) {
     doc.addPage();
+    currentPageId = 'p3';
     y = drawHeader(true);
-    writeTitle(`${labels.costsTitle} — ${matterDesc || matterLabel}`, 12, 'left', 'costsTitle');
+    writeTitle(`${labels.costsTitle} — ${matterDesc || matterLabel}`, 12, 'left', 'costsTitle', 'p3-costs-title');
 
     const eCols = [
       { key: 'colDescription', label: labels.colDescription, x: PAGE_LEFT,       w: 400, align: 'left'  },
@@ -2977,7 +3497,7 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
     doc.moveTo(PAGE_LEFT, y).lineTo(PAGE_RIGHT, y).strokeColor(accent).lineWidth(1).stroke();
     y += 8;
     forLabel('totalCostsLabel', 10, 'bold');
-    doc.fillColor(accent)
+    doc.fillColor(colorFor('totalCostsLabel', accent))
        .text(labels.totalCostsLabel, PAGE_LEFT, y, { width: eCols[0].w + eCols[0].x - PAGE_LEFT, align: 'right' });
     doc.text(fmtMoney(costsTotal), eCols[1].x + 5, y, { width: eCols[1].w - 10, align: 'right' });
     y += 20;
@@ -2985,58 +3505,74 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
 
   // ═══ Remittance page ════════════════════════════════════════════════════
   doc.addPage();
+  currentPageId = 'p4';
   y = drawHeader(true);
-  writeTitle(labels.remittanceTitle, 16, 'center', 'remittanceTitle');
+  writeTitle(labels.remittanceTitle, 16, 'center', 'remittanceTitle', 'p4-remittance-title');
   y += 4;
 
   const currentDue = +(Number(inv.total) - Number(inv.amount_paid || 0)).toFixed(2);
   const totalDue = +(currentDue + outstanding).toFixed(2);
 
-  const bal = (key, amount, emphasize) => {
+  const bal = (key, amount, emphasize, blockId) => {
     const label = labels[key];
-    if (emphasize) {
-      const h = 28;
-      doc.save().rect(PAGE_LEFT, y, PAGE_WIDTH, h).fill(accent).restore();
-      forLabel(key, 12, 'bold');
-      doc.fillColor('#fff');
-      doc.text(label, PAGE_LEFT + 14, y + 8, { width: PAGE_WIDTH * 0.65 });
-      doc.text(fmtMoney(amount), PAGE_LEFT, y + 8, { width: PAGE_WIDTH - 14, align: 'right' });
-      y += h + 6;
-    } else {
-      const h = 22;
-      forLabel(key, 11, 'regular');
-      doc.fillColor('#222');
-      doc.text(label, PAGE_LEFT + 14, y + 6, { width: PAGE_WIDTH * 0.65 });
-      doc.text(fmtMoney(amount), PAGE_LEFT, y + 6, { width: PAGE_WIDTH - 14, align: 'right' });
-      doc.moveTo(PAGE_LEFT, y + h).lineTo(PAGE_RIGHT, y + h).strokeColor(border).lineWidth(0.5).stroke();
-      y += h + 2;
-    }
+    const draw = () => {
+      if (emphasize) {
+        const h = 28;
+        doc.save().rect(PAGE_LEFT, y, PAGE_WIDTH, h).fill(accent).restore();
+        forLabel(key, 12, 'bold');
+        doc.fillColor(colorFor(key, '#fff'));
+        doc.text(label, PAGE_LEFT + 14, y + 8, { width: PAGE_WIDTH * 0.65 });
+        doc.text(fmtMoney(amount), PAGE_LEFT, y + 8, { width: PAGE_WIDTH - 14, align: 'right' });
+      } else {
+        const h = 22;
+        forLabel(key, 11, 'regular');
+        doc.fillColor(colorFor(key, '#222'));
+        doc.text(label, PAGE_LEFT + 14, y + 6, { width: PAGE_WIDTH * 0.65 });
+        doc.text(fmtMoney(amount), PAGE_LEFT, y + 6, { width: PAGE_WIDTH - 14, align: 'right' });
+        doc.moveTo(PAGE_LEFT, y + h).lineTo(PAGE_RIGHT, y + h).strokeColor(border).lineWidth(0.5).stroke();
+      }
+    };
+    if (blockId) withOffset(blockId, draw);
+    else draw();
+    y += (emphasize ? 28 + 6 : 22 + 2);
   };
-  bal('currentDueLabel',      currentDue,  false);
-  bal('outstandingLabel',     outstanding, false);
-  bal('totalBalanceDueLabel', totalDue,    true);
+  bal('currentDueLabel',      currentDue,  false, 'p4-current-due');
+  bal('outstandingLabel',     outstanding, false, 'p4-outstanding');
+  bal('totalBalanceDueLabel', totalDue,    true,  'p4-total-due');
 
   y += 18;
-  const block = (key, textLines) => {
+  const block = (key, textLines, headingId, contentId) => {
     if (!textLines.filter(Boolean).length) return;
+    const headingY = y;
     forLabel(key, 11, 'bold');
-    doc.fillColor(accent).text(labels[key], PAGE_LEFT, y, { width: PAGE_WIDTH });
+    doc.fillColor(colorFor(key, accent));
+    if (headingId) withOffset(headingId, () => doc.text(labels[key], PAGE_LEFT, headingY, { width: PAGE_WIDTH }));
+    else doc.text(labels[key], PAGE_LEFT, headingY, { width: PAGE_WIDTH });
     y += 16;
-    doc.font(F_REGULAR).fontSize(10).fillColor('#111');
-    for (const line of textLines.filter(Boolean)) {
-      doc.text(line, PAGE_LEFT + 14, y, { width: PAGE_WIDTH - 14 });
-      y += 13;
-    }
-    y += 14;
+    const filtered = textLines.filter(Boolean);
+    const contentY0 = y;
+    const drawContent = () => {
+      doc.font(F_REGULAR).fontSize(10).fillColor('#111');
+      let cy = contentY0;
+      for (const line of filtered) {
+        doc.text(line, PAGE_LEFT + 14, cy, { width: PAGE_WIDTH - 14 });
+        cy += 13;
+      }
+    };
+    if (contentId) withOffset(contentId, drawContent);
+    else drawContent();
+    y += 13 * filtered.length + 14;
   };
 
   if (remitName || remitAddr) {
-    block('checksPayableLabel', [remitName, ...(remitAddr ? String(remitAddr).split(/\r?\n/) : [])]);
+    block('checksPayableLabel', [remitName, ...(remitAddr ? String(remitAddr).split(/\r?\n/) : [])], 'p4-checks-heading', 'p4-checks-info');
   }
 
   if (wire.accountNumber || wire.routingNumber || wire.bankName) {
+    const wireHeadingY = y;
     forLabel('wireHeadingLabel', 11, 'bold');
-    doc.fillColor(accent).text(labels.wireHeadingLabel, PAGE_LEFT, y, { width: PAGE_WIDTH });
+    doc.fillColor(colorFor('wireHeadingLabel', accent));
+    withOffset('p4-wire-heading', () => doc.text(labels.wireHeadingLabel, PAGE_LEFT, wireHeadingY, { width: PAGE_WIDTH }));
     y += 18;
     const wireRows = [
       ['wireBeneficiaryNameLabel',    wire.beneficiaryName],
@@ -3052,27 +3588,33 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
       doc.font(F_REGULAR).fontSize(10);
       const valH = valLines.reduce((h, line) => h + doc.heightOfString(line, { width: PAGE_WIDTH - labelW - 20 }), 0) + 6;
       const rh = Math.max(22, valH);
-      doc.save().rect(PAGE_LEFT, y, PAGE_WIDTH, rh).fill('#f5f7fb').restore();
-      doc.rect(PAGE_LEFT, y, PAGE_WIDTH, rh).strokeColor(border).lineWidth(0.5).stroke();
-      forLabel(key, 10, 'bold');
-      doc.fillColor('#222').text(labels[key], PAGE_LEFT + 10, y + 6, { width: labelW - 10 });
-      doc.font(F_REGULAR).fontSize(10).fillColor('#111').text(valLines.join('\n'), PAGE_LEFT + labelW + 4, y + 6, { width: PAGE_WIDTH - labelW - 14 });
+      const rowY = y;
+      withOffset('p4-' + key, () => {
+        doc.save().rect(PAGE_LEFT, rowY, PAGE_WIDTH, rh).fill('#f5f7fb').restore();
+        doc.rect(PAGE_LEFT, rowY, PAGE_WIDTH, rh).strokeColor(border).lineWidth(0.5).stroke();
+        forLabel(key, 10, 'bold');
+        doc.fillColor(colorFor(key, '#222')).text(labels[key], PAGE_LEFT + 10, rowY + 6, { width: labelW - 10 });
+        doc.font(F_REGULAR).fontSize(10).fillColor('#111').text(valLines.join('\n'), PAGE_LEFT + labelW + 4, rowY + 6, { width: PAGE_WIDTH - labelW - 14 });
+      });
       y += rh;
     }
     y += 18;
   }
 
   if (inv.notes) {
+    const notesHeadY = y;
     forLabel('notesHeadingLabel', 10, 'bold');
-    doc.fillColor(accent).text(labels.notesHeadingLabel, PAGE_LEFT, y, { width: PAGE_WIDTH });
+    doc.fillColor(colorFor('notesHeadingLabel', accent));
+    withOffset('p4-notes-heading', () => doc.text(labels.notesHeadingLabel, PAGE_LEFT, notesHeadY, { width: PAGE_WIDTH }));
     y += 14;
-    doc.font(F_REGULAR).fontSize(10).fillColor('#333').text(inv.notes, PAGE_LEFT, y, { width: PAGE_WIDTH });
+    const notesY = y;
+    withOffset('p4-notes-info', () => doc.font(F_REGULAR).fontSize(10).fillColor('#333').text(inv.notes, PAGE_LEFT, notesY, { width: PAGE_WIDTH }));
     y += doc.heightOfString(inv.notes, { width: PAGE_WIDTH }) + 14;
   }
 
   if (footerText) {
-    doc.font(F_BOLD).fontSize(11).fillColor(accent)
-       .text(footerText, PAGE_LEFT, PAGE_BOTTOM - 16, { width: PAGE_WIDTH, align: 'center', lineBreak: false });
+    doc.font(F_BOLD).fontSize(11).fillColor(accent);
+    withOffset('p4-footer', () => doc.text(footerText, PAGE_LEFT, PAGE_BOTTOM - 16, { width: PAGE_WIDTH, align: 'center', lineBreak: false }));
   }
 }
 
@@ -3084,7 +3626,7 @@ app.get('/api/invoices/:id/pdf', authRequired, verifyFirmMembership, requireCap(
   const firm  = db.prepare('SELECT * FROM firms WHERE id = ?').get(req.user.firmId);
   const firmSettings = parseJSON(firm.settings, {});
   const logoBuffer = firm.logo_data || null;
-  const matter = inv.matter_id ? db.prepare('SELECT * FROM matters WHERE id = ? AND firm_id = ?').get(inv.matter_id, req.user.firmId) : null;
+  const matter = fetchMatterForInvoice(inv.matter_id, req.user.firmId);
   const client = inv.client_contact_id ? db.prepare('SELECT * FROM contacts WHERE id = ? AND firm_id = ?').get(inv.client_contact_id, req.user.firmId) : null;
   const timeEntries = db.prepare(`
     SELECT t.*, u.name AS user_name, u.first_name AS user_first, u.last_name AS user_last
@@ -3163,6 +3705,8 @@ app.post('/api/invoices/preview', authRequired, verifyFirmMembership, requireCap
     name: 'General Corporate Advisory Services',
     description: 'General Corporate Advisory Services',
     dt_matter_id: 'SAMPLE',
+    client_number: 42,
+    matter_number: 1,
   };
   const client = {
     id: 'preview_client',
@@ -3260,6 +3804,283 @@ app.delete('/api/trust/:id', authRequired, verifyFirmMembership, requireCap('man
 });
 
 // ═══════════════════════════════════════════════════════════════════════
+// CASHFLOW REPORT
+// ═══════════════════════════════════════════════════════════════════════
+// Three independent series rolled up by issued_at / occurred_at:
+//   billed   — sum of invoices.total (status != 'void')
+//   adjusts  — sum of signed invoice_adjustments.amount
+//   cash     — sum of succeeded invoice_payments.amount (broken out by method)
+// Realization = cash / (billed + adjustments) over the window. manageBilling
+// gates this — Partners and Admins only, per CLAUDE.md role table.
+app.get('/api/reports/cashflow', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const granularity = ['day','month','year'].includes(req.query.granularity) ? req.query.granularity : 'month';
+  const fmt = granularity === 'day' ? '%Y-%m-%d' : granularity === 'year' ? '%Y' : '%Y-%m';
+  const from = req.query.from || null;  // YYYY-MM-DD inclusive
+  const to   = req.query.to   || null;  // YYYY-MM-DD inclusive (interpreted as end-of-day)
+  const toEnd = to ? to + 'T23:59:59.999Z' : null;
+  const f = resolveCashflowFilters(req);
+
+  const dateClause = (col) => {
+    const parts = [];
+    const params = [];
+    if (from) { parts.push(`${col} >= ?`); params.push(from); }
+    if (toEnd){ parts.push(`${col} <= ?`); params.push(toEnd); }
+    return { sql: parts.length ? ' AND ' + parts.join(' AND ') : '', params };
+  };
+
+  // Adjustments link via invoice_id; cash and billed have client_contact_id +
+  // matter_id directly. We pre-resolved attorney→client list in resolveCashflowFilters
+  // so each downstream query just uses an IN (...) clause.
+  const billedClient = inClause('client_contact_id', f.clientIdIn);
+  const billedMatter = inClause('matter_id',         f.matterIdIn);
+  const cashClient   = inClause('client_contact_id', f.clientIdIn);
+  const cashMatter   = inClause('matter_id',         f.matterIdIn);
+
+  const billedDate = dateClause('issued_at');
+  const billed = db.prepare(`
+    SELECT strftime('${fmt}', issued_at) AS period, COALESCE(SUM(total),0) AS amount, COUNT(*) AS n
+    FROM invoices WHERE firm_id = ? AND status != 'void' AND issued_at IS NOT NULL
+    ${billedDate.sql}${billedClient.sql}${billedMatter.sql}
+    GROUP BY period ORDER BY period
+  `).all(req.user.firmId, ...billedDate.params, ...billedClient.params, ...billedMatter.params);
+
+  const adjDate = dateClause('occurred_at');
+  // Adjustments are filtered to the same invoice universe (client + matter) via a join.
+  const adjJoinNeeded = f.clientIdIn || f.matterIdIn;
+  const adjJoinClient = inClause('iv.client_contact_id', f.clientIdIn);
+  const adjJoinMatter = inClause('iv.matter_id',         f.matterIdIn);
+  const adjJoin = adjJoinNeeded
+    ? `JOIN invoices iv ON iv.id = a.invoice_id ${adjJoinClient.sql}${adjJoinMatter.sql}`
+    : '';
+  const adjJoinParams = adjJoinNeeded ? [...adjJoinClient.params, ...adjJoinMatter.params] : [];
+  const adjustments = db.prepare(`
+    SELECT strftime('${fmt}', a.occurred_at) AS period,
+           COALESCE(SUM(a.amount),0) AS amount,
+           COALESCE(SUM(CASE WHEN a.amount < 0 THEN -a.amount ELSE 0 END),0) AS writedowns,
+           COALESCE(SUM(CASE WHEN a.amount > 0 THEN  a.amount ELSE 0 END),0) AS writeups,
+           COUNT(*) AS n
+    FROM invoice_adjustments a ${adjJoin}
+    WHERE a.firm_id = ? ${adjDate.sql.replace(/occurred_at/g, 'a.occurred_at')}
+    GROUP BY period ORDER BY period
+  `).all(...adjJoinParams, req.user.firmId, ...adjDate.params);
+
+  const payDate = dateClause('occurred_at');
+  const cash = db.prepare(`
+    SELECT strftime('${fmt}', occurred_at) AS period,
+           COALESCE(method,'unknown') AS method,
+           COALESCE(SUM(amount),0) AS amount, COUNT(*) AS n
+    FROM invoice_payments
+    WHERE firm_id = ? AND status = 'succeeded' AND occurred_at IS NOT NULL
+    ${payDate.sql}${cashClient.sql}${cashMatter.sql}
+    GROUP BY period, method ORDER BY period
+  `).all(req.user.firmId, ...payDate.params, ...cashClient.params, ...cashMatter.params);
+
+  // Stitch the three series into one period→row map.
+  const periods = new Map();
+  const ensure = (p) => {
+    if (!periods.has(p)) periods.set(p, { period: p, billed_gross: 0, adjustments: 0, writedowns: 0, writeups: 0, cash_received: 0, cash_by_method: {} });
+    return periods.get(p);
+  };
+  for (const r of billed)      ensure(r.period).billed_gross  = +Number(r.amount).toFixed(2);
+  for (const r of adjustments) {
+    const row = ensure(r.period);
+    row.adjustments = +Number(r.amount).toFixed(2);
+    row.writedowns  = +Number(r.writedowns).toFixed(2);
+    row.writeups    = +Number(r.writeups).toFixed(2);
+  }
+  for (const r of cash) {
+    const row = ensure(r.period);
+    row.cash_received = +(row.cash_received + Number(r.amount)).toFixed(2);
+    row.cash_by_method[r.method] = +(Number(r.amount)).toFixed(2);
+  }
+
+  const rows = [...periods.values()].sort((a, b) => a.period < b.period ? -1 : a.period > b.period ? 1 : 0);
+  const totals = rows.reduce((t, r) => ({
+    billed_gross:  +(t.billed_gross  + r.billed_gross).toFixed(2),
+    adjustments:   +(t.adjustments   + r.adjustments).toFixed(2),
+    writedowns:    +(t.writedowns    + r.writedowns).toFixed(2),
+    writeups:      +(t.writeups      + r.writeups).toFixed(2),
+    cash_received: +(t.cash_received + r.cash_received).toFixed(2),
+  }), { billed_gross: 0, adjustments: 0, writedowns: 0, writeups: 0, cash_received: 0 });
+  const netBilled = +(totals.billed_gross + totals.adjustments).toFixed(2);
+  totals.net_billed = netBilled;
+  totals.realization_rate = netBilled > 0 ? +(totals.cash_received / netBilled).toFixed(4) : null;
+
+  res.json({
+    granularity, from, to,
+    clientId: f.clientId, matterId: f.matterId,
+    attorneyEmail: f.attorneyEmail, attorneyRole: f.attorneyRole,
+    periods: rows, totals,
+  });
+});
+
+// Shared helper: parse and validate the attorney/matter/client filter set used
+// by the cashflow tab's three reports. Returns { clientIdIn, matterIdIn,
+// attorneyEmail, attorneyRole } where the *In arrays are either null (no
+// filter) or the resolved id list. Pre-resolving the client list lets each
+// downstream query filter via "client_contact_id IN (?, ?, …)" without joining
+// contacts repeatedly.
+function resolveCashflowFilters(req) {
+  const firmId = req.user.firmId;
+  const attorneyEmail = (req.query.attorneyEmail || '').toLowerCase().trim() || null;
+  const attorneyRole  = ['originating', 'billing', 'either'].includes(req.query.attorneyRole) ? req.query.attorneyRole : 'either';
+  const clientId = req.query.clientId || null;
+  const matterId = req.query.matterId || null;
+
+  let clientIdIn = clientId ? [clientId] : null;
+  if (attorneyEmail) {
+    let csql = 'SELECT id FROM contacts WHERE firm_id = ?';
+    const cp  = [firmId];
+    if (attorneyRole === 'originating')   { csql += ' AND originating_attorney_email = ?'; cp.push(attorneyEmail); }
+    else if (attorneyRole === 'billing')  { csql += ' AND billing_attorney_email = ?';     cp.push(attorneyEmail); }
+    else                                  { csql += ' AND (originating_attorney_email = ? OR billing_attorney_email = ?)'; cp.push(attorneyEmail, attorneyEmail); }
+    if (clientIdIn) { csql += ' AND id = ?'; cp.push(clientIdIn[0]); }
+    clientIdIn = db.prepare(csql).all(...cp).map(r => r.id);
+  }
+  return { clientIdIn, matterIdIn: matterId ? [matterId] : null, attorneyEmail, attorneyRole, clientId, matterId };
+}
+
+function inClause(col, ids) {
+  if (!ids) return { sql: '', params: [] };
+  if (ids.length === 0) return { sql: ' AND 1=0', params: [] };  // empty list = match nothing
+  return { sql: ` AND ${col} IN (${ids.map(() => '?').join(',')})`, params: ids };
+}
+
+function periodFmtJs(iso, granularity) {
+  if (!iso) return '';
+  const m = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return '';
+  if (granularity === 'year')  return m[1];
+  if (granularity === 'month') return `${m[1]}-${m[2]}`;
+  return `${m[1]}-${m[2]}-${m[3]}`;
+}
+
+// AR aging — outstanding balance on issued invoices, bucketed by days since
+// issued_at. Status='sent' is the AR universe; 'paid' and 'void' are excluded
+// because their balance is zero (or nullified). Balance is computed from
+// invoice_payments (succeeded), not invoices.amount_paid, since that field is
+// a stale denormalization that the payments table is the source of truth for.
+app.get('/api/reports/ar-aging', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const f = resolveCashflowFilters(req);
+  const asOfStr = req.query.asOf || new Date().toISOString().slice(0, 10);
+  const today = new Date(asOfStr + 'T00:00:00');
+  today.setHours(0, 0, 0, 0);
+  const todayMs = today.getTime();
+
+  const cIn = inClause('i.client_contact_id', f.clientIdIn);
+  const mIn = inClause('i.matter_id',         f.matterIdIn);
+  const sql = `
+    SELECT i.id, i.number, i.client_contact_id, i.client_name, i.matter_id,
+           i.issued_at, i.due_at, i.total,
+           (SELECT COALESCE(SUM(p.amount), 0) FROM invoice_payments p
+              WHERE p.invoice_id = i.id AND p.status = 'succeeded') AS paid,
+           m.name AS matter_name, m.matter_number,
+           c.client_number, c.originating_attorney_email, c.billing_attorney_email
+      FROM invoices i
+      LEFT JOIN matters  m ON m.id = i.matter_id
+      LEFT JOIN contacts c ON c.id = i.client_contact_id
+     WHERE i.firm_id = ? AND i.status = 'sent' AND i.issued_at IS NOT NULL
+     ${cIn.sql}${mIn.sql}
+     ORDER BY i.issued_at
+  `;
+  const invoices = db.prepare(sql).all(req.user.firmId, ...cIn.params, ...mIn.params);
+
+  const buckets = {
+    '0-30':  { count: 0, amount: 0 },
+    '31-60': { count: 0, amount: 0 },
+    '61-90': { count: 0, amount: 0 },
+    '90+':   { count: 0, amount: 0 },
+  };
+  const rows = [];
+  for (const inv of invoices) {
+    const balance = +(Number(inv.total || 0) - Number(inv.paid || 0)).toFixed(2);
+    if (balance <= 0.005) continue;
+    const issuedDate = String(inv.issued_at).slice(0, 10);
+    const issuedMs = new Date(issuedDate + 'T00:00:00').getTime();
+    const days = Math.max(0, Math.floor((todayMs - issuedMs) / 86400000));
+    const bucket = days <= 30 ? '0-30' : days <= 60 ? '31-60' : days <= 90 ? '61-90' : '90+';
+    buckets[bucket].count  += 1;
+    buckets[bucket].amount = +(buckets[bucket].amount + balance).toFixed(2);
+    rows.push({
+      invoice_id: inv.id, number: inv.number,
+      client_contact_id: inv.client_contact_id, client_name: inv.client_name, client_number: inv.client_number,
+      matter_id: inv.matter_id, matter_name: inv.matter_name, matter_number: inv.matter_number,
+      issued_at: inv.issued_at, due_at: inv.due_at,
+      total: +Number(inv.total || 0).toFixed(2),
+      paid:  +Number(inv.paid  || 0).toFixed(2),
+      balance, days_overdue: days, bucket,
+      originating_attorney_email: inv.originating_attorney_email,
+      billing_attorney_email: inv.billing_attorney_email,
+    });
+  }
+  rows.sort((a, b) => b.days_overdue - a.days_overdue);
+  const totals = { count: rows.length, balance: +rows.reduce((s, r) => s + r.balance, 0).toFixed(2) };
+  res.json({ asOf: asOfStr, buckets, rows, totals });
+});
+
+// Cash receipts — succeeded payments rolled up by period, with method
+// breakdown and individual rows for the detail table.
+app.get('/api/reports/cash-receipts', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const granularity = ['day','month','year'].includes(req.query.granularity) ? req.query.granularity : 'month';
+  const from = req.query.from || null;
+  const to   = req.query.to   || null;
+  const toEnd = to ? to + 'T23:59:59.999Z' : null;
+  const f = resolveCashflowFilters(req);
+
+  const cIn = inClause('i.client_contact_id', f.clientIdIn);
+  const mIn = inClause('i.matter_id',         f.matterIdIn);
+  let sql = `
+    SELECT p.id, p.invoice_id, p.amount, p.method, p.occurred_at, p.destination,
+           p.reference, p.notes,
+           i.number AS invoice_number, i.client_contact_id, i.client_name, i.matter_id,
+           m.name AS matter_name, m.matter_number,
+           c.client_number, c.originating_attorney_email, c.billing_attorney_email
+      FROM invoice_payments p
+      LEFT JOIN invoices i ON i.id = p.invoice_id
+      LEFT JOIN matters  m ON m.id = i.matter_id
+      LEFT JOIN contacts c ON c.id = i.client_contact_id
+     WHERE p.firm_id = ? AND p.status = 'succeeded' AND p.occurred_at IS NOT NULL
+     ${cIn.sql}${mIn.sql}
+  `;
+  const params = [req.user.firmId, ...cIn.params, ...mIn.params];
+  if (from)  { sql += ' AND p.occurred_at >= ?'; params.push(from); }
+  if (toEnd) { sql += ' AND p.occurred_at <= ?'; params.push(toEnd); }
+  sql += ' ORDER BY p.occurred_at DESC';
+  const payments = db.prepare(sql).all(...params);
+
+  const periodMap = new Map();
+  const methodTotals = {};
+  for (const p of payments) {
+    const period = periodFmtJs(p.occurred_at, granularity);
+    if (!periodMap.has(period)) periodMap.set(period, { period, total: 0, count: 0, by_method: {} });
+    const row = periodMap.get(period);
+    const amt = Number(p.amount || 0);
+    const method = p.method || 'unknown';
+    row.total = +(row.total + amt).toFixed(2);
+    row.count += 1;
+    row.by_method[method] = +((row.by_method[method] || 0) + amt).toFixed(2);
+    methodTotals[method]  = +((methodTotals[method]  || 0) + amt).toFixed(2);
+  }
+  const periods = [...periodMap.values()].sort((a, b) => a.period < b.period ? -1 : 1);
+  const totals = {
+    amount: +payments.reduce((s, p) => s + Number(p.amount || 0), 0).toFixed(2),
+    count: payments.length,
+    by_method: methodTotals,
+  };
+  const rows = payments.map(p => ({
+    id: p.id, invoice_id: p.invoice_id, invoice_number: p.invoice_number,
+    occurred_at: p.occurred_at, amount: +Number(p.amount || 0).toFixed(2),
+    method: p.method || 'unknown', destination: p.destination,
+    reference: p.reference, notes: p.notes,
+    client_contact_id: p.client_contact_id, client_name: p.client_name, client_number: p.client_number,
+    matter_id: p.matter_id, matter_name: p.matter_name, matter_number: p.matter_number,
+    originating_attorney_email: p.originating_attorney_email,
+    billing_attorney_email: p.billing_attorney_email,
+  }));
+  res.json({ granularity, from, to, periods, rows, totals });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
 // CSV IMPORT / EXPORT
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -3336,9 +4157,168 @@ app.get('/api/dashboard', authRequired, verifyFirmMembership, (req, res) => {
     const outstanding = db.prepare(`SELECT COALESCE(SUM(total - amount_paid), 0) AS v FROM invoices
                                     WHERE firm_id = ? AND status IN ('sent')`).get(firmId).v;
     const trustTotal = db.prepare(`SELECT COALESCE(SUM(amount), 0) AS v FROM trust_ledger WHERE firm_id = ?`).get(firmId).v;
-    billing = { unbilledWip: unbilled, outstandingAR: outstanding, trustBalance: trustTotal };
+    // Aging slice — uses the same per-matter aging logic as the WIP report so
+    // the dashboard nudge and the report card always match.
+    const wip = computeUnbilledWipReport(firmId);
+    const over60Amount  = +(wip.summary['61-90'].amount + wip.summary['90+'].amount).toFixed(2);
+    const over60Matters = wip.summary['61-90'].count + wip.summary['90+'].count;
+    billing = {
+      unbilledWip: unbilled,
+      outstandingAR: outstanding,
+      trustBalance: trustTotal,
+      unbilledWipOver60: over60Amount,
+      unbilledWipOver60Matters: over60Matters,
+    };
   }
   res.json({ totalContacts, byType, overdue, thisWeek, recent, billing });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// REPORTS
+// ═══════════════════════════════════════════════════════════════════════
+
+// Unbilled WIP grouped by matter, with aging buckets based on the oldest
+// draft entry's work date. Time is included only for hourly matters (flat-fee
+// draft time is bookkeeping, not WIP). Expenses are included for hourly and
+// flat matters since advanced costs leak regardless of billing type.
+// Closed matters are included — stale draft time on a closed matter is exactly
+// the leakage this report exists to catch.
+//
+// Extracted as a function so the dashboard can reuse the same logic for its
+// "$X older than 60 days" nudge — guarantees the dashboard number and the
+// report agree.
+function computeUnbilledWipReport(firmId) {
+  const timeAgg = db.prepare(`
+    SELECT t.matter_id,
+           MIN(t.date) AS oldest_time_date,
+           SUM(t.minutes) / 60.0 AS time_hours,
+           SUM(t.minutes * t.rate / 60.0) AS time_amount,
+           COUNT(*) AS entry_count
+      FROM time_entries t
+      JOIN matters m ON m.id = t.matter_id
+     WHERE t.firm_id = ?
+       AND t.status = 'draft'
+       AND t.billable = 1
+       AND m.billing_type = 'hourly'
+     GROUP BY t.matter_id
+  `).all(firmId);
+
+  const expenseAgg = db.prepare(`
+    SELECT e.matter_id,
+           MIN(e.date) AS oldest_expense_date,
+           SUM(e.amount * (1 + COALESCE(e.markup_pct, 0))) AS expense_amount,
+           COUNT(*) AS expense_count
+      FROM expenses e
+      JOIN matters m ON m.id = e.matter_id
+     WHERE e.firm_id = ?
+       AND e.status = 'draft'
+       AND e.billable = 1
+       AND m.billing_type IN ('hourly','flat')
+     GROUP BY e.matter_id
+  `).all(firmId);
+
+  const byMatter = new Map();
+  for (const r of timeAgg) {
+    byMatter.set(r.matter_id, {
+      matter_id: r.matter_id,
+      oldest_time_date: r.oldest_time_date,
+      oldest_expense_date: null,
+      time_hours: r.time_hours || 0,
+      time_amount: r.time_amount || 0,
+      expense_amount: 0,
+      entry_count: r.entry_count || 0,
+      expense_count: 0,
+    });
+  }
+  for (const r of expenseAgg) {
+    const cur = byMatter.get(r.matter_id);
+    if (cur) {
+      cur.oldest_expense_date = r.oldest_expense_date;
+      cur.expense_amount = r.expense_amount || 0;
+      cur.expense_count = r.expense_count || 0;
+    } else {
+      byMatter.set(r.matter_id, {
+        matter_id: r.matter_id,
+        oldest_time_date: null,
+        oldest_expense_date: r.oldest_expense_date,
+        time_hours: 0,
+        time_amount: 0,
+        expense_amount: r.expense_amount || 0,
+        entry_count: 0,
+        expense_count: r.expense_count || 0,
+      });
+    }
+  }
+
+  const summary = {
+    '0-30':  { count: 0, amount: 0 },
+    '31-60': { count: 0, amount: 0 },
+    '61-90': { count: 0, amount: 0 },
+    '90+':   { count: 0, amount: 0 },
+  };
+
+  if (byMatter.size === 0) {
+    return { rows: [], summary, totals: { matters: 0, amount: 0 } };
+  }
+
+  const ids = [...byMatter.keys()];
+  const placeholders = ids.map(() => '?').join(',');
+  const matters = db.prepare(`
+    SELECT id, name, client_name, client_contact_id, status, billing_type
+      FROM matters
+     WHERE firm_id = ? AND id IN (${placeholders})
+  `).all(firmId, ...ids);
+  const matterMap = new Map(matters.map(m => [m.id, m]));
+
+  // Aging anchor: midnight today, local time. Date-only strings parse as local
+  // when no Z suffix is present, so the diff is in calendar days.
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const todayMs = today.getTime();
+
+  const rows = [];
+  for (const r of byMatter.values()) {
+    const m = matterMap.get(r.matter_id);
+    if (!m) continue; // matter deleted out from under the entries — skip
+    const candidates = [r.oldest_time_date, r.oldest_expense_date].filter(Boolean).sort();
+    const oldest = candidates[0];
+    const days = oldest
+      ? Math.max(0, Math.floor((todayMs - new Date(oldest + 'T00:00:00').getTime()) / 86400000))
+      : 0;
+    const bucket = days <= 30 ? '0-30' : days <= 60 ? '31-60' : days <= 90 ? '61-90' : '90+';
+    const time_amount    = +(r.time_amount || 0).toFixed(2);
+    const expense_amount = +(r.expense_amount || 0).toFixed(2);
+    const total_amount   = +(time_amount + expense_amount).toFixed(2);
+    rows.push({
+      matter_id:           m.id,
+      matter_name:         m.name,
+      matter_status:       m.status,
+      billing_type:        m.billing_type,
+      client_name:         m.client_name,
+      client_contact_id:   m.client_contact_id,
+      oldest_entry_date:   oldest,
+      days_since_oldest:   days,
+      bucket,
+      time_hours:          +(r.time_hours || 0).toFixed(2),
+      time_amount,
+      expense_amount,
+      total_amount,
+      entry_count:         r.entry_count,
+      expense_count:       r.expense_count,
+    });
+    summary[bucket].count  += 1;
+    summary[bucket].amount += total_amount;
+  }
+  for (const k of Object.keys(summary)) summary[k].amount = +summary[k].amount.toFixed(2);
+
+  rows.sort((a, b) => b.days_since_oldest - a.days_since_oldest);
+
+  const totalsAmount = +rows.reduce((s, r) => s + r.total_amount, 0).toFixed(2);
+  return { rows, summary, totals: { matters: rows.length, amount: totalsAmount } };
+}
+
+app.get('/api/reports/unbilled-wip', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  res.json(computeUnbilledWipReport(req.user.firmId));
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3410,18 +4390,21 @@ app.get('/api/timers', authRequired, verifyFirmMembership, requireCap('logTime')
 });
 
 // Create a new timer. Users may hold several concurrent timer rows, but only
-// one runs at a time — any others that were running get paused.
+// one runs at a time — any others that were running get paused. matterId is
+// optional: a timer can start with no client/matter and have one assigned later
+// via PATCH (so users can hit "Start" and decide what they're working on after).
 app.post('/api/timers', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
   const { matterId, description } = req.body || {};
-  if (!matterId) return res.status(400).json({ error: 'matterId required' });
-  const m = db.prepare('SELECT id FROM matters WHERE id = ? AND firm_id = ?').get(matterId, req.user.firmId);
-  if (!m) return res.status(404).json({ error: 'Matter not found' });
+  if (matterId) {
+    const m = db.prepare('SELECT id FROM matters WHERE id = ? AND firm_id = ?').get(matterId, req.user.firmId);
+    if (!m) return res.status(404).json({ error: 'Matter not found' });
+  }
   const now = new Date().toISOString();
   const info = db.transaction(() => {
     pauseOtherRunningTimers(req.user.email);
     return db.prepare(`INSERT INTO timers (user_email, firm_id, matter_id, description, started_at, accumulated_seconds)
                        VALUES (?, ?, ?, ?, ?, 0)`)
-      .run(req.user.email, req.user.firmId, matterId, description || null, now);
+      .run(req.user.email, req.user.firmId, matterId || null, description || null, now);
   })();
   res.json(timerToJSON(getTimerById(info.lastInsertRowid, req.user.email, req.user.firmId)));
 });

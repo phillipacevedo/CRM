@@ -178,13 +178,18 @@ Tracking list from code review on 2026-04-23. Check off items as they're resolve
       and `.kanban-col { width:100%; max-height:none }`. `.kanban-cards { max-height:50vh }` keeps
       each stacked column from taking over the whole screen when it has many cards.
 
-- [ ] **25. Topbar wrap is ugly** (`app.html:58`)
-  - `flex-wrap:wrap` with no breakpoint — search + actions stack awkwardly.
-  - Fix: `@media (max-width:900px) { .topbar { flex-direction:column; } }`.
+- [x] **25. Topbar wrap is ugly** (`app.html:58`) ✅ 2026-04-26
+      Added a `@media (max-width:900px)` rule that stacks the topbar as a column,
+      drops `margin-left:auto` on `.actions` (it pushes nothing in a column), and
+      removes the search's `max-width:420px` so it fills the row when stacked.
+      Desktop layout unchanged.
 
-- [ ] **26. Modal awkward on short screens** (`app.html:185`)
-  - `.modal { max-height:90vh }` fine, but forms tower on iPhone SE.
-  - Fix: `font-size:clamp(12px, 3vw, 14px)` on modal inputs/labels.
+- [x] **26. Modal awkward on short screens** (`app.html:185`) ✅ 2026-04-26
+      Inside the existing `(max-width:768px)` block, added
+      `font-size:clamp(12px,3vw,13.5px)` on `.modal-body input/select/textarea`
+      and `clamp(10px,2.5vw,11.5px)` on `.modal-body label`. Clamp ceilings match
+      current desktop sizes (13.5/11.5px) so wider screens are unaffected; the
+      floors keep text legible at ~320px.
 
 ### Event wiring / state
 
@@ -204,9 +209,14 @@ Tracking list from code review on 2026-04-23. Check off items as they're resolve
       Normal completed drags don't grow the registry; only mid-drag navigations trigger the
       force-release.
 
-- [ ] **29. View state scattered across `state._*`** (`app.html:1063`, `1103`, `4368`)
-  - `state._contactsView`, `state._clientsView`, `state._trustView` — no central manager.
-  - Fix: Consolidate into `state.viewState.*`.
+- [x] **29. View state scattered across `state._*`** (`app.html:1063`, `1103`, `4368`) ✅ 2026-04-26
+      Added `viewState: {}` to the central `state` initializer and migrated the five
+      view-scoped fields: `_contactsView` → `viewState.contacts`, `_clientsView` →
+      `viewState.clients`, `_timeView` → `viewState.time`, `_trustView` →
+      `viewState.trust`, `_settingsTab` → `viewState.settingsTab`.
+      **Intentionally left as `state._*`:** `_renderVersion` and `_viewCleanups` are
+      navigation control-flow (not per-view UI), `_pendingSearch` is a cross-view
+      handoff, and `_users` is a server-data cache. None belong under `viewState`.
 
 - [x] **30. Timer widget late-initializes** (`app.html:839`) ✅ 2026-04-23
       `boot()` now awaits `initTimer()` before calling `navigate('dashboard')`, so the dashboard's
@@ -231,9 +241,13 @@ Tracking list from code review on 2026-04-23. Check off items as they're resolve
       now share one rule. Adding a new badge means picking the right color group or defining a
       new unique rule — no more near-duplicate declarations to keep in sync.
 
-- [ ] **33. Button CSS specificity cascade** (`app.html:76-106`)
-  - `.btn-cluster .btn:hover` beats `.btn-ghost:hover`.
-  - Fix: Flatten with `.btn-ghost.in-cluster:hover` or `:is()`.
+- [x] **33. Button CSS specificity cascade** (`app.html:76-106`) ✅ 2026-04-26
+      Wrapped `.btn-cluster` in `:where()` on the descendant rules so they sit at
+      single-class specificity (0,1,0 / 0,1,1) — matching `.btn-ghost:hover` etc.
+      instead of escalating via the descendant-selector boost. Behavior is
+      identical because source order still favors the cluster rules; the win is
+      that any future per-button override only needs a single modifier class
+      instead of a specificity arms race.
 
 ### Accessibility / polish
 
