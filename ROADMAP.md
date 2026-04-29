@@ -106,8 +106,18 @@ Added "Origination" sub-tab to Cashflow. Calls `GET /api/reports/origination`, w
 
 ## Phase 4 — Larger Initiatives (1 month+)
 
-### 4.1 DealTracker matter sync
-`matters.dt_matter_id` is schema-ready but has no UI. Build a "Link to DT matter" picker on matter create/edit (calls the existing `/api/dt/matters` proxy). Once linked, sync matter name and status bidirectionally and surface DT-sourced fields (deal stage, counterparty) in a read-only panel on matter detail.
+### 4.1 DealTracker matter sync ✅
+**Subscription gate:** Added `dt_subscriber` boolean to `users` table. Admin toggles it per user in Settings → Team (Edit modal). DT subscriber users show a "DT" badge in the team table. Only DT subscribers see the DT linking UI in the matter form; non-subscribers get a hidden input that preserves any existing link.
+
+**Matter form DT field (DT subscribers only):**
+- Unlinked: "Link to DT matter" button → fetches `/api/dt/matters` (DT public export) → inline searchable list → click to link
+- If DT is unreachable: falls back to a manual ID text input
+- Linked: shows DT matter name, stage, status badges; "Sync" button calls `POST /api/matters/:id/dt-sync` to refresh cached data; "Unlink" clears the link
+
+**Server:**
+- `dt_subscriber INTEGER DEFAULT 0` migration on `users`; `dt_data TEXT` migration on `matters`
+- `GET /api/me` and `GET /api/seats` return `dtSubscriber`; `PUT /api/seats/:email` accepts `dtSubscriber`
+- `POST /api/matters/:id/dt-sync` — fetches DT public export, finds matching matter by ID, caches JSON in `dt_data`
 
 ### 4.2 Invoice layout editor: block add/remove
 The current layout editor lets users reposition and resize existing blocks but not add new ones or delete unwanted ones. Extend it to support:

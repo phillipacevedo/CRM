@@ -610,6 +610,8 @@ const migrations = [
   `ALTER TABLE invoice_payments ADD COLUMN created_by TEXT`,
   `ALTER TABLE invoices ADD COLUMN amount_writedown REAL DEFAULT 0`,
   `ALTER TABLE bank_transactions ADD COLUMN source TEXT DEFAULT 'mercury'`,
+  `ALTER TABLE users   ADD COLUMN dt_subscriber INTEGER DEFAULT 0`,
+  `ALTER TABLE matters ADD COLUMN dt_data TEXT`,
 ];
 // Only swallow "duplicate column" errors (idempotency). Anything else — syntax
 // typos, missing table, permission issues — is a real problem and should fail
@@ -1141,7 +1143,7 @@ app.get('/api/auth/me', authRequired, (req, res) => {
   res.json({
     email: u.email, name: u.name, firstName: u.first_name, lastName: u.last_name,
     role: u.role, isAdmin: !!u.is_admin, firmId: u.firm_id, firmName: firm?.name || '',
-    defaultRate: u.default_rate || 0,
+    defaultRate: u.default_rate || 0, dtSubscriber: !!u.dt_subscriber,
   });
 });
 
@@ -1286,13 +1288,14 @@ app.put('/api/me', authRequired, (req, res) => {
 });
 
 app.get('/api/seats', authRequired, verifyFirmMembership, (req, res) => {
-  const users = db.prepare('SELECT email, first_name, last_name, name, role, is_admin, default_rate, discount_rate, active, created_at FROM users WHERE firm_id = ? ORDER BY created_at').all(req.user.firmId);
+  const users = db.prepare('SELECT email, first_name, last_name, name, role, is_admin, default_rate, discount_rate, active, dt_subscriber, created_at FROM users WHERE firm_id = ? ORDER BY created_at').all(req.user.firmId);
   const canSeeRates = CAPS.viewRates(req.user);
   res.json({
     roles: Object.entries(ROLES).map(([id, v]) => ({ id, label: v.label, rank: v.rank })),
     users: users.map(u => ({
       email: u.email, firstName: u.first_name, lastName: u.last_name, name: u.name,
       role: u.role, isAdmin: !!u.is_admin, active: !!u.active,
+      dtSubscriber: !!u.dt_subscriber,
       defaultRate:  canSeeRates ? u.default_rate  : null,
       discountRate: canSeeRates ? u.discount_rate : null,
       createdAt: u.created_at,
@@ -1358,19 +1361,20 @@ app.put('/api/seats/:email', authRequired, adminRequired, (req, res) => {
   const emailLower = req.params.email.toLowerCase().trim();
   const u = db.prepare('SELECT * FROM users WHERE email = ? AND firm_id = ?').get(emailLower, req.user.firmId);
   if (!u) return res.status(404).json({ error: 'User not found' });
-  const { firstName, lastName, role, defaultRate, discountRate, active } = req.body;
+  const { firstName, lastName, role, defaultRate, discountRate, active, dtSubscriber } = req.body;
   if (role && !VALID_ROLES.includes(role)) return res.status(400).json({ error: 'Invalid role' });
-  const newFirst = (firstName ?? u.first_name ?? '').trim();
-  const newLast  = (lastName  ?? u.last_name  ?? '').trim();
-  const newRole  = role || u.role;
-  const newName  = fullName(newFirst, newLast) || u.name;
-  const newRate  = typeof defaultRate  === 'number' ? defaultRate  : u.default_rate;
-  const newDisc  = 'discountRate' in (req.body || {})
+  const newFirst  = (firstName ?? u.first_name ?? '').trim();
+  const newLast   = (lastName  ?? u.last_name  ?? '').trim();
+  const newRole   = role || u.role;
+  const newName   = fullName(newFirst, newLast) || u.name;
+  const newRate   = typeof defaultRate   === 'number' ? defaultRate   : u.default_rate;
+  const newDisc   = 'discountRate' in (req.body || {})
     ? (discountRate === null || discountRate === '' ? null : Number(discountRate))
     : u.discount_rate;
-  const newActive = typeof active === 'boolean' ? (active ? 1 : 0) : u.active;
-  db.prepare('UPDATE users SET first_name=?, last_name=?, name=?, role=?, default_rate=?, discount_rate=?, active=? WHERE email=?')
-    .run(newFirst, newLast, newName, newRole, newRate, newDisc, newActive, emailLower);
+  const newActive = typeof active        === 'boolean' ? (active        ? 1 : 0) : u.active;
+  const newDtSub  = typeof dtSubscriber  === 'boolean' ? (dtSubscriber  ? 1 : 0) : u.dt_subscriber;
+  db.prepare('UPDATE users SET first_name=?, last_name=?, name=?, role=?, default_rate=?, discount_rate=?, active=?, dt_subscriber=? WHERE email=?')
+    .run(newFirst, newLast, newName, newRole, newRate, newDisc, newActive, newDtSub, emailLower);
   res.json({ ok: true });
 });
 
@@ -2194,6 +2198,25 @@ app.put('/api/matters/:id/rates', authRequired, verifyFirmMembership, requireCap
   });
   tx(list);
   res.json({ ok: true });
+});
+
+// Fetch fresh DT data for a linked matter and cache it in dt_data
+app.post('/api/matters/:id/dt-sync', authRequired, verifyFirmMembership, requireCap('editContacts'), async (req, res) => {
+  const matter = db.prepare('SELECT id, dt_matter_id FROM matters WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  if (!matter)           return res.status(404).json({ error: 'Matter not found' });
+  if (!matter.dt_matter_id) return res.status(400).json({ error: 'No DT matter linked' });
+  try {
+    const r = await fetch(`${DT_URL}/api/clients/export`, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return res.status(502).json({ error: 'DT unreachable' });
+    const clients = await r.json();
+    const found = Array.isArray(clients) ? clients.find(c => String(c.id) === String(matter.dt_matter_id)) : null;
+    if (!found) return res.status(404).json({ error: 'DT matter not found in export — ID may have changed' });
+    db.prepare(`UPDATE matters SET dt_data = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(JSON.stringify(found), matter.id);
+    res.json({ ok: true, dt_matter_id: matter.dt_matter_id, dt_data: found });
+  } catch(e) {
+    res.status(502).json({ error: 'DT sync failed: ' + e.message });
+  }
 });
 
 // Pull DealTracker matters (proxy to DT API for linking)

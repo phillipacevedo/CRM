@@ -3147,8 +3147,78 @@ async function openMatterForm(existing) {
       el('div', { class: 'field' }, [ el('label', {}, 'Client'),
         el('select', { name: 'clientContactId' }, [ el('option', { value: '' }, '— choose —'),
           ...contacts.map(c => el('option', { value: c.id, ...(m.client_contact_id === c.id ? { selected: 'selected' } : {}) }, c.full_name + (c.company_name ? ` (${c.company_name})` : '')))]) ]),
-      el('div', { class: 'field' }, [ el('label', {}, 'DealTracker matter ID (optional)'),
-        el('input', { name: 'dtMatterId', value: m.dt_matter_id || '' }) ]),
+      state.me.dtSubscriber ? (() => {
+        const dtWrap  = el('div', { class: 'field' });
+        dtWrap.appendChild(el('label', {}, 'DealTracker matter'));
+        const dtBody  = el('div', { style: 'margin-top:4px' });
+        const dtInput = el('input', { name: 'dtMatterId', type: 'hidden', value: m.dt_matter_id || '' });
+        dtWrap.appendChild(dtBody);
+        dtWrap.appendChild(dtInput);
+
+        const showLinked = (dtId, dtObj) => {
+          dtInput.value = dtId;
+          dtBody.innerHTML = '';
+          dtBody.appendChild(el('div', { style: 'display:flex;align-items:center;gap:8px;flex-wrap:wrap' }, [
+            el('span', { style: 'font-weight:500;color:var(--blue);font-size:13px' }, dtObj?.name || dtObj?.full_name || dtId),
+            dtObj?.stage  ? el('span', { style: 'font-size:11px;color:var(--text-muted)' }, '· ' + dtObj.stage)  : null,
+            dtObj?.status ? el('span', { class: 'badge badge-status-' + (dtObj.status === 'active' ? 'active' : 'closed') }, dtObj.status) : null,
+            !isNew ? el('button', { class: 'btn btn-ghost btn-sm', style: 'font-size:11px', onclick: async e => {
+              e.preventDefault();
+              const btn = e.target; btn.disabled = true; btn.textContent = 'Syncing…';
+              const r = await api('/api/matters/' + m.id + '/dt-sync', { method: 'POST' }).catch(() => null);
+              if (r?.dt_data) { showLinked(r.dt_matter_id, r.dt_data); toast('Synced from DT'); }
+              else { toast('DT sync failed', true); btn.disabled = false; btn.textContent = 'Sync'; }
+            }}, 'Sync') : null,
+            el('button', { class: 'btn btn-ghost btn-sm', style: 'font-size:11px;color:var(--red)', onclick: e => {
+              e.preventDefault(); showUnlinked();
+            }}, 'Unlink'),
+          ]));
+        };
+
+        const showUnlinked = () => {
+          dtInput.value = '';
+          dtBody.innerHTML = '';
+          const linkBtn = el('button', { class: 'btn btn-ghost btn-sm', onclick: async e => {
+            e.preventDefault();
+            linkBtn.disabled = true; linkBtn.textContent = 'Loading…';
+            const data = await api('/api/dt/matters').catch(() => ({ clients: [] }));
+            const clients = data.clients || [];
+            dtBody.innerHTML = '';
+            if (!clients.length) {
+              dtBody.appendChild(el('div', { style: 'font-size:12px;color:var(--text-muted);margin-bottom:6px' }, 'DT unreachable. Enter ID manually:'));
+              const manualIn = el('input', { style: 'width:100%', placeholder: 'DT matter ID' });
+              manualIn.oninput = () => { dtInput.value = manualIn.value; };
+              dtBody.appendChild(manualIn);
+              return;
+            }
+            const searchIn = el('input', { placeholder: 'Search DT matters…', style: 'width:100%;margin-bottom:6px' });
+            const listEl   = el('div', { style: 'max-height:160px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;background:white' });
+            const renderList = q => {
+              listEl.innerHTML = '';
+              (q ? clients.filter(c => (c.name || c.full_name || '').toLowerCase().includes(q.toLowerCase())) : clients)
+                .slice(0, 30).forEach(c => {
+                  const row = el('div', { style: 'padding:7px 10px;cursor:pointer;border-bottom:1px solid var(--border);font-size:13px' }, c.name || c.full_name || String(c.id));
+                  row.onmouseenter = () => { row.style.background = 'var(--gray-bg)'; };
+                  row.onmouseleave = () => { row.style.background = ''; };
+                  row.onclick = () => showLinked(String(c.id), c);
+                  listEl.appendChild(row);
+                });
+              if (!listEl.children.length) listEl.appendChild(el('div', { style: 'padding:10px;color:var(--text-muted);font-size:12px' }, 'No matches'));
+            };
+            renderList('');
+            searchIn.oninput = () => renderList(searchIn.value);
+            dtBody.appendChild(searchIn);
+            dtBody.appendChild(listEl);
+          }}, 'Link to DT matter');
+          dtBody.appendChild(linkBtn);
+        };
+
+        if (m.dt_matter_id) {
+          const cached = m.dt_data ? (typeof m.dt_data === 'string' ? JSON.parse(m.dt_data) : m.dt_data) : null;
+          showLinked(m.dt_matter_id, cached);
+        } else { showUnlinked(); }
+        return dtWrap;
+      })() : el('input', { name: 'dtMatterId', type: 'hidden', value: m.dt_matter_id || '' }),
     ]),
     (() => {
       // Flat-fee field is only meaningful when billingType === 'flat'. Hide it
@@ -7905,7 +7975,8 @@ async function renderSettingsTeam(mount) {
       el('tbody', {}, seats.users.map(u => el('tr', {}, [
         el('td', {}, [
           el('strong', {}, u.name || '—'),
-          u.isAdmin ? el('span', { class: 'badge', style: 'margin-left:6px;background:var(--gold-bg);color:#7a6119' }, 'Admin') : null,
+          u.isAdmin      ? el('span', { class: 'badge', style: 'margin-left:6px;background:var(--gold-bg);color:#7a6119' }, 'Admin') : null,
+          u.dtSubscriber ? el('span', { class: 'badge', style: 'margin-left:6px;background:#dbeafe;color:#1d4ed8' }, 'DT') : null,
         ]),
         el('td', {}, u.email ? el('a', { href: 'mailto:' + u.email }, u.email) : '—'),
         el('td', {}, ROLE_LABELS[u.role] || u.role),
@@ -9088,6 +9159,10 @@ function editUserModal(u, roles) {
       el('input', { type: 'checkbox', id: 'eu-active', ...(u.active ? { checked: 'checked' } : {}) }),
       el('label', { for: 'eu-active' }, 'Active'),
     ]),
+    el('div', { class: 'checkbox-row' }, [
+      el('input', { type: 'checkbox', id: 'eu-dt-sub', ...(u.dtSubscriber ? { checked: 'checked' } : {}) }),
+      el('label', { for: 'eu-dt-sub' }, 'DealTracker subscriber — shows DT matter linking in matter form'),
+    ]),
   ]);
   openModal('Edit team member — ' + u.email, body, el('div', {}, [
     el('button', { class: 'btn btn-ghost btn-sm', onclick: async () => {
@@ -9100,6 +9175,7 @@ function editUserModal(u, roles) {
       const body = {
         firstName: $('#eu-first').value, lastName: $('#eu-last').value,
         role: $('#eu-role').value, active: $('#eu-active').checked,
+        dtSubscriber: $('#eu-dt-sub').checked,
       };
       if ($('#eu-rate'))     body.defaultRate  = parseFloat($('#eu-rate').value) || 0;
       if ($('#eu-discount')) body.discountRate = $('#eu-discount').value === '' ? null : parseFloat($('#eu-discount').value);
