@@ -119,14 +119,18 @@ Added "Origination" sub-tab to Cashflow. Calls `GET /api/reports/origination`, w
 - `GET /api/me` and `GET /api/seats` return `dtSubscriber`; `PUT /api/seats/:email` accepts `dtSubscriber`
 - `POST /api/matters/:id/dt-sync` — fetches DT public export, finds matching matter by ID, caches JSON in `dt_data`
 
-### 4.2 Invoice layout editor: block add/remove
+### 4.2 Invoice layout editor: block add/remove ✅
 The current layout editor lets users reposition and resize existing blocks but not add new ones or delete unwanted ones. Extend it to support:
 - Add a custom text block (firm tagline, payment instructions)
 - Toggle visibility of optional blocks (e.g., hide the "Hours × Rate" breakdown for flat-fee clients)
 - Persist block list alongside existing label styles in `invoice_layout`
 
-### 4.3 Bulk time/expense import
+**Shipped:** "Blocks" button in the layout editor toolbar opens a slide-in panel with visibility toggles for 5 sections: Professional Services detail (page 2), Timekeeper summary (page 2), Costs page (page 3), Wire/ACH instructions (page 4), and Custom text block (page 1). Custom text block is a multi-line contenteditable div on page 1 (between billing summary and payment note) — hidden by default, shown once enabled. Visibility state persisted as `hiddenBlocks[]` in `firm.settings`; the PDF renderer honors all toggles. Custom text content stored as `labels.customTextBlock`.
+
+### 4.3 Bulk time/expense import ✅
 Large matters accumulate time from multiple attorneys. Support a CSV import on the Time tab (parallel to contact CSV import) with columns: `matter_name`, `date`, `description`, `minutes`, `user_email`, `billable`. Show a preview table with validation errors before committing.
+
+**Shipped:** "Import CSV" button on Time tab (all `logTime` users). Modal accepts file upload or paste. Required columns: `matter_name`, `date` (YYYY-MM-DD), `minutes` (or `hours`). Optional: `description`, `user_email` (honored for `manageBilling` users only), `billable` (yes/no, default yes). Preview table shows per-row validation with color-coded status before committing. Server: `POST /api/time/import` — resolves matters by `id` (client-resolved), inserts in a transaction, returns `{ inserted, skipped, errors }`.
 
 ### 4.4 Email-linked interaction logging
 When SMTP is configured, add an optional BCC address (e.g., `log@crm.phillipacevedo.com`) that, when included on an outgoing email, auto-creates an interaction log entry. Requires an inbound email parser (Mailgun inbound routes or similar) but would close the loop between communication and the CRM record without manual entry.
@@ -150,5 +154,7 @@ April–May 2026   Phase 2.1–2.3, 2.5, 3.2 ✅ complete (invoice shortcut, for
 June 2026        Phase 2.4 (trust payment completion — deferred until payments go live)
 May 2026         Phase 3.1, 3.3–3.5 ✅ complete (bank reconciliation, custom expense categories, contact dedup, origination report)
 April–May 2026   Phase 4.1 ✅ complete (DealTracker matter sync with per-user subscription gate)
-Q4 2026+         Phase 4.2–4.4 as needed (invoice layout blocks, bulk import, email logging)
+May 2026         Phase 4.3 ✅ complete (bulk time/expense import via CSV)
+May 2026         Phase 4.2 ✅ complete (invoice layout block visibility + custom text block)
+Q4 2026+         Phase 4.4 as needed (email-linked interaction logging)
 ```

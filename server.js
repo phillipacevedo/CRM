@@ -2348,6 +2348,36 @@ app.delete('/api/time/:id', authRequired, verifyFirmMembership, requireCap('logT
   res.json({ ok: true });
 });
 
+app.post('/api/time/import', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  if (!rows.length) return res.json({ inserted: 0, skipped: 0, errors: [] });
+  let inserted = 0, skipped = 0;
+  const errors = [];
+  const tx = db.transaction(() => {
+    rows.forEach((row, i) => {
+      const m = db.prepare('SELECT id FROM matters WHERE id = ? AND firm_id = ?').get(row.matterId, req.user.firmId);
+      if (!m) { errors.push({ index: i, error: 'Matter not found' }); skipped++; return; }
+      if (!row.date || !/^\d{4}-\d{2}-\d{2}$/.test(String(row.date))) { errors.push({ index: i, error: 'Invalid date' }); skipped++; return; }
+      const mins = parseInt(row.minutes, 10);
+      if (!mins || mins <= 0) { errors.push({ index: i, error: 'Invalid minutes' }); skipped++; return; }
+      const targetUser = (row.userEmail && CAPS.manageBilling(req.user))
+        ? String(row.userEmail).toLowerCase()
+        : req.user.email;
+      const rate = effectiveRate(targetUser, row.matterId);
+      const billable = row.billable === false || row.billable === 0 ? 0 : 1;
+      db.prepare(`INSERT INTO time_entries (id, firm_id, user_email, matter_id, date, minutes, rate, description, billable) VALUES (?,?,?,?,?,?,?,?,?)`)
+        .run(uid('t_'), req.user.firmId, targetUser, row.matterId, row.date, mins, rate, row.description || null, billable);
+      inserted++;
+    });
+  });
+  try {
+    tx();
+    res.json({ inserted, skipped, errors });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════
 // INVOICES
 // ═══════════════════════════════════════════════════════════════════════
@@ -3061,6 +3091,8 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
   // automatically in the PDF. `currentPageId` lets `drawHeader` (which is
   // shared across all four pages) pick up the right per-page offset.
   const blockLayout = (firmSettings.blockLayout && typeof firmSettings.blockLayout === 'object') ? firmSettings.blockLayout : {};
+  const hiddenBlocks = new Set(Array.isArray(firmSettings.hiddenBlocks) ? firmSettings.hiddenBlocks : ['p1-custom-text']);
+  const isHidden = (id) => hiddenBlocks.has(id);
   const PX_TO_PT = 0.75;
   const blockOff = (id) => {
     const lay = blockLayout[id];
@@ -3155,6 +3187,7 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
     wireRoutingNumberLabel:      'ABA Routing Number',
     wireBankNameLabel:           'Bank Name',
     wireBankAddressLabel:        'Bank Address',
+    customTextBlock:             '',
   }, firmSettings.labels || {});
 
   // Fallback to the original simple format if the firm prefers it
@@ -3479,12 +3512,28 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
     y += 20;
   }
 
+  const customText = String(labels.customTextBlock || '').trim();
+  if (customText && !isHidden('p1-custom-text')) {
+    y += 12;
+    doc.font(F_REGULAR).fontSize(10).fillColor('#333');
+    const ctLines = customText.split(/\r?\n/);
+    withOffset('p1-custom-text', () => {
+      let cy = y;
+      for (const line of ctLines) {
+        doc.text(line || ' ', PAGE_LEFT, cy, { width: PAGE_WIDTH });
+        cy += doc.heightOfString(line || ' ', { width: PAGE_WIDTH }) + 2;
+      }
+    });
+    const ctH = ctLines.reduce((h, l) => h + doc.heightOfString(l || ' ', { width: PAGE_WIDTH }) + 2, 0);
+    y += ctH + 8;
+  }
+
   forLabel('paymentDetailsNote', 10, 'italic');
   doc.fillColor(colorFor('paymentDetailsNote', muted));
   withOffset('p1-payment-note', () => doc.text(labels.paymentDetailsNote, PAGE_LEFT, PAGE_BOTTOM - 20, { width: PAGE_WIDTH, align: 'center', lineBreak: false }));
 
   // ═══ Professional Services detail ═══════════════════════════════════════
-  if (timeEntries.length > 0) {
+  if (timeEntries.length > 0 && !isHidden('p2-services')) {
     doc.addPage();
     currentPageId = 'p2';
     y = drawHeader(true);
@@ -3528,7 +3577,7 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
     y += 24;
 
     // Summary by timekeeper
-    if (byTimekeeper.size > 0) {
+    if (byTimekeeper.size > 0 && !isHidden('p2-timekeeper')) {
       // Page-break if this section wouldn't have room for a title + at least
       // a header row and one data row (~80pt).
       if (y + 80 > PAGE_BOTTOM) {
@@ -3560,7 +3609,7 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
 
   // ═══ Expense detail ═════════════════════════════════════════════════════
   const expenseLines = lines.filter(l => l.kind === 'expense');
-  if (expenseLines.length > 0) {
+  if (expenseLines.length > 0 && !isHidden('p3-costs')) {
     doc.addPage();
     currentPageId = 'p3';
     y = drawHeader(true);
@@ -3647,7 +3696,7 @@ function renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client,
     block('checksPayableLabel', [remitName, ...(remitAddr ? String(remitAddr).split(/\r?\n/) : [])], 'p4-checks-heading', 'p4-checks-info');
   }
 
-  if (wire.accountNumber || wire.routingNumber || wire.bankName) {
+  if ((wire.accountNumber || wire.routingNumber || wire.bankName) && !isHidden('p4-wire')) {
     const wireHeadingY = y;
     forLabel('wireHeadingLabel', 11, 'bold');
     doc.fillColor(colorFor('wireHeadingLabel', accent));

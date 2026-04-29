@@ -691,6 +691,61 @@ table.data.contacts tbody tr.is-client td:first-child{box-shadow:inset 3px 0 0 v
 }
 .inv-design-mode .inv-page{cursor:default}
 
+/* Hidden blocks — visibility toggled via the Blocks panel */
+.inv-block-hidden{display:none !important}
+
+/* Custom text block (page 1) */
+.inv-custom-text{
+  margin:18px 0 0;padding:10px 12px;
+  border:1px dashed #c0b89a;border-radius:4px;
+  font-size:calc(10.5px * var(--inv-font-scale,1));
+  line-height:1.5;color:#333;min-height:36px;
+  position:relative;
+}
+.inv-custom-text::before{
+  content:'Custom text block';position:absolute;top:-9px;left:10px;
+  font:600 9px/1 -apple-system,sans-serif;letter-spacing:.4px;
+  text-transform:uppercase;color:#baa87e;
+  background:#fff;padding:0 4px;
+}
+.inv-custom-text-lbl{
+  display:block;outline:none;width:100%;
+  white-space:pre-wrap;word-break:break-word;
+  -webkit-user-modify:read-write-plaintext-only;
+  min-height:22px;
+}
+.inv-custom-text-lbl[data-empty="1"]:not(:focus)::before{
+  content:attr(data-placeholder);color:#bbb;font-style:italic;
+}
+
+/* Blocks panel — slides in from the left */
+.inv-blocks-panel{
+  position:fixed;top:80px;left:20px;z-index:1150;
+  width:276px;background:#fff;border:1px solid var(--border);
+  border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.18);
+  padding:14px;font-size:12px;color:var(--navy);
+  transform:translateX(calc(-100% - 40px));opacity:0;pointer-events:none;
+  transition:transform .18s ease-out, opacity .15s ease-out;
+}
+.inv-blocks-panel[data-open="1"]{transform:translateX(0);opacity:1;pointer-events:auto}
+.inv-blocks-panel .hdr{
+  display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;
+}
+.inv-blocks-panel .hdr .ttl{font-weight:700;font-size:13px}
+.inv-blocks-panel .hdr .close{
+  background:none;border:none;font-size:18px;color:var(--text-muted);cursor:pointer;
+  line-height:1;padding:2px 6px;border-radius:4px;
+}
+.inv-blocks-panel .hdr .close:hover{background:var(--cream,#f5f2e8);color:var(--navy)}
+.inv-blocks-panel .block-row{
+  display:flex;align-items:flex-start;gap:9px;padding:7px 0;
+  border-bottom:.5px solid var(--border);cursor:pointer;
+}
+.inv-blocks-panel .block-row:last-of-type{border-bottom:none}
+.inv-blocks-panel .block-row input[type="checkbox"]{margin:2px 0 0;cursor:pointer;accent-color:var(--navy,#1e3a5f);flex-shrink:0}
+.inv-blocks-panel .block-row .lbl{font-size:12px;color:var(--navy);line-height:1.35;cursor:pointer}
+.inv-blocks-panel .hint{font-size:10.5px;color:var(--text-muted);line-height:1.4;margin-top:10px;padding-top:8px;border-top:.5px solid var(--border)}
+
 /* ═══════════════════════════════════════════════════════════════════════
    INVOICE EDITOR CSS — END
    ═══════════════════════════════════════════════════════════════════════ */
@@ -2740,6 +2795,140 @@ function importCsvModal() {
   ]));
 }
 
+async function importTimeCsvModal() {
+  const allMatters = await api('/api/matters');
+  const matterByName = new Map();
+  for (const m of allMatters) {
+    const key = m.name.toLowerCase().trim();
+    if (!matterByName.has(key)) matterByName.set(key, m);
+  }
+
+  let parsedRows = [];
+  const importBtn = el('button', { class: 'btn btn-primary btn-sm', disabled: true,
+    onclick: async () => {
+      const valid = parsedRows.filter(r => r.valid);
+      if (!valid.length) return;
+      const rows = valid.map(r => ({
+        matterId: r.matter.id, date: r.date, minutes: r.minutes,
+        description: r.description, userEmail: r.userEmail || undefined, billable: r.billable,
+      }));
+      try {
+        const result = await api('/api/time/import', { method: 'POST', body: { rows } });
+        toast(`Imported ${result.inserted} time entr${result.inserted === 1 ? 'y' : 'ies'}` +
+              (result.skipped ? ` (${result.skipped} skipped)` : ''));
+        closeModal(); navigate('time');
+      } catch (e) { toast('Import failed: ' + (e.message || 'error'), true); }
+    }
+  }, 'Import');
+
+  const previewSlot = el('div', { style: 'margin-top:14px' });
+  const showUser = can('manageBilling');
+
+  function parseAndPreview(text) {
+    previewSlot.innerHTML = '';
+    parsedRows = [];
+    importBtn.disabled = true;
+    importBtn.textContent = 'Import';
+    if (!text.trim()) return;
+    const raw = parseCsv(text);
+    if (!raw.length) { previewSlot.appendChild(el('p', { style: 'color:var(--text-muted);font-size:13px' }, 'No rows found.')); return; }
+
+    parsedRows = raw.map((r, i) => {
+      const errs = [];
+      const matterName = (r.matter_name || r.matter || '').trim();
+      if (!matterName) errs.push('matter_name required');
+      const matter = matterName ? matterByName.get(matterName.toLowerCase()) : null;
+      if (matterName && !matter) errs.push('matter not found');
+
+      const date = (r.date || '').trim();
+      if (!date) errs.push('date required');
+      else if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) errs.push('date must be YYYY-MM-DD');
+
+      let minutes = null;
+      const minsRaw = (r.minutes || r.mins || '').trim();
+      const hrsRaw  = (r.hours || '').trim();
+      if (minsRaw) {
+        const n = parseInt(minsRaw, 10);
+        if (isNaN(n) || n <= 0) errs.push('minutes must be a positive integer');
+        else minutes = n;
+      } else if (hrsRaw) {
+        const h = parseFloat(hrsRaw);
+        if (isNaN(h) || h <= 0) errs.push('hours must be a positive number');
+        else minutes = Math.round(h * 60);
+      } else errs.push('minutes (or hours) required');
+
+      const userEmail = (r.user_email || r.userEmail || '').trim().toLowerCase() || null;
+      const billableRaw = (r.billable || '').trim().toLowerCase();
+      const billable = !billableRaw || ['yes','y','true','1'].includes(billableRaw);
+      const description = (r.description || r.desc || '').trim() || null;
+
+      return { index: i, matterName, matter, date, minutes, userEmail, billable, description, errors: errs, valid: errs.length === 0 };
+    });
+
+    const validCount = parsedRows.filter(r => r.valid).length;
+    importBtn.disabled = validCount === 0;
+    importBtn.textContent = `Import ${validCount} row${validCount === 1 ? '' : 's'}`;
+
+    const errorCount = parsedRows.length - validCount;
+    previewSlot.appendChild(el('div', { style: 'font-size:13px;margin-bottom:8px' }, [
+      el('span', { style: 'color:' + (validCount > 0 ? 'var(--success,#2d7a2d)' : 'var(--text-muted)') }, validCount + ' valid'),
+      errorCount > 0 ? el('span', { style: 'color:var(--danger,#c0392b);margin-left:10px' }, errorCount + ' with errors') : null,
+    ]));
+
+    const hdrs = ['#', 'Date', 'Matter', ...(showUser ? ['User'] : []), 'Min', 'Billable', 'Description', 'Status'];
+    const thead = el('thead', {}, [el('tr', {}, hdrs.map(h =>
+      el('th', { style: 'text-align:left;padding:5px 8px;white-space:nowrap;border-bottom:1px solid var(--border);font-size:11px;background:var(--surface,#f8f8f8)' }, h)))]);
+    const tbody = el('tbody', {}, parsedRows.map(row => {
+      const errTxt = row.errors.join('; ');
+      const cs = (bad) => 'padding:4px 8px;font-size:12px;' + (bad ? 'color:var(--danger,#c0392b)' : '');
+      const dateErr = !row.date || !/^\d{4}-\d{2}-\d{2}$/.test(row.date);
+      const cells = [
+        el('td', { style: cs(false) }, String(row.index + 1)),
+        el('td', { style: cs(dateErr) }, row.date || '—'),
+        el('td', { style: cs(!row.matter) }, row.matterName || '—'),
+        ...(showUser ? [el('td', { style: cs(false) }, row.userEmail || '(you)')] : []),
+        el('td', { style: cs(row.minutes === null) }, row.minutes != null ? String(row.minutes) : '—'),
+        el('td', { style: cs(false) }, row.billable ? 'yes' : 'no'),
+        el('td', { style: 'padding:4px 8px;font-size:12px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, row.description || ''),
+        el('td', { style: 'padding:4px 8px;font-size:12px;' + (row.valid ? 'color:var(--success,#2d7a2d)' : 'color:var(--danger,#c0392b)') },
+          row.valid ? '✓' : errTxt),
+      ];
+      return el('tr', { style: row.valid ? '' : 'background:rgba(220,0,0,0.03)' }, cells);
+    }));
+    previewSlot.appendChild(el('div', { style: 'overflow:auto;max-height:300px;border:1px solid var(--border);border-radius:6px' }, [
+      el('table', { style: 'width:100%;border-collapse:collapse' }, [thead, tbody]),
+    ]));
+  }
+
+  const fileInput = el('input', { type: 'file', id: 'time-csv-file', accept: '.csv,text/csv', style: 'font-size:13px' });
+  const textarea  = el('textarea', { id: 'time-csv-text',
+    style: 'width:100%;min-height:90px;font-family:monospace;font-size:11px;padding:8px;border:1px solid var(--border);border-radius:6px;resize:vertical',
+    placeholder: 'matter_name,date,description,minutes,user_email,billable\nSmith v. Jones,2026-04-01,Research,90,,yes' });
+
+  fileInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    const text = await file.text();
+    textarea.value = text;
+    parseAndPreview(text);
+  });
+  textarea.addEventListener('input', (e) => parseAndPreview(e.target.value));
+
+  const body = el('div', {}, [
+    el('p', { style: 'color:var(--text-muted);font-size:13px;margin-bottom:10px' },
+      'Required columns: matter_name, date (YYYY-MM-DD), minutes. Optional: description, user_email, billable (yes/no). Accepts hours instead of minutes.'),
+    el('div', { style: 'display:flex;align-items:center;gap:10px;margin-bottom:6px' }, [fileInput]),
+    el('div', { style: 'text-align:center;font-size:11px;color:var(--text-muted);margin-bottom:4px' }, '— or paste CSV below —'),
+    textarea,
+    previewSlot,
+  ]);
+
+  openModal('Import time entries from CSV', body, el('div', {}, [
+    el('div', { class: 'spacer' }),
+    el('button', { class: 'btn btn-ghost btn-sm', onclick: closeModal }, 'Cancel'),
+    importBtn,
+  ]));
+}
+
 function parseCsv(text) {
   const lines = text.split(/\r?\n/).filter(l => l.trim());
   if (lines.length < 2) return [];
@@ -3453,6 +3642,7 @@ async function renderTime(mount, v) {
   if (isStaleRender(v)) return;
   const actions = $('#topbar-actions');
   actions.innerHTML = '';
+  if (can('logTime')) actions.appendChild(el('button', { class: 'btn btn-sm', onclick: importTimeCsvModal }, 'Import CSV'));
   actions.appendChild(el('button', { class: 'btn btn-primary btn-sm', onclick: () => openTimeForm(null, matters) }, '+ New time entry'));
 
   // Determine fetch range per mode
@@ -8162,6 +8352,7 @@ const DEFAULT_INVOICE_LABELS = {
   wireRoutingNumberLabel:      'ABA Routing Number',
   wireBankNameLabel:           'Bank Name',
   wireBankAddressLabel:        'Bank Address',
+  customTextBlock:             '',
 };
 
 // Opens a fullscreen editor that renders a paper-like mock invoice with
@@ -8238,10 +8429,36 @@ function openInvoiceLayoutEditor(baseSettings) {
     return span;
   };
 
+  // Multi-line editable block — used for the custom text block.
+  // Unlike lbl(), Enter inserts a newline and content is read via innerText.
+  const multiLbl = (key) => {
+    const span = el('span', {
+      class: 'inv-lbl inv-custom-text-lbl',
+      contenteditable: 'true',
+      spellcheck: 'false',
+      'data-label-key': key,
+      'data-multiline': '1',
+      'data-empty': working[key] ? '0' : '1',
+      'data-placeholder': 'Click to add payment instructions, firm tagline, or notes…',
+      title: 'Click to edit — ' + key,
+    }, working[key] || '');
+    span.addEventListener('paste', (e) => {
+      e.preventDefault();
+      const text = (e.clipboardData || window.clipboardData).getData('text');
+      document.execCommand('insertText', false, text);
+    });
+    span.addEventListener('input', () => {
+      span.setAttribute('data-empty', span.textContent.trim() ? '0' : '1');
+    });
+    return span;
+  };
+
   const readLabels = () => {
     const out = {};
     overlay.querySelectorAll('[data-label-key]').forEach(n => {
-      out[n.dataset.labelKey] = (n.textContent || '').replace(/\s+/g, ' ').trim();
+      out[n.dataset.labelKey] = n.dataset.multiline
+        ? (n.innerText || '').trim()
+        : (n.textContent || '').replace(/\s+/g, ' ').trim();
     });
     return out;
   };
@@ -8249,7 +8466,9 @@ function openInvoiceLayoutEditor(baseSettings) {
   const resetAll = () => {
     if (!confirm('Reset all labels back to defaults? Unsaved changes will be lost.')) return;
     overlay.querySelectorAll('[data-label-key]').forEach(n => {
-      n.textContent = DEFAULT_INVOICE_LABELS[n.dataset.labelKey] || '';
+      const def = DEFAULT_INVOICE_LABELS[n.dataset.labelKey] || '';
+      n.textContent = def;
+      if (n.dataset.multiline) n.setAttribute('data-empty', def ? '0' : '1');
     });
   };
 
@@ -8464,6 +8683,19 @@ function openInvoiceLayoutEditor(baseSettings) {
   const blockLayout = JSON.parse(JSON.stringify(baseSettings.blockLayout || {}));
   let designMode = false;
 
+  // Block visibility — which optional sections to hide in preview + PDF.
+  // Default: custom text block hidden; all others visible.
+  const hiddenBlocks = new Set(
+    Array.isArray(baseSettings.hiddenBlocks) ? baseSettings.hiddenBlocks : ['p1-custom-text']
+  );
+  const BLOCK_OPTIONS = [
+    { id: 'p2-services',   label: 'Professional Services detail (page 2)' },
+    { id: 'p2-timekeeper', label: 'Timekeeper summary (page 2)' },
+    { id: 'p3-costs',      label: 'Costs page (page 3)' },
+    { id: 'p4-wire',       label: 'Wire/ACH instructions (page 4)' },
+    { id: 'p1-custom-text',label: 'Custom text block (page 1)' },
+  ];
+
   const applyBlockLayout = () => {
     overlay.querySelectorAll('[data-block-id]').forEach(node => {
       const lay = blockLayout[node.dataset.blockId];
@@ -8546,6 +8778,16 @@ function openInvoiceLayoutEditor(baseSettings) {
     });
   };
 
+  const applyBlockVisibility = () => {
+    overlay.querySelectorAll('[data-vis-id]').forEach(node => {
+      node.classList.toggle('inv-block-hidden', hiddenBlocks.has(node.dataset.visId));
+    });
+    BLOCK_OPTIONS.forEach(opt => {
+      const cb = overlay.querySelector(`[data-vis-cb="${opt.id}"]`);
+      if (cb) cb.checked = !hiddenBlocks.has(opt.id);
+    });
+  };
+
   const save = async () => {
     try {
       const labels = readLabels();
@@ -8558,7 +8800,8 @@ function openInvoiceLayoutEditor(baseSettings) {
         invoiceTitleScale: currentTitleScale,
         labels,
         labelStyles,
-        blockLayout: collectBlockLayout() };
+        blockLayout: collectBlockLayout(),
+        hiddenBlocks: [...hiddenBlocks] };
       await api('/api/firm', { method: 'PUT', body: { settings: newSettings } });
       state.firm.settings = newSettings;
       if (logoPending && logoPending !== false) {
@@ -8661,11 +8904,14 @@ function openInvoiceLayoutEditor(baseSettings) {
         ]),
       ]),
     ]),
+    el('div', { class: 'inv-custom-text', 'data-vis-id': 'p1-custom-text', 'data-block-id': 'p1-custom-text' }, [
+      multiLbl('customTextBlock'),
+    ]),
     el('div', { class: 'inv-payment-note', 'data-block-id': 'p1-payment-note' }, [ lbl('paymentDetailsNote') ]),
   ]);
 
   // ── Page 2: Professional Services ───────────────────────────────────────
-  const page2 = el('div', { class: 'inv-page' }, [
+  const page2 = el('div', { class: 'inv-page', 'data-vis-id': 'p2-services' }, [
     shortHeader('p2-header'),
     el('div', { class: 'inv-section-title left', 'data-block-id': 'p2-services-title' }, [
       lbl('professionalServicesTitle'), ' — ',
@@ -8695,28 +8941,30 @@ function openInvoiceLayoutEditor(baseSettings) {
         el('td', { class: 'right inv-fake' }, fm(s.servicesTotal)),
       ])),
     ]),
-    el('div', { class: 'inv-section-title left', style: 'margin-top:20px', 'data-block-id': 'p2-timekeeper-title' }, [ lbl('summaryByTimekeeperTitle') ]),
-    el('table', { class: 'inv-table' }, [
-      el('thead', {}, el('tr', {}, [
-        el('th', {}, [ lbl('colTimekeeper') ]),
-        el('th', { class: 'right' }, [ lbl('colHours') ]),
-        el('th', { class: 'right' }, [ lbl('colAmount') ]),
-      ])),
-      el('tbody', {}, [ el('tr', {}, [
-        el('td', { class: 'inv-fake' }, 'Jane Doe'),
-        el('td', { class: 'right inv-fake' }, s.totalHours.toFixed(2)),
-        el('td', { class: 'right inv-fake' }, fm(s.servicesTotal)),
-      ]) ]),
-      el('tfoot', {}, el('tr', {}, [
-        el('td', { class: 'right' }, [ lbl('colTotal') ]),
-        el('td', { class: 'right inv-fake' }, s.totalHours.toFixed(2)),
-        el('td', { class: 'right inv-fake' }, fm(s.servicesTotal)),
-      ])),
+    el('div', { 'data-vis-id': 'p2-timekeeper' }, [
+      el('div', { class: 'inv-section-title left', style: 'margin-top:20px', 'data-block-id': 'p2-timekeeper-title' }, [ lbl('summaryByTimekeeperTitle') ]),
+      el('table', { class: 'inv-table' }, [
+        el('thead', {}, el('tr', {}, [
+          el('th', {}, [ lbl('colTimekeeper') ]),
+          el('th', { class: 'right' }, [ lbl('colHours') ]),
+          el('th', { class: 'right' }, [ lbl('colAmount') ]),
+        ])),
+        el('tbody', {}, [ el('tr', {}, [
+          el('td', { class: 'inv-fake' }, 'Jane Doe'),
+          el('td', { class: 'right inv-fake' }, s.totalHours.toFixed(2)),
+          el('td', { class: 'right inv-fake' }, fm(s.servicesTotal)),
+        ]) ]),
+        el('tfoot', {}, el('tr', {}, [
+          el('td', { class: 'right' }, [ lbl('colTotal') ]),
+          el('td', { class: 'right inv-fake' }, s.totalHours.toFixed(2)),
+          el('td', { class: 'right inv-fake' }, fm(s.servicesTotal)),
+        ])),
+      ]),
     ]),
   ]);
 
   // ── Page 3: Costs ───────────────────────────────────────────────────────
-  const page3 = el('div', { class: 'inv-page' }, [
+  const page3 = el('div', { class: 'inv-page', 'data-vis-id': 'p3-costs' }, [
     shortHeader('p3-header'),
     el('div', { class: 'inv-section-title left', 'data-block-id': 'p3-costs-title' }, [
       lbl('costsTitle'), ' — ',
@@ -8760,13 +9008,15 @@ function openInvoiceLayoutEditor(baseSettings) {
     ]),
     el('div', { class: 'inv-block-heading', 'data-block-id': 'p4-checks-heading' }, [ lbl('checksPayableLabel') ]),
     el('div', { class: 'inv-fake', style: 'padding-left:14px;white-space:pre-line', 'data-block-id': 'p4-checks-info' }, `${remitName}\n${remitAddr}`),
-    el('div', { class: 'inv-block-heading', 'data-block-id': 'p4-wire-heading' }, [ lbl('wireHeadingLabel') ]),
-    wireRow('wireBeneficiaryNameLabel',    wire.beneficiaryName),
-    wireRow('wireBeneficiaryAddressLabel', wire.beneficiaryAddress),
-    wireRow('wireAccountNumberLabel',      wire.accountNumber),
-    wireRow('wireRoutingNumberLabel',      wire.routingNumber),
-    wireRow('wireBankNameLabel',           wire.bankName),
-    wireRow('wireBankAddressLabel',        wire.bankAddress),
+    el('div', { 'data-vis-id': 'p4-wire' }, [
+      el('div', { class: 'inv-block-heading', 'data-block-id': 'p4-wire-heading' }, [ lbl('wireHeadingLabel') ]),
+      wireRow('wireBeneficiaryNameLabel',    wire.beneficiaryName),
+      wireRow('wireBeneficiaryAddressLabel', wire.beneficiaryAddress),
+      wireRow('wireAccountNumberLabel',      wire.accountNumber),
+      wireRow('wireRoutingNumberLabel',      wire.routingNumber),
+      wireRow('wireBankNameLabel',           wire.bankName),
+      wireRow('wireBankAddressLabel',        wire.bankAddress),
+    ]),
     el('div', { class: 'inv-block-heading', 'data-block-id': 'p4-notes-heading' }, [ lbl('notesHeadingLabel') ]),
     el('div', { class: 'inv-fake', style: 'padding-left:14px', 'data-block-id': 'p4-notes-info' }, 'Sample invoice for preview purposes only.'),
     el('div', { class: 'inv-footer', 'data-block-id': 'p4-footer' }, footerText),
@@ -9015,6 +9265,29 @@ function openInvoiceLayoutEditor(baseSettings) {
     fontPanelHideTimer = setTimeout(() => { fontPanel.dataset.open = '0'; }, 180);
   };
 
+  const blocksPanel = el('div', { class: 'inv-blocks-panel', 'data-open': '0' }, [
+    el('div', { class: 'hdr' }, [
+      el('div', { class: 'ttl' }, 'Show / hide sections'),
+      el('button', { type: 'button', class: 'close', title: 'Close', onclick: () => { blocksPanel.dataset.open = '0'; } }, '×'),
+    ]),
+    ...BLOCK_OPTIONS.map(opt => {
+      const cb = el('input', { type: 'checkbox', 'data-vis-cb': opt.id,
+        ...(hiddenBlocks.has(opt.id) ? {} : { checked: 'checked' }) });
+      cb.addEventListener('change', () => {
+        if (cb.checked) hiddenBlocks.delete(opt.id);
+        else hiddenBlocks.add(opt.id);
+        applyBlockVisibility();
+      });
+      return el('label', { class: 'block-row' }, [cb, el('span', { class: 'lbl' }, opt.label)]);
+    }),
+    el('div', { class: 'hint' }, 'Hidden sections are omitted from both the preview and the generated PDF. Sections with no data (no expenses, no time entries) are always omitted regardless.'),
+  ]);
+  const toggleBlocksPanel = () => {
+    const open = blocksPanel.dataset.open === '1';
+    blocksPanel.dataset.open = open ? '0' : '1';
+    if (!open) hideFontPanel(true);
+  };
+
   const colorGroup = el('div', { class: 'inv-color-group', title: 'Accent color' }, [
     el('span', { class: 'lab' }, 'Color'),
     ...presets.map(p => el('button', {
@@ -9044,6 +9317,7 @@ function openInvoiceLayoutEditor(baseSettings) {
         logoGroup,
         titleGroup,
         colorGroup,
+        el('button', { type: 'button', class: 'btn btn-ghost btn-sm', onclick: toggleBlocksPanel }, 'Blocks'),
         el('button', {
           id: 'inv-design-toggle', type: 'button',
           class: 'btn btn-ghost btn-sm',
@@ -9061,6 +9335,7 @@ function openInvoiceLayoutEditor(baseSettings) {
       page1, page2, page3, page4,
     ]),
     fontPanel,
+    blocksPanel,
   ]);
 
   // Show the panel when a label gains focus; hide shortly after it blurs,
@@ -9069,6 +9344,7 @@ function openInvoiceLayoutEditor(baseSettings) {
     const tgt = e.target;
     if (tgt && tgt.classList && tgt.classList.contains('inv-lbl')) {
       showFontPanel(tgt);
+      blocksPanel.dataset.open = '0';
     } else if (fontPanel.contains(tgt)) {
       clearTimeout(fontPanelHideTimer);
     }
@@ -9089,6 +9365,7 @@ function openInvoiceLayoutEditor(baseSettings) {
   applyTitleScale(currentTitleScale);
   applyAllLabelStyles();
   applyBlockLayout();
+  applyBlockVisibility();
   renderLabelColorSwatches();
   refreshLabelPanel(null);
   renderLogos();
