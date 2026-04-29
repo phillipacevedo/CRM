@@ -149,5 +149,6 @@ April 2026       Phase 1 ✅ complete
 April–May 2026   Phase 2.1–2.3, 2.5, 3.2 ✅ complete (invoice shortcut, form cleanup, dirty guard, filter persistence, matter billing dashboard)
 June 2026        Phase 2.4 (trust payment completion — deferred until payments go live)
 May 2026         Phase 3.1, 3.3–3.5 ✅ complete (bank reconciliation, custom expense categories, contact dedup, origination report)
-Q4 2026+         Phase 4 as needed
+April–May 2026   Phase 4.1 ✅ complete (DealTracker matter sync with per-user subscription gate)
+Q4 2026+         Phase 4.2–4.4 as needed (invoice layout blocks, bulk import, email logging)
 ```
