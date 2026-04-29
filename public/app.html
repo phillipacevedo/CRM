@@ -41,6 +41,9 @@ a:hover{text-decoration:underline}
 }
 .nav-item:hover{background:rgba(255,255,255,.08);color:#fff}
 .nav-item.active{background:rgba(201,162,39,.22);color:var(--gold);font-weight:600}
+.nav-item.nav-locked{opacity:.45;cursor:default}
+.nav-item.nav-locked:hover{background:none;color:rgba(255,255,255,.78)}
+.nav-lock{font-size:10px;margin-left:auto;opacity:.7}
 .nav-item .icon{width:18px;height:18px;flex-shrink:0;opacity:.9}
 .sidebar-footer{padding:12px 8px;border-top:1px solid rgba(255,255,255,.1);display:flex;flex-direction:column;gap:2px}
 .sidebar-footer .user-name{padding:8px 12px;font-size:12px;color:rgba(255,255,255,.55)}
@@ -191,6 +194,19 @@ table.data .num{text-align:right;font-variant-numeric:tabular-nums}
   display:inline-block;padding:2px 8px;background:var(--gray-bg);color:var(--text-muted);
   border-radius:3px;font-size:11px;font-weight:500;margin-right:4px;
 }
+
+/* Collapsible form sections (contact form) */
+details.form-section{border-top:1px solid var(--border);margin-top:12px}
+details.form-section > summary{
+  display:flex;align-items:center;cursor:pointer;
+  padding:10px 0 8px;list-style:none;user-select:none;
+  font-size:11.5px;font-weight:700;color:var(--text-muted);
+  text-transform:uppercase;letter-spacing:.5px;
+}
+details.form-section > summary::-webkit-details-marker{display:none}
+details.form-section > summary::after{content:'▸';margin-left:auto;font-size:10px;opacity:.6;transition:transform .15s}
+details.form-section[open] > summary::after{transform:rotate(90deg)}
+details.form-section .section-body{padding-top:4px}
 
 /* Forms */
 .form-row{display:flex;gap:12px;margin-bottom:12px}
@@ -988,6 +1004,7 @@ function _flushToast() {
 const FOCUSABLE_SELECTOR = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 let _modalPreviousFocus = null;
 let _modalKeyHandler = null;
+let _modalDirty = false;
 
 // Most callers build a modal footer as `el('div', {}, [...buttons])`. Nesting
 // that wrapper inside `.modal-footer` would break its flex layout — buttons
@@ -1000,6 +1017,7 @@ function unwrapFooter(footerEl) {
 }
 
 function openModal(title, bodyEl, footerEl, wide=false) {
+  _modalDirty = false;
   const overlay = $('#modal-overlay');
   overlay.innerHTML = '';
   const modal = el('div', { class: 'modal' + (wide ? ' wide' : '') }, [
@@ -1012,7 +1030,13 @@ function openModal(title, bodyEl, footerEl, wide=false) {
   ]);
   overlay.appendChild(modal);
   overlay.classList.add('open');
-  overlay.onclick = (e) => { if (e.target === overlay) closeModal(); };
+  modal.addEventListener('input',  () => { _modalDirty = true; });
+  modal.addEventListener('change', () => { _modalDirty = true; });
+  overlay.onclick = (e) => {
+    if (e.target !== overlay) return;
+    if (_modalDirty && !confirm('Discard unsaved changes?')) return;
+    closeModal();
+  };
 
   // Focus management: remember what had focus, trap Tab inside the modal,
   // close on Escape. Focus the first interactive element so keyboard users
@@ -1022,7 +1046,12 @@ function openModal(title, bodyEl, footerEl, wide=false) {
   const first = focusables()[0];
   if (first) setTimeout(() => first.focus(), 0);
   _modalKeyHandler = (e) => {
-    if (e.key === 'Escape') { e.preventDefault(); closeModal(); return; }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      if (_modalDirty && !confirm('Discard unsaved changes?')) return;
+      closeModal();
+      return;
+    }
     if (e.key !== 'Tab') return;
     const items = focusables();
     if (items.length === 0) { e.preventDefault(); return; }
@@ -1033,6 +1062,7 @@ function openModal(title, bodyEl, footerEl, wide=false) {
   document.addEventListener('keydown', _modalKeyHandler);
 }
 function closeModal() {
+  _modalDirty = false;
   $('#modal-overlay').classList.remove('open');
   $('#modal-overlay').innerHTML = '';
   if (_modalKeyHandler) { document.removeEventListener('keydown', _modalKeyHandler); _modalKeyHandler = null; }
@@ -1091,17 +1121,22 @@ const ICONS = {
 function renderNav() {
   const nav = $('#sidebar-nav');
   nav.innerHTML = '';
-  NAV_ITEMS.filter(it => !it.cap || can(it.cap)).forEach(it => {
+  NAV_ITEMS.forEach(it => {
+    const locked = it.cap && !can(it.cap);
     const b = el('button', {
-      class: 'nav-item' + (state.currentView === it.id ? ' active' : ''),
-      onclick: () => navigate(it.id),
-      html: `${ICONS[it.icon]}<span>${it.label}</span>`
+      class: 'nav-item' + (state.currentView === it.id ? ' active' : '') + (locked ? ' nav-locked' : ''),
+      onclick: locked ? null : () => navigate(it.id),
+      title: locked ? 'Requires ' + it.cap + ' access' : '',
+      html: `${ICONS[it.icon]}<span>${it.label}</span>${locked ? '<span class="nav-lock">🔒</span>' : ''}`,
     });
     nav.appendChild(b);
   });
 }
 
 async function navigate(view, opts={}) {
+  if ($('#modal-overlay').classList.contains('open') && _modalDirty) {
+    if (!confirm('Discard unsaved changes?')) return;
+  }
   runViewCleanups();
   const v = ++state._renderVersion;
   // Push to history on a distinct view change so browser back/forward works
@@ -1532,7 +1567,7 @@ async function renderContacts(mount, v) {
     actions.appendChild(el('button', { class: 'btn btn-primary btn-sm', onclick: () => openContactForm() }, '+ New contact'));
   }
 
-  state.viewState.contacts ||= { search: '', type: '' };
+  state.viewState.contacts ||= { search: '', type: '', sort: 'name', dir: 'asc' };
   const cv = state.viewState.contacts;
   if (q) cv.search = q;
 
@@ -1549,6 +1584,7 @@ async function renderContacts(mount, v) {
       onchange: () => { cv.type = $('#f-type').value; applyContactFilters(); } },
       [ el('option', { value: '' }, 'All types'),
         ...CONTACT_TYPES.map(t => el('option', { value: t.id, ...(cv.type === t.id ? { selected: 'selected' } : {}) }, t.label)) ]),
+    el('div', { id: 'contacts-clear' }),
     el('div', { class: 'spacer' }),
     el('div', { id: 'contacts-count', style: 'color:var(--text-muted);font-size:12px' }, `${state.contacts.length} contacts`),
   ]);
@@ -1573,7 +1609,7 @@ async function renderClients(mount, v) {
     actions.appendChild(el('button', { class: 'btn btn-primary btn-sm', onclick: () => startClientIntake() }, '+ New client'));
   }
 
-  state.viewState.clients ||= { search: '' };
+  state.viewState.clients ||= { search: '', sort: 'name', dir: 'asc' };
   const cv = state.viewState.clients;
   // Selection lives on viewState so it survives re-renders (sort, search).
   cv.selection ||= new Set();
@@ -1588,6 +1624,7 @@ async function renderClients(mount, v) {
   mount.innerHTML = '';
   mount.appendChild(el('div', { class: 'row mb-16', style: 'gap:8px;flex-wrap:wrap;align-items:center' }, [
     searchBox,
+    el('div', { id: 'clients-clear' }),
     el('div', { class: 'spacer' }),
     el('div', { id: 'clients-count', style: 'color:var(--text-muted);font-size:12px' }, `${state.contacts.length} clients`),
   ]));
@@ -1640,6 +1677,15 @@ function applyContactFilters() {
   }));
   const count = $('#contacts-count');
   if (count) count.textContent = `${rows.length} contact${rows.length === 1 ? '' : 's'}`;
+  const clearSlot = $('#contacts-clear');
+  if (clearSlot) {
+    clearSlot.innerHTML = '';
+    if (cv.search || cv.type) {
+      clearSlot.appendChild(el('button', { class: 'btn btn-ghost btn-sm', style: 'color:var(--red)', onclick: () => {
+        cv.search = ''; cv.type = ''; navigate('contacts');
+      }}, '× Clear filters'));
+    }
+  }
 }
 
 function applyClientFilters() {
@@ -1652,6 +1698,15 @@ function applyClientFilters() {
   const qq = (cv.search || '').trim().toLowerCase();
   let rows = state.contacts.filter(c => contactMatchesQuery(c, qq));
   rows = sortContactRows(rows, cv.sort, cv.dir);
+  const clearSlot = $('#clients-clear');
+  if (clearSlot) {
+    clearSlot.innerHTML = '';
+    if (cv.search) {
+      clearSlot.appendChild(el('button', { class: 'btn btn-ghost btn-sm', style: 'color:var(--red)', onclick: () => {
+        cv.search = ''; navigate('clients');
+      }}, '× Clear'));
+    }
+  }
 
   // Drop selections for rows no longer visible after filtering — avoids
   // ghost-deleting a row the user can't see and forgot was selected.
@@ -1857,8 +1912,13 @@ async function openContactForm(existing) {
   const users = (state._users ||= (await api('/api/seats')).users);
   const isNew = !existing?.id;
   const c = existing || {};
+  const hasMoreDetails = !isNew && (c.secondary_email || c.secondary_phone || c.industry ||
+    c.preferred_contact || c.address || c.mailing_address || c.linkedin || c.notes || c.privilege);
+
   const body = el('div', {}, [
     c.privilege ? el('div', { class: 'privilege-banner' }, '🔒 PRIVILEGED / CONFIDENTIAL') : null,
+
+    // ── Always-visible core fields ─────────────────────────────────────
     el('div', { class: 'form-row' }, [
       el('div', { class: 'field' }, [ el('label', {}, 'Type'), contactTypeSelect(c.type) ]),
       el('div', { class: 'field' }, [ el('label', {}, 'Owner'),
@@ -1874,26 +1934,13 @@ async function openContactForm(existing) {
       el('div', { class: 'field' }, [ el('label', {}, 'Phone'), el('input', { name: 'phone', value: c.phone || '' }) ]),
     ]),
     el('div', { class: 'form-row' }, [
-      el('div', { class: 'field' }, [ el('label', {}, 'Secondary email'), el('input', { name: 'secondaryEmail', type: 'email', value: c.secondary_email || '' }) ]),
-      el('div', { class: 'field' }, [ el('label', {}, 'Secondary phone'), el('input', { name: 'secondaryPhone', value: c.secondary_phone || '' }) ]),
-    ]),
-    el('div', { class: 'form-row' }, [
       el('div', { class: 'field' }, [ el('label', {}, 'Title'), el('input', { name: 'title', value: c.title || '' }) ]),
       el('div', { class: 'field' }, [ el('label', {}, 'Company'), el('input', { name: 'companyName', value: c.company_name || '' }) ]),
     ]),
     el('div', { class: 'form-row' }, [
-      el('div', { class: 'field' }, [ el('label', {}, 'Industry'), el('input', { name: 'industry', value: c.industry || '', placeholder: 'e.g. real estate, tech, manufacturing' }) ]),
-      el('div', { class: 'field' }, [ el('label', {}, 'Preferred contact method'),
-        el('select', { name: 'preferredContact' }, [
-          el('option', { value: '',     ...(!c.preferred_contact ? { selected: 'selected' } : {}) }, '—'),
-          el('option', { value: 'email', ...(c.preferred_contact === 'email' ? { selected: 'selected' } : {}) }, 'Email'),
-          el('option', { value: 'phone', ...(c.preferred_contact === 'phone' ? { selected: 'selected' } : {}) }, 'Phone'),
-          el('option', { value: 'text',  ...(c.preferred_contact === 'text'  ? { selected: 'selected' } : {}) }, 'Text'),
-          el('option', { value: 'mail',  ...(c.preferred_contact === 'mail'  ? { selected: 'selected' } : {}) }, 'Mail'),
-        ]) ]),
+      el('div', { class: 'field' }, [ el('label', {}, 'Next action'), el('input', { name: 'nextAction', value: c.next_action || '' }) ]),
+      el('div', { class: 'field' }, [ el('label', {}, 'Next action date'), el('input', { name: 'nextActionAt', type: 'date', value: toDateInput(c.next_action_at) }) ]),
     ]),
-    el('div', { class: 'field' }, [ el('label', {}, 'Street address'), el('input', { name: 'address', value: c.address || '' }) ]),
-    el('div', { class: 'field' }, [ el('label', {}, 'Mailing address (if different)'), el('input', { name: 'mailingAddress', value: c.mailing_address || '' }) ]),
     el('div', { class: 'form-row' }, [
       el('div', { class: 'field' }, [ el('label', {}, 'Pipeline stage (prospects)'),
         el('select', { name: 'pipelineStage' }, [ el('option', { value: '' }, '—'),
@@ -1902,61 +1949,87 @@ async function openContactForm(existing) {
       el('div', { class: 'field' }, [ el('label', {}, 'Tags (comma separated)'),
         el('input', { name: 'tags', value: (c.tags || []).join(', ') }) ]),
     ]),
-    el('div', { class: 'form-row' }, [
-      el('div', { class: 'field' }, [ el('label', {}, 'Next action'), el('input', { name: 'nextAction', value: c.next_action || '' }) ]),
-      el('div', { class: 'field' }, [ el('label', {}, 'Next action date'), el('input', { name: 'nextActionAt', type: 'date', value: toDateInput(c.next_action_at) }) ]),
-    ]),
+
+    // ── Client details (collapsible, shown only when type = client) ────
     el('div', { id: 'client-only-wrap', style: (c.type === 'client' ? '' : 'display:none') }, [
-      el('div', { style: 'border-top:1px solid var(--border);margin:16px 0 12px;padding-top:12px;font-weight:600;color:var(--text-muted);font-size:12px;text-transform:uppercase;letter-spacing:0.5px' }, 'Client details'),
-      el('div', { class: 'form-row' }, [
-        el('div', { class: 'field' }, [ el('label', {}, 'Client since'), el('input', { name: 'clientSince', type: 'date', value: toDateInput(c.client_since) }) ]),
-        el('div', { class: 'field' }, [ el('label', {}, 'Date of birth'), el('input', { name: 'dateOfBirth', type: 'date', value: toDateInput(c.date_of_birth) }) ]),
-      ]),
-      el('div', { class: 'form-row' }, [
-        el('div', { class: 'field' }, [ el('label', {}, 'Tax ID — last 4 digits only'),
-          el('input', { name: 'taxIdLast4', maxlength: '4', pattern: '\\d{0,4}', value: c.tax_id_last4 || '', placeholder: 'e.g. 1234' }) ]),
-        el('div', { class: 'field' }, [ el('label', {}, 'Default billing increment'),
-          el('select', { name: 'billingIncrementMinutes' }, [
-            el('option', { value: '',  ...(!c.billing_increment_minutes ? { selected: 'selected' } : {}) }, 'Firm default (' + firmDefaultIncLabel() + ')'),
-            el('option', { value: '6',  ...(c.billing_increment_minutes === 6  ? { selected: 'selected' } : {}) }, '0.1 hr (6 min)'),
-            el('option', { value: '15', ...(c.billing_increment_minutes === 15 ? { selected: 'selected' } : {}) }, '0.25 hr (15 min)'),
-          ]) ]),
-      ]),
-      el('div', { class: 'form-row' }, [
-        el('div', { class: 'field' }, [ el('label', {}, 'Originating attorney'),
-          el('select', { name: 'originatingAttorneyEmail' }, [
-            el('option', { value: '', ...(!c.originating_attorney_email ? { selected: 'selected' } : {}) }, '—'),
-            ...users.filter(u => u.active).map(u =>
-              el('option', { value: u.email, ...(c.originating_attorney_email === u.email ? { selected: 'selected' } : {}) }, u.name + ' (' + u.email + ')')),
-          ]) ]),
-        el('div', { class: 'field' }, [ el('label', {}, 'Origination split %'),
-          el('input', { name: 'originationSplitPct', type: 'number', min: '0', max: '100', step: '0.01',
-            value: (c.origination_split_pct != null ? c.origination_split_pct : ''), placeholder: 'e.g. 25' }) ]),
-      ]),
-      el('div', { class: 'form-row' }, [
-        el('div', { class: 'field' }, [ el('label', {}, 'Billing attorney (reviews bills)'),
-          el('select', { name: 'billingAttorneyEmail' }, [
-            el('option', { value: '', ...(!c.billing_attorney_email ? { selected: 'selected' } : {}) }, '—'),
-            ...users.filter(u => u.active).map(u =>
-              el('option', { value: u.email, ...(c.billing_attorney_email === u.email ? { selected: 'selected' } : {}) }, u.name + ' (' + u.email + ')')),
-          ]) ]),
-        el('div', { class: 'field' }, []),
-      ]),
-      el('div', { style: 'border-top:1px dashed var(--border);margin:14px 0 10px;padding-top:10px;font-weight:600;color:var(--text-muted);font-size:11.5px;text-transform:uppercase;letter-spacing:0.5px' }, 'Main contact (entity clients)'),
-      el('div', { class: 'form-row' }, [
-        el('div', { class: 'field' }, [ el('label', {}, 'Name'), el('input', { name: 'primaryContactName', value: c.primary_contact_name || '' }) ]),
-        el('div', { class: 'field' }, [ el('label', {}, 'Title'), el('input', { name: 'primaryContactTitle', value: c.primary_contact_title || '' }) ]),
-      ]),
-      el('div', { class: 'form-row' }, [
-        el('div', { class: 'field' }, [ el('label', {}, 'Email'), el('input', { name: 'primaryContactEmail', type: 'email', value: c.primary_contact_email || '' }) ]),
-        el('div', { class: 'field' }, [ el('label', {}, 'Phone'), el('input', { name: 'primaryContactPhone', value: c.primary_contact_phone || '' }) ]),
+      el('details', { class: 'form-section', ...(c.type === 'client' ? { open: '' } : {}) }, [
+        el('summary', {}, 'Client details'),
+        el('div', { class: 'section-body' }, [
+          el('div', { class: 'form-row' }, [
+            el('div', { class: 'field' }, [ el('label', {}, 'Client since'), el('input', { name: 'clientSince', type: 'date', value: toDateInput(c.client_since) }) ]),
+            el('div', { class: 'field' }, [ el('label', {}, 'Date of birth'), el('input', { name: 'dateOfBirth', type: 'date', value: toDateInput(c.date_of_birth) }) ]),
+          ]),
+          el('div', { class: 'form-row' }, [
+            el('div', { class: 'field' }, [ el('label', {}, 'Tax ID — last 4 digits only'),
+              el('input', { name: 'taxIdLast4', maxlength: '4', pattern: '\\d{0,4}', value: c.tax_id_last4 || '', placeholder: 'e.g. 1234' }) ]),
+            el('div', { class: 'field' }, [ el('label', {}, 'Default billing increment'),
+              el('select', { name: 'billingIncrementMinutes' }, [
+                el('option', { value: '',  ...(!c.billing_increment_minutes ? { selected: 'selected' } : {}) }, 'Firm default (' + firmDefaultIncLabel() + ')'),
+                el('option', { value: '6',  ...(c.billing_increment_minutes === 6  ? { selected: 'selected' } : {}) }, '0.1 hr (6 min)'),
+                el('option', { value: '15', ...(c.billing_increment_minutes === 15 ? { selected: 'selected' } : {}) }, '0.25 hr (15 min)'),
+              ]) ]),
+          ]),
+          el('div', { class: 'form-row' }, [
+            el('div', { class: 'field' }, [ el('label', {}, 'Originating attorney'),
+              el('select', { name: 'originatingAttorneyEmail' }, [
+                el('option', { value: '', ...(!c.originating_attorney_email ? { selected: 'selected' } : {}) }, '—'),
+                ...users.filter(u => u.active).map(u =>
+                  el('option', { value: u.email, ...(c.originating_attorney_email === u.email ? { selected: 'selected' } : {}) }, u.name + ' (' + u.email + ')')),
+              ]) ]),
+            el('div', { class: 'field' }, [ el('label', {}, 'Origination split %'),
+              el('input', { name: 'originationSplitPct', type: 'number', min: '0', max: '100', step: '0.01',
+                value: (c.origination_split_pct != null ? c.origination_split_pct : ''), placeholder: 'e.g. 25' }) ]),
+          ]),
+          el('div', { class: 'form-row' }, [
+            el('div', { class: 'field' }, [ el('label', {}, 'Billing attorney (reviews bills)'),
+              el('select', { name: 'billingAttorneyEmail' }, [
+                el('option', { value: '', ...(!c.billing_attorney_email ? { selected: 'selected' } : {}) }, '—'),
+                ...users.filter(u => u.active).map(u =>
+                  el('option', { value: u.email, ...(c.billing_attorney_email === u.email ? { selected: 'selected' } : {}) }, u.name + ' (' + u.email + ')')),
+              ]) ]),
+            el('div', { class: 'field' }, []),
+          ]),
+          el('div', { style: 'border-top:1px dashed var(--border);margin:14px 0 10px;padding-top:10px;font-weight:600;color:var(--text-muted);font-size:11.5px;text-transform:uppercase;letter-spacing:0.5px' }, 'Main contact (entity clients)'),
+          el('div', { class: 'form-row' }, [
+            el('div', { class: 'field' }, [ el('label', {}, 'Name'), el('input', { name: 'primaryContactName', value: c.primary_contact_name || '' }) ]),
+            el('div', { class: 'field' }, [ el('label', {}, 'Title'), el('input', { name: 'primaryContactTitle', value: c.primary_contact_title || '' }) ]),
+          ]),
+          el('div', { class: 'form-row' }, [
+            el('div', { class: 'field' }, [ el('label', {}, 'Email'), el('input', { name: 'primaryContactEmail', type: 'email', value: c.primary_contact_email || '' }) ]),
+            el('div', { class: 'field' }, [ el('label', {}, 'Phone'), el('input', { name: 'primaryContactPhone', value: c.primary_contact_phone || '' }) ]),
+          ]),
+        ]),
       ]),
     ]),
-    el('div', { class: 'field' }, [ el('label', {}, 'LinkedIn URL'), el('input', { name: 'linkedin', value: c.linkedin || '' }) ]),
-    el('div', { class: 'field' }, [ el('label', {}, 'Notes'), el('textarea', { name: 'notes' }, c.notes || '') ]),
-    el('div', { class: 'checkbox-row' }, [
-      el('input', { type: 'checkbox', name: 'privilege', id: 'priv-cb', ...(c.privilege ? { checked: 'checked' } : {}) }),
-      el('label', { for: 'priv-cb' }, 'Mark privileged / confidential'),
+
+    // ── More details (collapsible) ─────────────────────────────────────
+    el('details', { class: 'form-section', ...(hasMoreDetails ? { open: '' } : {}) }, [
+      el('summary', {}, 'More details'),
+      el('div', { class: 'section-body' }, [
+        el('div', { class: 'form-row' }, [
+          el('div', { class: 'field' }, [ el('label', {}, 'Secondary email'), el('input', { name: 'secondaryEmail', type: 'email', value: c.secondary_email || '' }) ]),
+          el('div', { class: 'field' }, [ el('label', {}, 'Secondary phone'), el('input', { name: 'secondaryPhone', value: c.secondary_phone || '' }) ]),
+        ]),
+        el('div', { class: 'form-row' }, [
+          el('div', { class: 'field' }, [ el('label', {}, 'Industry'), el('input', { name: 'industry', value: c.industry || '', placeholder: 'e.g. real estate, tech, manufacturing' }) ]),
+          el('div', { class: 'field' }, [ el('label', {}, 'Preferred contact method'),
+            el('select', { name: 'preferredContact' }, [
+              el('option', { value: '',     ...(!c.preferred_contact ? { selected: 'selected' } : {}) }, '—'),
+              el('option', { value: 'email', ...(c.preferred_contact === 'email' ? { selected: 'selected' } : {}) }, 'Email'),
+              el('option', { value: 'phone', ...(c.preferred_contact === 'phone' ? { selected: 'selected' } : {}) }, 'Phone'),
+              el('option', { value: 'text',  ...(c.preferred_contact === 'text'  ? { selected: 'selected' } : {}) }, 'Text'),
+              el('option', { value: 'mail',  ...(c.preferred_contact === 'mail'  ? { selected: 'selected' } : {}) }, 'Mail'),
+            ]) ]),
+        ]),
+        el('div', { class: 'field' }, [ el('label', {}, 'Street address'), el('input', { name: 'address', value: c.address || '' }) ]),
+        el('div', { class: 'field' }, [ el('label', {}, 'Mailing address (if different)'), el('input', { name: 'mailingAddress', value: c.mailing_address || '' }) ]),
+        el('div', { class: 'field' }, [ el('label', {}, 'LinkedIn URL'), el('input', { name: 'linkedin', value: c.linkedin || '' }) ]),
+        el('div', { class: 'field' }, [ el('label', {}, 'Notes'), el('textarea', { name: 'notes' }, c.notes || '') ]),
+        el('div', { class: 'checkbox-row', style: 'margin-top:8px' }, [
+          el('input', { type: 'checkbox', name: 'privilege', id: 'priv-cb', ...(c.privilege ? { checked: 'checked' } : {}) }),
+          el('label', { for: 'priv-cb' }, 'Mark privileged / confidential'),
+        ]),
+      ]),
     ]),
   ]);
 
@@ -1977,6 +2050,14 @@ async function openContactForm(existing) {
     });
     data.tags = data.tags ? data.tags.split(',').map(s => s.trim()).filter(Boolean) : [];
     data.billingIncrementMinutes = data.billingIncrementMinutes ? parseInt(data.billingIncrementMinutes, 10) : null;
+    if (data.email) {
+      const qs = '?email=' + encodeURIComponent(data.email) + (isNew ? '' : '&excludeId=' + c.id);
+      const dups = await api('/api/contacts/dedup-check' + qs).catch(() => []);
+      if (dups.length > 0) {
+        const names = dups.map(x => x.full_name).join(', ');
+        if (!confirm('A contact with this email already exists: ' + names + '.\n\nSave anyway?')) return;
+      }
+    }
     try {
       if (isNew) await api('/api/contacts', { method: 'POST', body: data });
       else       await api('/api/contacts/' + c.id, { method: 'PUT', body: data });
@@ -2072,10 +2153,13 @@ async function openContact(id) {
     el('button', { class: 'btn btn-ghost btn-sm mb-16', onclick: () => openInteractionForm(contact.id) }, '+ Log interaction'),
     (interactions.length === 0) ? el('div', { class: 'empty' }, 'No interactions logged yet.') :
       el('div', { class: 'timeline' }, interactions.map(i => el('div', { class: 'timeline-item' }, [
-        el('div', { class: 'ti-head' }, [
-          el('strong', {}, i.kind.toUpperCase()),
-          document.createTextNode(' · ' + fmt.datetime(i.occurred_at) + ' · ' + (i.created_by || '')),
-          i.subject ? el('div', { style: 'font-weight:600;margin-top:2px' }, i.subject) : null,
+        el('div', { class: 'ti-head', style: 'display:flex;align-items:flex-start;gap:6px' }, [
+          el('div', { style: 'flex:1' }, [
+            el('strong', {}, i.kind.toUpperCase()),
+            document.createTextNode(' · ' + fmt.datetime(i.occurred_at) + ' · ' + (i.created_by || '')),
+            i.subject ? el('div', { style: 'font-weight:600;margin-top:2px' }, i.subject) : null,
+          ]),
+          el('button', { title: 'Edit', style: 'flex-shrink:0;color:var(--text-muted);background:none;border:none;cursor:pointer;font-size:13px;padding:0 2px;line-height:1', onclick: () => openInteractionForm(contact.id, i) }, '✎'),
         ]),
         i.body ? el('div', { class: 'ti-body' }, i.body) : null,
       ]))),
@@ -2088,6 +2172,9 @@ async function openContact(id) {
   const footer = el('div', {}, [
     can('editContacts') ? el('button', { class: 'btn btn-ghost btn-sm', onclick: () => { closeModal(); openContactForm(contact); } }, 'Edit') : null,
     el('div', { class: 'spacer' }),
+    (contact.type === 'client' && can('manageBilling'))
+      ? el('button', { class: 'btn btn-ghost btn-sm', onclick: () => { closeModal(); state.viewState.trust = { ...(state.viewState.trust || {}), search: contact.full_name || '' }; navigate('trust'); } }, 'Trust ledger')
+      : null,
     el('button', { class: 'btn btn-primary btn-sm', onclick: closeModal }, 'Close'),
   ]);
   openModal(contact.full_name || 'Contact', body, footer, true);
@@ -2231,31 +2318,46 @@ async function buildClientFinancialSummary(clientId) {
   ]);
 }
 
-async function openInteractionForm(contactId) {
+async function openInteractionForm(contactId, existing) {
+  const isNew = !existing?.id;
+  const occurredDefault = existing?.occurred_at
+    ? new Date(existing.occurred_at).toISOString().slice(0, 16)
+    : new Date().toISOString().slice(0, 16);
   const body = el('div', {}, [
     el('div', { class: 'form-row' }, [
       el('div', { class: 'field' }, [ el('label', {}, 'Type'),
-        el('select', { name: 'kind' }, ['call','email','meeting','note','task'].map(k => el('option', { value: k }, k))) ]),
-      el('div', { class: 'field' }, [ el('label', {}, 'Occurred at'), el('input', { name: 'occurredAt', type: 'datetime-local', value: new Date().toISOString().slice(0,16) }) ]),
+        el('select', { name: 'kind' }, ['call','email','meeting','note','task'].map(k =>
+          el('option', { value: k, ...((existing?.kind || 'call') === k ? { selected: 'selected' } : {}) }, k))) ]),
+      el('div', { class: 'field' }, [ el('label', {}, 'Occurred at'), el('input', { name: 'occurredAt', type: 'datetime-local', value: occurredDefault }) ]),
     ]),
-    el('div', { class: 'field' }, [ el('label', {}, 'Subject'), el('input', { name: 'subject' }) ]),
-    el('div', { class: 'field' }, [ el('label', {}, 'Notes'), el('textarea', { name: 'body', style: 'min-height:140px' }) ]),
+    el('div', { class: 'field' }, [ el('label', {}, 'Subject'), el('input', { name: 'subject', value: existing?.subject || '' }) ]),
+    el('div', { class: 'field' }, [ el('label', {}, 'Notes'), el('textarea', { name: 'body', style: 'min-height:140px' }, existing?.body || '') ]),
   ]);
   const save = async () => {
     const data = { contactId };
     $$('input, select, textarea', body).forEach(i => data[i.name] = i.value);
     if (data.occurredAt) data.occurredAt = new Date(data.occurredAt).toISOString();
-    await api('/api/interactions', { method: 'POST', body: data });
-    toast('Interaction logged');
+    if (isNew) {
+      await api('/api/interactions', { method: 'POST', body: data });
+      toast('Interaction logged');
+    } else {
+      await api('/api/interactions/' + existing.id, { method: 'PUT', body: data });
+      toast('Interaction updated');
+    }
     closeModal();
     openContact(contactId);
   };
   const footer = el('div', {}, [
+    !isNew ? el('button', { class: 'btn btn-danger btn-sm', onclick: async () => {
+      if (!confirm('Delete this interaction?')) return;
+      await api('/api/interactions/' + existing.id, { method: 'DELETE' });
+      toast('Deleted'); closeModal(); openContact(contactId);
+    } }, 'Delete') : null,
     el('div', { class: 'spacer' }),
     el('button', { class: 'btn btn-ghost btn-sm', onclick: closeModal }, 'Cancel'),
-    el('button', { class: 'btn btn-primary btn-sm', onclick: save }, 'Log'),
+    el('button', { class: 'btn btn-primary btn-sm', onclick: save }, isNew ? 'Log' : 'Save'),
   ]);
-  openModal('Log interaction', body, footer);
+  openModal(isNew ? 'Log interaction' : 'Edit interaction', body, footer);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2950,7 +3052,13 @@ async function renderMatters(mount, v) {
   if (can('editContacts')) {
     actions.appendChild(el('button', { class: 'btn btn-primary btn-sm', onclick: () => openMatterForm() }, '+ New matter'));
   }
-  if (state.matters.length === 0) { mount.innerHTML = '<div class="card empty">No matters yet.</div>'; return; }
+  if (state.matters.length === 0) {
+    mount.appendChild(el('div', { class: 'card', style: 'padding:32px;text-align:center' }, [
+      el('div', { style: 'color:var(--text-light);margin-bottom:12px' }, 'No matters yet.'),
+      can('editContacts') ? el('button', { class: 'btn btn-primary btn-sm', onclick: () => openMatterForm() }, '+ New matter') : null,
+    ]));
+    return;
+  }
 
   state.viewState.matters ||= {};
   const mv = state.viewState.matters;
@@ -3079,10 +3187,14 @@ async function openMatterForm(existing) {
       ]),
     ]),
     el('div', { class: 'field' }, [ el('label', {}, 'Description'), el('textarea', { name: 'description' }, m.description || '') ]),
+    !isNew && can('manageBilling') ? el('div', { id: 'matter-billing-wrap' }) : null,
     !isNew && can('viewRates') ? el('div', { id: 'matter-rates-wrap' }) : null,
+    !isNew && can('manageBilling') ? el('div', { id: 'matter-invoices-wrap' }) : null,
   ]);
 
+  if (!isNew && can('manageBilling')) renderMatterBillingSummary(body.querySelector('#matter-billing-wrap'), m);
   if (!isNew && can('viewRates')) renderMatterRates(body.querySelector('#matter-rates-wrap'), m);
+  if (!isNew && can('manageBilling')) renderMatterInvoices(body.querySelector('#matter-invoices-wrap'), m);
 
   const save = async () => {
     const d = {};
@@ -3107,6 +3219,15 @@ async function openMatterForm(existing) {
   openModal(isNew ? 'New matter' : 'Edit matter', body, el('div', {}, [
     !isNew && can('manageBilling') ? el('button', { class: 'btn btn-danger btn-sm', onclick: async () => { if (!confirm('Delete matter and all its time entries?')) return; await api('/api/matters/' + m.id, { method: 'DELETE' }); toast('Deleted'); closeModal(); navigate('matters'); } }, 'Delete') : null,
     el('div', { class: 'spacer' }),
+    !isNew && can('manageBilling') ? el('button', { class: 'btn btn-ghost btn-sm', onclick: async () => {
+      if (!confirm('Generate an invoice for "' + (m.name || 'this matter') + '"?\n\nAll draft billable time and expenses on this matter will be included.')) return;
+      try {
+        const r = await api('/api/invoices', { method: 'POST', body: { matterId: m.id, issuedAt: new Date().toISOString().slice(0, 10) } });
+        toast('Invoice ' + (r.number || '') + ' created');
+        closeModal();
+        navigate('invoices');
+      } catch(e) { toast(e.message || 'Could not generate invoice', true); }
+    }}, 'Generate invoice') : null,
     el('button', { class: 'btn btn-ghost btn-sm', onclick: closeModal }, 'Cancel'),
     el('button', { class: 'btn btn-primary btn-sm', onclick: save }, 'Save'),
   ]), true);
@@ -3137,6 +3258,74 @@ async function renderMatterRates(wrap, matter) {
     await api('/api/matters/' + matter.id + '/rates', { method: 'PUT', body: items });
     toast('Rates saved');
   } }, 'Save rates'));
+}
+
+async function renderMatterBillingSummary(wrap, matter) {
+  const [timeEntries, invoices, trust, expenses] = await Promise.all([
+    api('/api/time?matterId='     + encodeURIComponent(matter.id)).catch(() => []),
+    api('/api/invoices?matterId=' + encodeURIComponent(matter.id)).catch(() => []),
+    api('/api/trust?matterId='    + encodeURIComponent(matter.id)).catch(() => ({ entries: [] })),
+    api('/api/expenses?matterId=' + encodeURIComponent(matter.id)).catch(() => []),
+  ]);
+
+  const draftTime     = timeEntries.filter(t => t.status === 'draft' && t.billable);
+  const wipTime       = draftTime.reduce((s, t) => s + (Number(t.minutes) / 60) * Number(t.rate || 0), 0);
+  const draftExpenses = expenses.filter(e => e.status === 'draft' && e.billable);
+  const wipExpenses   = draftExpenses.reduce((s, e) => s + Number(e.amount) * (1 + Number(e.markup_pct || 0)), 0);
+  const wip           = wipTime + wipExpenses;
+
+  const liveInv    = invoices.filter(i => i.status !== 'void');
+  const billed     = liveInv.reduce((s, i) => s + Number(i.amount_paid || 0), 0);
+  const outstanding = liveInv.filter(i => ['draft','sent'].includes(i.status))
+    .reduce((s, i) => s + Math.max(0, Number(i.total || 0) + Number(i.amount_writedown || 0) - Number(i.amount_paid || 0)), 0);
+  const trustBal   = (trust.entries || []).reduce((s, e) => s + Number(e.amount || 0), 0);
+
+  const stat = (label, value, tone, sub) => el('div', { class: 'stat-card' }, [
+    el('div', { class: 'stat-label' }, label),
+    el('div', { class: 'stat-value', style: tone ? 'color:var(--' + tone + ')' : '' }, value),
+    sub ? el('div', { class: 'stat-sub' }, sub) : null,
+  ]);
+
+  wrap.innerHTML = '';
+  wrap.appendChild(el('h3', { style: 'font-size:13px;font-weight:700;color:var(--navy);margin-top:16px;margin-bottom:8px' }, 'Billing summary'));
+  wrap.appendChild(el('div', { class: 'grid grid-4', style: 'margin-bottom:12px' }, [
+    stat('Unbilled WIP', fmt.money(wip), wip > 0 ? 'gold' : null,
+      draftTime.length + ' entr' + (draftTime.length === 1 ? 'y' : 'ies') + (draftExpenses.length ? ' + ' + draftExpenses.length + ' expense' + (draftExpenses.length === 1 ? '' : 's') : '')),
+    stat('Outstanding', fmt.money(outstanding), outstanding > 0 ? 'red' : null,
+      liveInv.filter(i => ['draft','sent'].includes(i.status)).length + ' open invoice' + (liveInv.filter(i => ['draft','sent'].includes(i.status)).length === 1 ? '' : 's')),
+    stat('Collected', fmt.money(billed), null,
+      liveInv.filter(i => i.status === 'paid').length + ' paid invoice' + (liveInv.filter(i => i.status === 'paid').length === 1 ? '' : 's')),
+    stat('Trust held', fmt.money(trustBal), trustBal < 0 ? 'red' : trustBal > 0 ? 'green' : null,
+      (trust.entries || []).length + ' ledger entr' + ((trust.entries || []).length === 1 ? 'y' : 'ies')),
+  ]));
+}
+
+async function renderMatterInvoices(wrap, matter) {
+  const invoices = await api('/api/invoices?matterId=' + encodeURIComponent(matter.id)).catch(() => []);
+  wrap.innerHTML = '';
+  wrap.appendChild(el('h3', { style: 'font-size:13px;font-weight:700;color:var(--navy);margin-top:16px' }, 'Invoices'));
+  if (!invoices.length) {
+    wrap.appendChild(el('div', { class: 'empty', style: 'padding:8px 0' }, 'No invoices yet.'));
+    return;
+  }
+  wrap.appendChild(el('table', { class: 'data' }, [
+    el('thead', {}, el('tr', {}, [
+      el('th', {}, '#'), el('th', {}, 'Issued'), el('th', { class: 'num' }, 'Total'),
+      el('th', { class: 'num' }, 'Paid'), el('th', {}, 'Status'), el('th', {}, ''),
+    ])),
+    el('tbody', {}, invoices.map(i => {
+      const wd  = Number(i.amount_writedown || 0);
+      const bal = +(Number(i.total || 0) + wd - Number(i.amount_paid || 0)).toFixed(2);
+      return el('tr', {}, [
+        el('td', {}, i.number || '—'),
+        el('td', {}, fmt.date(i.issued_at)),
+        el('td', { class: 'num' }, fmt.money(i.total)),
+        el('td', { class: 'num' }, fmt.money(i.amount_paid || 0)),
+        el('td', {}, el('span', { class: 'badge badge-status-' + i.status }, i.status)),
+        el('td', {}, el('button', { class: 'btn btn-ghost btn-sm', onclick: () => openInvoiceDetail(i.id) }, 'View')),
+      ]);
+    })),
+  ]));
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -3302,7 +3491,13 @@ function renderTimeEntries(mount, entries, matters) {
     return a;
   }, { min: 0, bill: 0, amt: 0 });
   mount.appendChild(timeStatCards(sum.min, sum.bill, entries.length, sum.amt));
-  if (entries.length === 0) { mount.appendChild(el('div', { class: 'card empty' }, 'No time entries this month.')); return; }
+  if (entries.length === 0) {
+    mount.appendChild(el('div', { class: 'card', style: 'padding:32px;text-align:center' }, [
+      el('div', { style: 'color:var(--text-light);margin-bottom:12px' }, 'No time entries this month.'),
+      can('logTime') ? el('button', { class: 'btn btn-primary btn-sm', onclick: () => openTimeForm(null, matters) }, '+ Log time') : null,
+    ]));
+    return;
+  }
   const canTime = can('logTime');
 
   state.viewState.time ||= {};
@@ -3355,6 +3550,26 @@ function renderTimeEntries(mount, entries, matters) {
         navigate('time');
       } : null,
     });
+    if (tb && can('manageBilling')) {
+      const picked = entries.filter(t => tv.entriesSelection.has(t.id));
+      const draftBillable = picked.filter(t => t.status === 'draft' && t.billable);
+      const matterIds = [...new Set(draftBillable.map(t => t.matter_id))];
+      if (matterIds.length === 1) {
+        const matter = matterById.get(matterIds[0]);
+        const billBtn = el('button', { class: 'btn btn-primary btn-sm', onclick: async () => {
+          const mName = matter?.name || 'this matter';
+          if (!confirm('Generate an invoice for "' + mName + '"?\n\nAll draft billable time and expenses on this matter will be included.')) return;
+          try {
+            const r = await api('/api/invoices', { method: 'POST', body: { matterId: matterIds[0], issuedAt: new Date().toISOString().slice(0, 10) } });
+            toast('Invoice ' + (r.number || '') + ' created');
+            tv.entriesSelection.clear();
+            navigate('invoices');
+          } catch(e) { toast(e.message || 'Could not generate invoice', true); }
+        }}, 'Generate invoice');
+        const deleteBtn = tb.querySelector('.btn-danger');
+        tb.insertBefore(billBtn, deleteBtn || tb.lastChild);
+      }
+    }
     if (tb) toolbarSlot.appendChild(tb);
 
     tableSlot.innerHTML = '';
@@ -3382,7 +3597,12 @@ function renderTimeEntries(mount, entries, matters) {
           can('viewRates') ? el('td', { class: 'num' }, fmt.money(t.rate || 0)) : null,
           can('viewRates') ? el('td', { class: 'num' }, fmt.money((t.minutes/60) * (t.rate || 0))) : null,
           el('td', {}, t.description || '—'),
-          el('td', {}, el('span', { class: 'badge badge-status-' + t.status }, t.status)),
+          el('td', {}, (t.status === 'billed' && t.invoice_id)
+            ? el('span', { style: 'display:flex;align-items:center;gap:6px' }, [
+                el('span', { class: 'badge badge-status-billed' }, 'billed'),
+                el('button', { style: 'font-size:11px;color:var(--blue);background:none;border:none;padding:0;cursor:pointer', onclick: (e) => { e.stopPropagation(); openInvoiceDetail(t.invoice_id); } }, 'Invoice ↗'),
+              ])
+            : el('span', { class: 'badge badge-status-' + t.status }, t.status)),
           canTime ? el('td', { style: 'text-align:center', 'data-row-action': 'timer' }, el('button', {
             class: 'row-timer-btn',
             title: 'Start timer for this matter',
@@ -4681,7 +4901,15 @@ async function renderExpenses(mount, v) {
     el('div', { class: 'stat-card' }, [ el('div', { class: 'stat-label' }, 'Billable'), el('div', { class: 'stat-value' }, fmt.money(totals.billable)) ]),
     el('div', { class: 'stat-card' }, [ el('div', { class: 'stat-label' }, 'Unbilled billable'), el('div', { class: 'stat-value' }, fmt.money(totals.unbilled)), el('div', { class: 'stat-sub' }, 'Added to next invoice for the matter') ]),
   ]));
-  if (expenses.length === 0) { mount.appendChild(el('div', { class: 'card empty' }, 'No expenses yet.')); return; }
+  if (expenses.length === 0) {
+    mount.appendChild(el('div', { class: 'card', style: 'padding:32px;text-align:center' }, [
+      el('div', { style: 'color:var(--text-light);margin-bottom:12px' }, 'No expenses yet.'),
+      activeMatters.length
+        ? el('button', { class: 'btn btn-primary btn-sm', onclick: () => openExpenseForm(null, activeMatters) }, '+ Record an expense')
+        : el('div', { style: 'font-size:12px;color:var(--text-muted)' }, 'Create a matter first to log expenses against it.'),
+    ]));
+    return;
+  }
 
   const selected = new Set();
   const bulkBar = el('div', { class: 'row mb-12', style: 'gap:8px;align-items:center;display:none' });
@@ -4997,7 +5225,7 @@ function openExpenseForm(existing, matters) {
     el('div', { class: 'form-row' }, [
       el('div', { class: 'field' }, [ el('label', {}, 'Date'), el('input', { name: 'date', type: 'date', value: toDateInput(e.date) || todayDateInput() }) ]),
       el('div', { class: 'field' }, [ el('label', {}, 'Category'),
-        el('select', { name: 'category' }, EXPENSE_CATEGORIES.map(c =>
+        el('select', { name: 'category' }, (state.firm?.expenseCategories?.length ? state.firm.expenseCategories : EXPENSE_CATEGORIES).map(c =>
           el('option', { value: c.id, ...((e.category||'other') === c.id ? { selected: 'selected' } : {}) }, c.label))) ]),
       el('div', { class: 'field' }, [ el('label', {}, 'Amount ($)'), el('input', { name: 'amount', type: 'number', step: '0.01', value: e.amount || '' }) ]),
     ]),
@@ -5640,8 +5868,16 @@ async function openInvoiceDetail(id) {
     el('div', { class: 'grid grid-3 mb-12' }, [
       el('div', {}, [
         el('div', { style: 'font-size:11px;color:var(--text-light);text-transform:uppercase' }, 'Client'),
-        el('div', { style: 'font-weight:600' }, inv.client_name || '—'),
-        matterIdent ? el('div', { style: 'font-size:12px;color:var(--text-muted);margin-top:2px' }, matterIdent) : null,
+        inv.client_contact_id
+          ? el('button', { style: 'font-weight:600;color:var(--blue);background:none;border:none;padding:0;cursor:pointer;text-align:left', onclick: () => { closeModal(); openContact(inv.client_contact_id); } }, inv.client_name || '—')
+          : el('div', { style: 'font-weight:600' }, inv.client_name || '—'),
+        (matterIdent && inv.matter_id)
+          ? el('button', { style: 'font-size:12px;color:var(--blue);background:none;border:none;padding:0;cursor:pointer;text-align:left;display:block;margin-top:2px', onclick: async () => {
+              const matters = state.matters || await api('/api/matters');
+              const m = matters.find(x => x.id === inv.matter_id);
+              if (m) { closeModal(); openMatterForm(m); }
+            } }, matterIdent)
+          : matterIdent ? el('div', { style: 'font-size:12px;color:var(--text-muted);margin-top:2px' }, matterIdent) : null,
       ]),
       el('div', {}, [
         el('div', { style: 'font-size:11px;color:var(--text-light);text-transform:uppercase' }, 'Issued'),
@@ -5747,7 +5983,11 @@ async function openInvoiceDetail(id) {
       el('div', { style: 'font-size:11px;color:var(--text-light);text-transform:uppercase;letter-spacing:.5px;font-weight:700' }, 'Status'),
       el('div', { class: 'btn-group' }, ['draft','sent','paid','void'].map(s => el('button', {
         class: inv.status === s ? 'active' : '',
-        onclick: async () => { await api('/api/invoices/' + id + '/status', { method: 'PATCH', body: { status: s } }); toast('Marked ' + s); closeModal(); navigate('invoices'); },
+        onclick: async () => {
+          if (s === 'void' && !confirm('Void this invoice? This cannot be undone. Billed time entries will be released back to draft.')) return;
+          await api('/api/invoices/' + id + '/status', { method: 'PATCH', body: { status: s } });
+          toast('Marked ' + s); closeModal(); navigate('invoices');
+        },
       }, s[0].toUpperCase() + s.slice(1)))),
       el('div', { class: 'spacer' }),
     ]),
@@ -6083,6 +6323,82 @@ function svgVbarChart(periods, getData, opts = {}) {
   return svg;
 }
 
+function makeCombobox(initOptions, selectedValue, onChange, placeholder) {
+  let options = initOptions;
+  let currentValue = selectedValue;
+  let filtered = [...options];
+  let highlightIdx = -1;
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.placeholder = placeholder || '';
+  input.style.cssText = 'width:100%;box-sizing:border-box';
+
+  const dropdown = document.createElement('div');
+  dropdown.style.cssText = 'position:absolute;left:0;right:0;background:#fff;border:1px solid #d1d5db;border-radius:6px;max-height:220px;overflow-y:auto;z-index:2000;box-shadow:0 4px 12px rgba(0,0,0,.12);display:none';
+
+  const wrap = document.createElement('div');
+  wrap.style.position = 'relative';
+  wrap.appendChild(input);
+  wrap.appendChild(dropdown);
+
+  const labelOf = (val) => { const o = options.find(o => o.value === val); return o ? o.label : ''; };
+  const setDisplay = (val) => { input.value = labelOf(val); };
+  setDisplay(currentValue);
+
+  const updateHighlight = () => {
+    [...dropdown.children].forEach((item, i) => { item.style.background = i === highlightIdx ? '#f3f4f6' : ''; });
+  };
+
+  const renderDrop = () => {
+    dropdown.innerHTML = '';
+    filtered.forEach((opt, i) => {
+      const item = document.createElement('div');
+      item.style.cssText = 'padding:6px 10px;cursor:pointer;font-size:13px';
+      item.textContent = opt.label || '—';
+      item.addEventListener('mouseover', () => { highlightIdx = i; updateHighlight(); });
+      item.addEventListener('mousedown', e => { e.preventDefault(); pick(opt.value); });
+      dropdown.appendChild(item);
+    });
+    dropdown.style.display = filtered.length ? 'block' : 'none';
+  };
+
+  const pick = (val) => {
+    currentValue = val;
+    setDisplay(val);
+    dropdown.style.display = 'none';
+    highlightIdx = -1;
+    onChange(val);
+  };
+
+  input.addEventListener('focus', () => {
+    input.select();
+    filtered = [...options];
+    highlightIdx = -1;
+    renderDrop();
+  });
+  input.addEventListener('input', () => {
+    const q = input.value.toLowerCase();
+    filtered = options.filter(o => !q || o.label.toLowerCase().includes(q));
+    highlightIdx = -1;
+    renderDrop();
+  });
+  input.addEventListener('keydown', e => {
+    if (e.key === 'ArrowDown') { highlightIdx = Math.min(highlightIdx + 1, filtered.length - 1); updateHighlight(); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { highlightIdx = Math.max(highlightIdx - 1, 0); updateHighlight(); e.preventDefault(); }
+    else if (e.key === 'Enter') { if (highlightIdx >= 0 && filtered[highlightIdx]) pick(filtered[highlightIdx].value); e.preventDefault(); }
+    else if (e.key === 'Escape') { setDisplay(currentValue); dropdown.style.display = 'none'; }
+  });
+  input.addEventListener('blur', () => { setTimeout(() => { setDisplay(currentValue); dropdown.style.display = 'none'; }, 200); });
+
+  return {
+    el: wrap,
+    getValue: () => currentValue,
+    setValue: (val) => { currentValue = val; setDisplay(val); },
+    setOptions: (opts) => { options = opts; filtered = [...opts]; },
+  };
+}
+
 async function renderCashflow(mount, v) {
   const view = (state._profile && state._profile.cashflowView) || {};
   const today = new Date();
@@ -6116,28 +6432,34 @@ async function renderCashflow(mount, v) {
   const attorneys = ((seatsData && seatsData.users) || [])
     .filter(u => ['Admin','Partner','Associate'].includes(u.role));
 
-  const buildMatterOptions = () => {
-    const filtered = (allMatters || []).filter(m => !params.clientId || String(m.contact_id) === String(params.clientId));
+  const buildMatterOpts = () => {
+    const ms = (allMatters || []).filter(m => !params.clientId || String(m.contact_id) === String(params.clientId));
     return [
-      el('option', { value: '' }, 'All matters'),
-      ...filtered.map(m => el('option', { value: String(m.id), ...(params.matterId === String(m.id) ? { selected: '' } : {}) },
-        (fmtMatterFullId(m) || '') + (m.description ? ' — ' + m.description : ''))),
+      { value: '', label: 'All matters' },
+      ...ms.map(m => ({ value: String(m.id), label: (fmtMatterFullId(m) || '') + (m.description ? ' — ' + m.description : '') })),
     ];
   };
+
+  const clientOpts = [
+    { value: '', label: 'All clients' },
+    ...(clients || []).map(c => ({ value: String(c.id), label: c.full_name })),
+  ];
 
   const fromInput  = el('input', { type: 'date', value: params.from, onchange: e => { params.from = e.target.value; persist(); panelRefresh(); } });
   const toInput    = el('input', { type: 'date', value: params.to,   onchange: e => { params.to   = e.target.value; persist(); panelRefresh(); } });
   const granSel    = el('select', { onchange: e => { params.granularity = e.target.value; persist(); panelRefresh(); } },
     ['day','month','year'].map(g => el('option', { value: g, ...(params.granularity === g ? { selected: '' } : {}) }, g[0].toUpperCase() + g.slice(1))));
-  const clientSel  = el('select', { onchange: e => {
-    params.clientId = e.target.value; params.matterId = '';
-    persist(); rebuildMatterSel(); panelRefresh();
-  } }, [
-    el('option', { value: '' }, 'All clients'),
-    ...(clients || []).map(c => el('option', { value: String(c.id), ...(params.clientId === String(c.id) ? { selected: '' } : {}) }, c.full_name)),
-  ]);
-  let matterSel = el('select', { onchange: e => { params.matterId = e.target.value; persist(); panelRefresh(); } }, buildMatterOptions());
-  const rebuildMatterSel = () => { matterSel.innerHTML = ''; buildMatterOptions().forEach(o => matterSel.appendChild(o)); };
+
+  const clientCombo = makeCombobox(clientOpts, params.clientId, val => {
+    params.clientId = val; params.matterId = '';
+    matterCombo.setValue('');
+    matterCombo.setOptions(buildMatterOpts());
+    persist(); panelRefresh();
+  }, 'All clients');
+
+  const matterCombo = makeCombobox(buildMatterOpts(), params.matterId, val => {
+    params.matterId = val; persist(); panelRefresh();
+  }, 'All matters');
 
   const attySel = el('select', { onchange: e => { params.attorneyEmail = e.target.value; persist(); panelRefresh(); } }, [
     el('option', { value: '' }, 'All attorneys'),
@@ -6153,8 +6475,8 @@ async function renderCashflow(mount, v) {
       el('div', { class: 'field', style: 'margin:0' }, [ el('label', {}, 'From'),     fromInput ]),
       el('div', { class: 'field', style: 'margin:0' }, [ el('label', {}, 'To'),       toInput ]),
       el('div', { class: 'field', style: 'margin:0' }, [ el('label', {}, 'Group by'), granSel ]),
-      el('div', { class: 'field', style: 'margin:0;min-width:170px' }, [ el('label', {}, 'Client'),   clientSel ]),
-      el('div', { class: 'field', style: 'margin:0;min-width:170px' }, [ el('label', {}, 'Matter'),   matterSel ]),
+      el('div', { class: 'field', style: 'margin:0;min-width:170px' }, [ el('label', {}, 'Client'),   clientCombo.el ]),
+      el('div', { class: 'field', style: 'margin:0;min-width:170px' }, [ el('label', {}, 'Matter'),   matterCombo.el ]),
       el('div', { class: 'field', style: 'margin:0;min-width:150px' }, [ el('label', {}, 'Attorney'), attySel ]),
       el('div', { class: 'field', style: 'margin:0' },                 [ el('label', {}, 'Role'),     attyRoleSel ]),
       el('div', { class: 'spacer' }),
@@ -6163,7 +6485,8 @@ async function renderCashflow(mount, v) {
         params.clientId = ''; params.matterId = ''; params.attorneyEmail = ''; params.attorneyRole = 'originating';
         persist();
         fromInput.value = params.from; toInput.value = params.to; granSel.value = 'month';
-        clientSel.value = ''; rebuildMatterSel(); attySel.value = ''; attyRoleSel.value = 'originating';
+        clientCombo.setValue(''); matterCombo.setValue(''); matterCombo.setOptions(buildMatterOpts());
+        attySel.value = ''; attyRoleSel.value = 'originating';
         panelRefresh();
       } }, 'Reset'),
     ]),
@@ -6184,9 +6507,11 @@ async function renderCashflow(mount, v) {
   };
 
   const subTabDefs = [
-    { key: 'activity', label: 'Activity',      fn: renderCashflowActivityPanel },
-    { key: 'aging',    label: 'AR Aging',       fn: renderCashflowAgingPanel },
-    { key: 'receipts', label: 'Cash Receipts',  fn: renderCashflowReceiptsPanel },
+    { key: 'activity',       label: 'Activity',        fn: renderCashflowActivityPanel },
+    { key: 'aging',          label: 'AR Aging',         fn: renderCashflowAgingPanel },
+    { key: 'receipts',       label: 'Cash Receipts',    fn: renderCashflowReceiptsPanel },
+    { key: 'origination',    label: 'Origination',      fn: renderCashflowOriginationPanel },
+    { key: 'reconciliation', label: 'Reconciliation',   fn: renderCashflowReconciliationPanel },
   ];
 
   const tabBar = el('div', { class: 'settings-tabs' });
@@ -6475,6 +6800,281 @@ async function renderCashflowReceiptsPanel(slot, buildQs) {
   slot.appendChild(chartCard);
   slot.appendChild(methodCard);
   slot.appendChild(tableCard);
+}
+
+// Parse OFX/QFX file text into transaction rows (client-side, no library needed)
+function parseOFX(text) {
+  const blocks = [];
+  // Try XML format first (<STMTTRN>...</STMTTRN>)
+  const xmlRe = /<STMTTRN>([\s\S]*?)<\/STMTTRN>/gi;
+  let m;
+  while ((m = xmlRe.exec(text)) !== null) blocks.push(m[1]);
+  // Fall back to SGML (no closing tags — delimit by next <STMTTRN> or end marker)
+  if (!blocks.length) {
+    const sgmlRe = /<STMTTRN>([\s\S]*?)(?=<STMTTRN>|<\/BANKTRANLIST>|<LEDGERBAL>|<\/OFX>)/gi;
+    while ((m = sgmlRe.exec(text)) !== null) blocks.push(m[1]);
+  }
+  return blocks.map(b => {
+    const get = tag => { const r = new RegExp('<' + tag + '>([^<\\r\\n]+)', 'i').exec(b); return r ? r[1].trim() : null; };
+    const fitid  = get('FITID');
+    const dtraw  = (get('DTPOSTED') || get('DTAVAIL') || '').replace(/\[.*/, '');
+    const amt    = parseFloat(get('TRNAMT') || '0');
+    const ds     = dtraw.slice(0, 8);
+    const posted = ds.length === 8 ? ds.slice(0,4) + '-' + ds.slice(4,6) + '-' + ds.slice(6,8) : null;
+    return {
+      id:          fitid ? 'ofx_' + fitid : null,
+      posted_at:   posted,
+      amount:      isNaN(amt) ? 0 : amt,
+      counterparty: get('NAME') || get('PAYEE') || null,
+      memo:        get('MEMO') || null,
+    };
+  }).filter(t => t.id && t.posted_at);
+}
+
+async function renderCashflowReconciliationPanel(slot) {
+  slot.innerHTML = '<div class="empty" style="padding:24px"><span class="loader"></span></div>';
+  let data;
+  try { data = await api('/api/bank/transactions'); }
+  catch { slot.innerHTML = '<div class="empty">Could not load bank transactions.</div>'; return; }
+
+  const allTxns    = data.transactions || [];
+  const lastSynced = data.lastSyncedAt;
+
+  // State
+  let showAll      = false;
+  let selectedTxId = null;
+  let payments     = [];
+
+  const render = () => {
+    slot.innerHTML = '';
+
+    // ── Controls row ──────────────────────────────────────────────────
+    const controls = el('div', { style: 'display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px' }, [
+      el('button', { class: 'btn btn-primary btn-sm', id: 'recon-sync-btn', onclick: async () => {
+        const btn = $('#recon-sync-btn');
+        btn.disabled = true; btn.textContent = 'Syncing…';
+        try {
+          const r = await api('/api/bank/sync', { method: 'POST' });
+          toast('Synced ' + r.fetched + ' transactions');
+          data = await api('/api/bank/transactions');
+          allTxns.length = 0; allTxns.push(...(data.transactions || []));
+          render();
+        } catch(e) {
+          toast('Sync failed — check Mercury credentials');
+          btn.disabled = false; btn.textContent = 'Sync Mercury';
+        }
+      }}, 'Sync Mercury'),
+      el('div', { style: 'font-size:12px;color:var(--text-muted)' },
+        lastSynced ? 'Last synced ' + fmt.date(lastSynced) : 'Not synced yet'),
+      el('label', { style: 'display:flex;align-items:center;gap:6px;font-size:13px;margin-left:auto;cursor:pointer' }, [
+        el('input', { type: 'checkbox', ...(showAll ? { checked: 'checked' } : {}), onchange: e => { showAll = e.target.checked; selectedTxId = null; render(); } }),
+        'Show reconciled',
+      ]),
+      // OFX import
+      (() => {
+        const fileIn = el('input', { type: 'file', accept: '.ofx,.qfx,.OFX,.QFX', style: 'display:none' });
+        fileIn.onchange = async () => {
+          const file = fileIn.files[0];
+          if (!file) return;
+          const text = await file.text();
+          const parsed = parseOFX(text);
+          if (!parsed.length) { toast('No transactions found in file'); return; }
+          const role = prompt('Account type for this import?\n"operating" or "trust"', 'operating');
+          if (!role) return;
+          const r = await api('/api/bank/import', { method: 'POST', body: { transactions: parsed, accountRole: role.trim().toLowerCase() } });
+          toast('Imported ' + r.inserted + ' new of ' + r.total + ' transactions');
+          data = await api('/api/bank/transactions');
+          allTxns.length = 0; allTxns.push(...(data.transactions || []));
+          render();
+        };
+        const btn = el('button', { class: 'btn btn-ghost btn-sm', onclick: () => fileIn.click() }, 'Import OFX/QFX');
+        const wrap = el('span'); wrap.appendChild(fileIn); wrap.appendChild(btn);
+        return wrap;
+      })(),
+    ]);
+    slot.appendChild(controls);
+
+    const txns = showAll ? allTxns : allTxns.filter(t => !t.reconciled_payment_id);
+    if (!txns.length) {
+      slot.appendChild(el('div', { class: 'empty' }, showAll ? 'No bank transactions. Sync Mercury or import an OFX file.' : 'All transactions reconciled.'));
+      return;
+    }
+
+    // ── Transaction table ─────────────────────────────────────────────
+    const unrecCount = allTxns.filter(t => !t.reconciled_payment_id).length;
+    slot.appendChild(el('div', { style: 'font-size:12px;color:var(--text-muted);margin-bottom:8px' },
+      unrecCount + ' unreconciled · ' + allTxns.length + ' total'));
+
+    const tbody = el('tbody');
+    txns.forEach(tx => {
+      const isSelected = tx.id === selectedTxId;
+      const isReconc   = !!tx.reconciled_payment_id;
+      const row = el('tr', {
+        style: isSelected ? 'background:var(--blue-light, #e8f0fe);cursor:pointer' : (isReconc ? 'opacity:.65;cursor:default' : 'cursor:pointer'),
+        onclick: () => {
+          if (isReconc) return;
+          selectedTxId = isSelected ? null : tx.id;
+          render();
+        },
+      }, [
+        el('td', {}, fmt.date(tx.posted_at)),
+        el('td', {}, tx.counterparty || tx.memo || '—'),
+        el('td', { class: 'num', style: 'font-weight:500;color:' + (tx.amount >= 0 ? 'var(--green)' : 'var(--red)') },
+          (tx.amount >= 0 ? '+' : '') + fmt.money(tx.amount)),
+        el('td', {}, tx.account_role || '—'),
+        el('td', { style: 'font-size:11px' },
+          isReconc
+            ? el('span', { style: 'color:var(--green)' }, '✓ Inv #' + (tx.invoice_number || '?') + (tx.client_name ? ' · ' + tx.client_name : ''))
+            : el('span', { style: 'color:var(--text-muted)' }, '—')
+        ),
+        el('td', { style: 'text-align:right' },
+          isReconc
+            ? el('button', { class: 'btn btn-ghost btn-sm', style: 'font-size:11px', onclick: async e => {
+                e.stopPropagation();
+                if (!confirm('Clear reconciliation for this transaction?')) return;
+                await api('/api/bank/transactions/' + tx.id + '/unreconcile', { method: 'PATCH' });
+                toast('Cleared');
+                data = await api('/api/bank/transactions');
+                allTxns.length = 0; allTxns.push(...(data.transactions || []));
+                render();
+              }}, 'Clear')
+            : el('button', { class: 'btn btn-ghost btn-sm', style: 'font-size:11px', onclick: async e => {
+                e.stopPropagation();
+                selectedTxId = tx.id;
+                render();
+                // Load payments and scroll to picker
+                await loadPaymentPicker(tx);
+              }}, 'Match')
+        ),
+      ]);
+      tbody.appendChild(row);
+    });
+    slot.appendChild(el('div', { class: 'card mb-16', style: 'overflow-x:auto' }, [
+      el('table', { class: 'data' }, [
+        el('thead', {}, el('tr', {}, [
+          el('th', {}, 'Date'), el('th', {}, 'Description'), el('th', { class: 'num' }, 'Amount'),
+          el('th', {}, 'Account'), el('th', {}, 'Reconciled to'), el('th'),
+        ])),
+        tbody,
+      ]),
+    ]));
+
+    // ── Payment picker (shown when a tx is selected) ───────────────────
+    if (selectedTxId) {
+      const selTx = allTxns.find(t => t.id === selectedTxId);
+      const pickerCard = el('div', { class: 'card', id: 'payment-picker-card' }, [
+        el('div', { style: 'font-weight:600;margin-bottom:4px' }, 'Match to an invoice payment'),
+        el('div', { style: 'font-size:12px;color:var(--text-muted);margin-bottom:12px' },
+          'Showing unreconciled payments. Closest amount matches listed first.'),
+        el('div', { id: 'payment-picker-body' }, [ el('div', { class: 'empty' }, el('span', { class: 'loader' })) ]),
+      ]);
+      slot.appendChild(pickerCard);
+      loadPaymentPicker(selTx);
+    }
+  };
+
+  const loadPaymentPicker = async (tx) => {
+    if (!payments.length) {
+      try { payments = await api('/api/bank/unreconciled-payments'); }
+      catch { payments = []; }
+    }
+    const body = $('#payment-picker-body');
+    if (!body) return;
+    body.innerHTML = '';
+    if (!payments.length) {
+      body.appendChild(el('div', { class: 'empty' }, 'No unreconciled invoice payments found.'));
+      return;
+    }
+    // Sort by closeness to tx amount
+    const sorted = [...payments].sort((a, b) => Math.abs(Math.abs(Number(a.amount)) - Math.abs(tx.amount)) - Math.abs(Math.abs(Number(b.amount)) - Math.abs(tx.amount)));
+    const tbody = el('tbody');
+    sorted.slice(0, 50).forEach(p => {
+      tbody.appendChild(el('tr', {}, [
+        el('td', {}, fmt.date(p.occurred_at)),
+        el('td', {}, p.client_name || '—'),
+        el('td', {}, p.invoice_number ? 'Inv #' + p.invoice_number : '—'),
+        el('td', { class: 'num' }, fmt.money(p.amount)),
+        el('td', {}, (p.method || '').replace('_', ' ')),
+        el('td', { style: 'text-align:right' }, [
+          el('button', { class: 'btn btn-primary btn-sm', onclick: async () => {
+            await api('/api/bank/transactions/' + tx.id + '/reconcile', { method: 'PATCH', body: { paymentId: p.id } });
+            toast('Matched');
+            selectedTxId = null;
+            payments = [];
+            data = await api('/api/bank/transactions');
+            allTxns.length = 0; allTxns.push(...(data.transactions || []));
+            render();
+          }}, 'Match'),
+        ]),
+      ]));
+    });
+    body.appendChild(el('table', { class: 'data' }, [
+      el('thead', {}, el('tr', {}, [
+        el('th', {}, 'Date'), el('th', {}, 'Client'), el('th', {}, 'Invoice'),
+        el('th', { class: 'num' }, 'Amount'), el('th', {}, 'Method'), el('th'),
+      ])),
+      tbody,
+    ]));
+  };
+
+  render();
+}
+
+async function renderCashflowOriginationPanel(slot) {
+  slot.innerHTML = '<div class="empty" style="padding:24px"><span class="loader"></span></div>';
+  let data;
+  try { data = await api('/api/reports/origination'); }
+  catch { slot.innerHTML = '<div class="empty">Could not load origination data.</div>'; return; }
+
+  const attorneys = data.attorneys || [];
+  slot.innerHTML = '';
+
+  if (!attorneys.length) {
+    slot.appendChild(el('div', { class: 'empty' }, 'No origination data. Set "Originating attorney" on client contacts to track origination credit.'));
+    return;
+  }
+
+  const totalBilled  = attorneys.reduce((s, a) => s + a.total_billed, 0);
+  const totalShare   = attorneys.reduce((s, a) => s + a.total_share, 0);
+  const clientCount  = attorneys.reduce((s, a) => s + a.clients.length, 0);
+  const stat = (label, value, sub) => el('div', { class: 'stat-card' }, [
+    el('div', { class: 'stat-label' }, label),
+    el('div', { class: 'stat-value' }, value),
+    sub ? el('div', { style: 'font-size:11px;color:var(--text-muted);margin-top:2px' }, sub) : null,
+  ]);
+  slot.appendChild(el('div', { class: 'grid grid-3 mb-16' }, [
+    stat('Originating attorneys', String(attorneys.length)),
+    stat('Total fees billed', fmt.money(totalBilled), clientCount + ' originated client' + (clientCount === 1 ? '' : 's')),
+    stat('Total origination credit', fmt.money(totalShare)),
+  ]));
+
+  attorneys.forEach(a => {
+    slot.appendChild(el('div', { class: 'card mb-16' }, [
+      el('div', { style: 'display:flex;align-items:center;gap:12px;margin-bottom:12px' }, [
+        el('div', { style: 'font-weight:600' }, a.email),
+        el('div', { class: 'spacer' }),
+        el('div', { style: 'font-size:13px;color:var(--text-muted)' }, 'Credit: ' + fmt.money(a.total_share) + ' of ' + fmt.money(a.total_billed) + ' billed'),
+      ]),
+      el('table', { class: 'data' }, [
+        el('thead', {}, el('tr', {}, [
+          el('th', {}, 'Client'),
+          el('th', { class: 'num' }, 'Split %'),
+          el('th', { class: 'num' }, 'Fees billed'),
+          el('th', { class: 'num' }, 'Collected'),
+          el('th', { class: 'num' }, 'Credit'),
+        ])),
+        el('tbody', {}, a.clients.map(cl =>
+          el('tr', {}, [
+            el('td', {}, cl.client_name + (cl.client_number ? ' · #' + cl.client_number : '')),
+            el('td', { class: 'num' }, cl.split_pct ? cl.split_pct + '%' : '—'),
+            el('td', { class: 'num' }, fmt.money(cl.fees_billed)),
+            el('td', { class: 'num' }, fmt.money(cl.fees_collected)),
+            el('td', { class: 'num' }, cl.split_pct ? fmt.money(cl.share) : '—'),
+          ])
+        )),
+      ]),
+    ]));
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -7218,6 +7818,67 @@ function renderSettingsFirm(mount) {
       state.firm.pipelineStages = stages;
       toast('Saved');
     } }, 'Save stages'),
+  ]));
+
+  const defaultCatLines = EXPENSE_CATEGORIES.map(c => `${c.id} | ${c.label}`).join('\n');
+  const savedCats = state.firm.expenseCategories || [];
+  mount.appendChild(el('div', { class: 'card mb-24' }, [
+    el('h3', {}, 'Expense categories'),
+    el('div', { style: 'font-size:12px;color:var(--text-muted);margin-bottom:10px' }, 'Categories shown in the expense form. One per line: "id | label". Leave blank to use defaults.'),
+    el('textarea', { id: 'expense-cats-ta', style: 'width:100%;min-height:140px;font-family:monospace' },
+      savedCats.length ? savedCats.map(c => `${c.id} | ${c.label}`).join('\n') : defaultCatLines),
+    el('button', { class: 'btn btn-primary btn-sm mt-16', onclick: async () => {
+      const lines = $('#expense-cats-ta').value.split('\n').map(l => l.trim()).filter(Boolean);
+      const cats = lines.map(l => {
+        const [id, label] = l.split('|').map(s => s.trim());
+        return { id: id || label.toLowerCase().replace(/\s+/g,'-'), label: label || id };
+      });
+      await api('/api/firm', { method: 'PUT', body: { expenseCategories: cats } });
+      state.firm.expenseCategories = cats;
+      toast('Saved');
+    } }, 'Save categories'),
+  ]));
+
+  const dupResultsSlot = el('div', { id: 'dup-results', style: 'margin-top:12px' });
+  mount.appendChild(el('div', { class: 'card mb-24' }, [
+    el('h3', {}, 'Find duplicates'),
+    el('div', { style: 'font-size:12px;color:var(--text-muted);margin-bottom:12px' }, 'Contacts that share the same email address.'),
+    el('button', { class: 'btn btn-primary btn-sm', id: 'find-dups-btn', onclick: async () => {
+      const btn = $('#find-dups-btn');
+      btn.disabled = true;
+      const groups = await api('/api/contacts/duplicates').catch(() => []);
+      btn.disabled = false;
+      dupResultsSlot.innerHTML = '';
+      if (!groups.length) {
+        dupResultsSlot.appendChild(el('div', { style: 'font-size:13px;color:var(--text-muted)' }, 'No duplicates found.'));
+        return;
+      }
+      groups.forEach(g => {
+        const groupEl = el('div', { style: 'border:1px solid var(--border);border-radius:6px;padding:12px;margin-top:12px' }, [
+          el('div', { style: 'font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:8px' }, g.email),
+        ]);
+        g.contacts.forEach(contact => {
+          const others = g.contacts.filter(o => o.id !== contact.id);
+          const row = el('div', { style: 'display:flex;align-items:center;gap:10px;padding:6px 0;border-top:1px solid var(--border)' }, [
+            el('div', { style: 'flex:1' }, [
+              el('div', { style: 'font-weight:500' }, contact.full_name),
+              el('div', { style: 'font-size:11px;color:var(--text-muted)' }, [contact.type, contact.company_name].filter(Boolean).join(' · ')),
+            ]),
+            ...others.map(other =>
+              el('button', { class: 'btn btn-ghost btn-sm', style: 'font-size:11px;white-space:nowrap', onclick: async () => {
+                if (!confirm('Merge "' + contact.full_name + '" into "' + other.full_name + '"?\n\nInteractions, matters, invoices, and trust entries will move to "' + other.full_name + '". This cannot be undone.')) return;
+                await api('/api/contacts/' + other.id + '/merge/' + contact.id, { method: 'POST' });
+                toast('Merged');
+                groupEl.remove();
+              }}, 'Merge into ' + other.full_name)
+            ),
+          ]);
+          groupEl.appendChild(row);
+        });
+        dupResultsSlot.appendChild(groupEl);
+      });
+    }}, 'Find duplicates'),
+    dupResultsSlot,
   ]));
 }
 

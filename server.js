@@ -609,6 +609,7 @@ const migrations = [
   `ALTER TABLE invoice_payments ADD COLUMN notes TEXT`,
   `ALTER TABLE invoice_payments ADD COLUMN created_by TEXT`,
   `ALTER TABLE invoices ADD COLUMN amount_writedown REAL DEFAULT 0`,
+  `ALTER TABLE bank_transactions ADD COLUMN source TEXT DEFAULT 'mercury'`,
 ];
 // Only swallow "duplicate column" errors (idempotency). Anything else — syntax
 // typos, missing table, permission issues — is a real problem and should fail
@@ -1414,18 +1415,19 @@ app.get('/api/firm', authRequired, verifyFirmMembership, (req, res) => {
   const f = db.prepare('SELECT * FROM firms WHERE id = ?').get(req.user.firmId);
   const s = parseJSON(f.settings, {});
   const data = parseJSON(db.prepare('SELECT data FROM firm_data WHERE firm_id = ?').get(req.user.firmId)?.data || '{}', {});
-  res.json({ id: f.id, name: f.name, settings: s, pipelineStages: data.pipelineStages || [], tags: data.tags || [], hasLogo: !!f.logo_data });
+  res.json({ id: f.id, name: f.name, settings: s, pipelineStages: data.pipelineStages || [], tags: data.tags || [], expenseCategories: data.expenseCategories || [], hasLogo: !!f.logo_data });
 });
 
 app.put('/api/firm', authRequired, requireCap('manageFirm'), (req, res) => {
-  const { name, settings, pipelineStages, tags } = req.body;
+  const { name, settings, pipelineStages, tags, expenseCategories } = req.body;
   if (name) db.prepare('UPDATE firms SET name = ? WHERE id = ?').run(name.trim(), req.user.firmId);
   if (settings) db.prepare('UPDATE firms SET settings = ? WHERE id = ?').run(JSON.stringify(settings), req.user.firmId);
-  if (pipelineStages || tags) {
+  if (pipelineStages || tags || expenseCategories) {
     const row = db.prepare('SELECT data FROM firm_data WHERE firm_id = ?').get(req.user.firmId);
     const cur = parseJSON(row?.data || '{}', {});
-    if (pipelineStages) cur.pipelineStages = pipelineStages;
-    if (tags)           cur.tags = tags;
+    if (pipelineStages)    cur.pipelineStages    = pipelineStages;
+    if (tags)              cur.tags              = tags;
+    if (expenseCategories) cur.expenseCategories = expenseCategories;
     db.prepare(`INSERT INTO firm_data (firm_id, data, version, updated_at) VALUES (?, ?, 1, datetime('now'))
                 ON CONFLICT(firm_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`)
       .run(req.user.firmId, JSON.stringify(cur));
@@ -1879,6 +1881,49 @@ app.delete('/api/contacts/:id', authRequired, verifyFirmMembership, requireCap('
   res.json({ ok: true });
 });
 
+// Dedup check — warn before saving a contact with a matching email
+app.get('/api/contacts/dedup-check', authRequired, verifyFirmMembership, (req, res) => {
+  const { email, excludeId } = req.query;
+  if (!email) return res.json([]);
+  let sql = 'SELECT id, full_name, type, email FROM contacts WHERE firm_id = ? AND LOWER(email) = ?';
+  const params = [req.user.firmId, String(email).trim().toLowerCase()];
+  if (excludeId) { sql += ' AND id != ?'; params.push(excludeId); }
+  res.json(db.prepare(sql).all(...params));
+});
+
+// Find all email-duplicate groups for the Find Duplicates tool in Settings
+app.get('/api/contacts/duplicates', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
+  const emails = db.prepare(
+    `SELECT LOWER(email) AS email FROM contacts
+     WHERE firm_id = ? AND email IS NOT NULL AND email != ''
+     GROUP BY LOWER(email) HAVING COUNT(*) > 1`
+  ).all(req.user.firmId).map(r => r.email);
+  const groups = emails.map(email => {
+    const contacts = db.prepare(
+      `SELECT id, full_name, type, email, company_name, created_at FROM contacts
+       WHERE firm_id = ? AND LOWER(email) = ? ORDER BY created_at ASC`
+    ).all(req.user.firmId, email);
+    return { email, contacts };
+  });
+  res.json(groups);
+});
+
+// Merge: absorb otherId into id; transfer all references then delete other
+app.post('/api/contacts/:id/merge/:otherId', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
+  const primary = db.prepare('SELECT * FROM contacts WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  const other   = db.prepare('SELECT * FROM contacts WHERE id = ? AND firm_id = ?').get(req.params.otherId, req.user.firmId);
+  if (!primary || !other) return res.status(404).json({ error: 'Contact not found' });
+  if (primary.id === other.id) return res.status(400).json({ error: 'Cannot merge a contact with itself' });
+  db.transaction(() => {
+    db.prepare(`UPDATE interactions SET contact_id        = ? WHERE contact_id        = ? AND firm_id = ?`).run(primary.id, other.id, req.user.firmId);
+    db.prepare(`UPDATE matters       SET client_contact_id = ? WHERE client_contact_id = ? AND firm_id = ?`).run(primary.id, other.id, req.user.firmId);
+    db.prepare(`UPDATE invoices      SET client_contact_id = ? WHERE client_contact_id = ? AND firm_id = ?`).run(primary.id, other.id, req.user.firmId);
+    db.prepare(`UPDATE trust_ledger  SET contact_id        = ? WHERE contact_id        = ? AND firm_id = ?`).run(primary.id, other.id, req.user.firmId);
+    db.prepare('DELETE FROM contacts WHERE id = ? AND firm_id = ?').run(other.id, req.user.firmId);
+  })();
+  res.json({ ok: true, primaryId: primary.id });
+});
+
 // Move pipeline stage (drag-and-drop kanban)
 app.patch('/api/contacts/:id/stage', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
   const { stage } = req.body;
@@ -2025,6 +2070,17 @@ app.post('/api/interactions', authRequired, verifyFirmMembership, requireCap('ed
     db.prepare(`UPDATE contacts SET last_activity_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND firm_id = ?`).run(b.contactId, req.user.firmId);
   }
   res.json(db.prepare('SELECT * FROM interactions WHERE id = ?').get(id));
+});
+
+app.put('/api/interactions/:id', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
+  const i = db.prepare('SELECT * FROM interactions WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  if (!i) return res.status(404).json({ error: 'Not found' });
+  if (i.created_by !== req.user.email && !req.user.isAdmin) return res.status(403).json({ error: 'Only the author or an admin can edit' });
+  const b = req.body || {};
+  db.prepare(`UPDATE interactions SET kind=?, subject=?, body=?, occurred_at=? WHERE id = ?`)
+    .run(b.kind || i.kind, b.subject ?? i.subject, b.body ?? i.body,
+         b.occurredAt || i.occurred_at, req.params.id);
+  res.json(db.prepare('SELECT * FROM interactions WHERE id = ?').get(req.params.id));
 });
 
 app.delete('/api/interactions/:id', authRequired, verifyFirmMembership, (req, res) => {
@@ -4078,6 +4134,231 @@ app.get('/api/reports/cash-receipts', authRequired, verifyFirmMembership, requir
     billing_attorney_email: p.billing_attorney_email,
   }));
   res.json({ granularity, from, to, periods, rows, totals });
+});
+
+app.get('/api/reports/origination', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const rows = db.prepare(`
+    SELECT c.originating_attorney_email AS attorney_email,
+           c.origination_split_pct      AS split_pct,
+           c.id                         AS client_id,
+           c.full_name                  AS client_name,
+           c.client_number,
+           COALESCE(SUM(CASE WHEN i.status IS NOT NULL AND i.status != 'void' THEN i.total       ELSE 0 END), 0) AS fees_billed,
+           COALESCE(SUM(CASE WHEN i.status IS NOT NULL AND i.status != 'void' THEN i.amount_paid ELSE 0 END), 0) AS fees_collected
+    FROM contacts c
+    LEFT JOIN invoices i ON i.client_contact_id = c.id AND i.firm_id = c.firm_id
+    WHERE c.firm_id = ? AND c.originating_attorney_email IS NOT NULL AND c.originating_attorney_email != ''
+    GROUP BY c.id
+    ORDER BY c.originating_attorney_email, fees_billed DESC
+  `).all(req.user.firmId);
+
+  const attorneyMap = new Map();
+  for (const row of rows) {
+    const email = row.attorney_email;
+    if (!attorneyMap.has(email)) attorneyMap.set(email, { email, total_billed: 0, total_share: 0, clients: [] });
+    const a = attorneyMap.get(email);
+    const splitPct = Number(row.split_pct || 0);
+    const billed   = Number(row.fees_billed   || 0);
+    const share    = +(billed * splitPct / 100).toFixed(2);
+    a.total_billed = +(a.total_billed + billed).toFixed(2);
+    a.total_share  = +(a.total_share  + share).toFixed(2);
+    a.clients.push({
+      client_id:      row.client_id,
+      client_name:    row.client_name,
+      client_number:  row.client_number,
+      split_pct:      splitPct,
+      fees_billed:    +billed.toFixed(2),
+      fees_collected: +Number(row.fees_collected || 0).toFixed(2),
+      share,
+    });
+  }
+  res.json({ attorneys: [...attorneyMap.values()] });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// BANK RECONCILIATION
+// Mercury auto-sync + OFX/QFX file import, shared reconciliation table
+// ═══════════════════════════════════════════════════════════════════════
+
+const timedFetch = async (url, init = {}, ms = 15000) => {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try { return await fetch(url, { ...init, signal: ctrl.signal }); }
+  finally { clearTimeout(t); }
+};
+
+// Sync transactions from Mercury for both configured accounts
+app.post('/api/bank/sync', authRequired, verifyFirmMembership, requireCap('manageBilling'), async (req, res) => {
+  if (!paymentsEnabled) return res.status(503).json({ error: 'PAYMENTS_KEK not configured' });
+  const cfg = readPaymentConfig(req.user.firmId);
+  const token = cfg ? decryptSecret(cfg.mercury_token) : null;
+  if (!token) return res.status(400).json({ error: 'Mercury token not configured' });
+
+  const accounts = [];
+  if (cfg.mercury_operating_account_id) accounts.push({ id: cfg.mercury_operating_account_id, role: 'operating' });
+  if (cfg.mercury_trust_account_id)     accounts.push({ id: cfg.mercury_trust_account_id,     role: 'trust' });
+  if (!accounts.length) return res.status(400).json({ error: 'No Mercury account IDs configured' });
+
+  const firmId = req.user.firmId;
+  const syncState = db.prepare('SELECT last_synced_at FROM mercury_sync_state WHERE firm_id = ?').get(firmId);
+  // Fetch from last sync date, or 90 days back on first run
+  const since = syncState?.last_synced_at
+    ? syncState.last_synced_at.slice(0, 10)
+    : new Date(Date.now() - 90 * 86400e3).toISOString().slice(0, 10);
+
+  const upsert = db.prepare(`
+    INSERT INTO bank_transactions
+      (id, firm_id, account_id, account_role, amount, posted_at, counterparty, memo, raw_json, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'mercury')
+    ON CONFLICT(id) DO UPDATE SET
+      amount       = excluded.amount,
+      posted_at    = excluded.posted_at,
+      counterparty = excluded.counterparty,
+      memo         = excluded.memo,
+      raw_json     = excluded.raw_json,
+      fetched_at   = datetime('now')
+  `);
+
+  let totalFetched = 0;
+  try {
+    for (const acct of accounts) {
+      let offset = 0;
+      const limit = 500;
+      while (true) {
+        const url = `https://api.mercury.com/api/v1/account/${acct.id}/transactions` +
+          `?limit=${limit}&offset=${offset}&status=sent&start=${since}`;
+        const r = await timedFetch(url, {
+          headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          return res.status(502).json({ error: 'Mercury API error: ' + (j.message || j.error || `HTTP ${r.status}`) });
+        }
+        const j = await r.json();
+        const txns = Array.isArray(j.transactions) ? j.transactions : [];
+        db.transaction(() => {
+          for (const t of txns) {
+            upsert.run(
+              t.id, firmId, acct.id, acct.role,
+              Number(t.amount || 0),
+              t.postedAt || t.createdAt || null,
+              t.counterpartyName || (t.counterparty && t.counterparty.name) || null,
+              t.note || t.bankDescription || null,
+              JSON.stringify(t),
+            );
+          }
+        })();
+        totalFetched += txns.length;
+        if (txns.length < limit) break;
+        offset += limit;
+      }
+    }
+  } catch (e) {
+    return res.status(502).json({ error: 'Mercury sync failed: ' + e.message });
+  }
+
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO mercury_sync_state (firm_id, last_synced_at) VALUES (?, ?)
+              ON CONFLICT(firm_id) DO UPDATE SET last_synced_at = excluded.last_synced_at`)
+    .run(firmId, now);
+
+  res.json({ ok: true, fetched: totalFetched, syncedAt: now });
+});
+
+// List bank transactions (reconciled + unreconciled)
+app.get('/api/bank/transactions', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const firmId = req.user.firmId;
+  const { unreconciled, accountRole, from, to } = req.query;
+  let sql = `
+    SELECT bt.*,
+           ip.invoice_id    AS payment_invoice_id,
+           ip.amount        AS payment_amount,
+           ip.method        AS payment_method,
+           i.number         AS invoice_number,
+           i.client_name
+    FROM bank_transactions bt
+    LEFT JOIN invoice_payments ip ON ip.id  = bt.reconciled_payment_id
+    LEFT JOIN invoices         i  ON i.id   = ip.invoice_id
+    WHERE bt.firm_id = ?
+  `;
+  const params = [firmId];
+  if (unreconciled === '1') { sql += ' AND bt.reconciled_payment_id IS NULL'; }
+  if (accountRole) { sql += ' AND bt.account_role = ?'; params.push(accountRole); }
+  if (from) { sql += ' AND bt.posted_at >= ?'; params.push(from); }
+  if (to)   { sql += ' AND bt.posted_at <= ?'; params.push(to + 'T23:59:59'); }
+  sql += ' ORDER BY bt.posted_at DESC LIMIT 500';
+
+  const syncState = db.prepare('SELECT last_synced_at FROM mercury_sync_state WHERE firm_id = ?').get(firmId);
+  res.json({
+    transactions: db.prepare(sql).all(...params),
+    lastSyncedAt: syncState?.last_synced_at || null,
+  });
+});
+
+// Invoice payments not yet matched to any bank transaction
+app.get('/api/bank/unreconciled-payments', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const payments = db.prepare(`
+    SELECT ip.id, ip.invoice_id, ip.amount, ip.method, ip.occurred_at, ip.destination,
+           ip.reference, ip.notes,
+           i.number AS invoice_number, i.client_name, i.matter_id,
+           m.name   AS matter_name
+    FROM invoice_payments ip
+    LEFT JOIN invoices i ON i.id = ip.invoice_id
+    LEFT JOIN matters  m ON m.id = i.matter_id
+    WHERE ip.firm_id = ? AND ip.status = 'succeeded'
+      AND NOT EXISTS (
+        SELECT 1 FROM bank_transactions bt
+        WHERE bt.reconciled_payment_id = ip.id AND bt.firm_id = ip.firm_id
+      )
+    ORDER BY ip.occurred_at DESC
+    LIMIT 300
+  `).all(req.user.firmId);
+  res.json(payments);
+});
+
+// Import OFX/QFX rows parsed client-side
+app.post('/api/bank/import', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const { transactions, accountRole } = req.body;
+  if (!Array.isArray(transactions)) return res.status(400).json({ error: 'transactions must be an array' });
+  const role = ['operating', 'trust'].includes(accountRole) ? accountRole : 'operating';
+  const firmId = req.user.firmId;
+  const upsert = db.prepare(`
+    INSERT INTO bank_transactions
+      (id, firm_id, account_id, account_role, amount, posted_at, counterparty, memo, source)
+    VALUES (?, ?, 'ofx', ?, ?, ?, ?, ?, 'ofx')
+    ON CONFLICT(id) DO NOTHING
+  `);
+  let inserted = 0;
+  db.transaction(() => {
+    for (const t of transactions) {
+      if (!t.id) continue;
+      const r = upsert.run(t.id, firmId, role, Number(t.amount || 0), t.posted_at || null, t.counterparty || null, t.memo || null);
+      inserted += r.changes;
+    }
+  })();
+  res.json({ ok: true, inserted, total: transactions.length });
+});
+
+// Link a bank transaction to an invoice payment
+app.patch('/api/bank/transactions/:id/reconcile', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const { paymentId } = req.body;
+  if (!paymentId) return res.status(400).json({ error: 'paymentId required' });
+  const tx = db.prepare('SELECT id FROM bank_transactions WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  if (!tx) return res.status(404).json({ error: 'Transaction not found' });
+  const pmt = db.prepare('SELECT id FROM invoice_payments WHERE id = ? AND firm_id = ?').get(paymentId, req.user.firmId);
+  if (!pmt) return res.status(404).json({ error: 'Payment not found' });
+  db.prepare('UPDATE bank_transactions SET reconciled_payment_id = ? WHERE id = ? AND firm_id = ?')
+    .run(paymentId, req.params.id, req.user.firmId);
+  res.json({ ok: true });
+});
+
+// Clear a reconciliation link
+app.patch('/api/bank/transactions/:id/unreconcile', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const tx = db.prepare('SELECT id FROM bank_transactions WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  if (!tx) return res.status(404).json({ error: 'Transaction not found' });
+  db.prepare('UPDATE bank_transactions SET reconciled_payment_id = NULL WHERE id = ? AND firm_id = ?')
+    .run(req.params.id, req.user.firmId);
+  res.json({ ok: true });
 });
 
 // ═══════════════════════════════════════════════════════════════════════
