@@ -1302,6 +1302,7 @@ async function onGlobalSearch(e) {
 
 async function logout() {
   await api('/api/auth/logout', { method: 'POST' });
+  try { localStorage.removeItem(TIMER_CACHE_KEY); } catch {}
   window.location.href = '/';
 }
 
@@ -1392,9 +1393,41 @@ async function renderDashboard(mount, v) {
         ])))
   ]);
 
+  // "My open tasks" widget — only for users who can be assigned tasks
+  let myTasksEl = null;
+  if (can('editContacts')) {
+    const myTasks = await api('/api/tasks/mine').catch(() => []);
+    const overdue = dt => dt && new Date(dt + 'T00:00:00') < new Date() && new Date(dt + 'T00:00:00').toDateString() !== new Date().toDateString();
+    myTasksEl = el('div', { class: 'card mb-24' }, [
+      el('h3', {}, 'My open tasks'),
+      myTasks.length === 0 ? el('div', { class: 'empty' }, 'No open tasks assigned to you.') :
+        el('div', {}, myTasks.map(t => el('div', {
+          class: 'row',
+          style: 'padding:6px 0;border-bottom:1px solid var(--border);cursor:pointer;gap:10px',
+          onclick: async () => {
+            const matters = state.matters || await api('/api/matters');
+            const m = matters.find(x => x.id === t.matter_id);
+            if (m) openMatterForm(m);
+          },
+        }, [
+          el('div', { style: 'flex:1' }, [
+            el('div', { style: 'font-weight:500' }, t.description),
+            el('div', { style: 'font-size:11px;color:var(--text-muted)' }, [
+              t.matter_name || t.matter_id,
+              t.client_name ? ' · ' + t.client_name : '',
+            ]),
+          ]),
+          t.due_date
+            ? el('div', { style: 'font-size:12px;font-weight:600;white-space:nowrap;color:' + (overdue(t.due_date) ? 'var(--red)' : 'var(--text-muted)') }, fmt.date(t.due_date))
+            : null,
+        ]))),
+    ]);
+  }
+
   mount.innerHTML = '';
   mount.appendChild(grid);
   mount.appendChild(el('div', { class: 'grid grid-2 mb-24' }, [overdueEl, weekEl]));
+  if (myTasksEl) mount.appendChild(myTasksEl);
   mount.appendChild(recentEl);
 }
 
@@ -1582,7 +1615,7 @@ function headerSelectCell(visibleIds, selection, onChange) {
 }
 
 // Floating action bar shown above a table when ≥1 row is selected.
-function selectionToolbar({ count, label, onDelete, onExport, onClear, deleteLabel }) {
+function selectionToolbar({ count, label, onDelete, onExport, onClear, deleteLabel, extraActions }) {
   if (count === 0) return null;
   return el('div', {
     class: 'selection-toolbar',
@@ -1592,6 +1625,7 @@ function selectionToolbar({ count, label, onDelete, onExport, onClear, deleteLab
     el('strong', {}, count + ' ' + (label || 'item') + (count === 1 ? '' : 's') + ' selected'),
     el('div', { class: 'spacer', style: 'flex:1' }),
     onExport ? el('button', { class: 'btn btn-ghost btn-sm', onclick: onExport }, 'Export CSV') : null,
+    ...(extraActions || []).map(a => el('button', { class: 'btn btn-ghost btn-sm', onclick: a.onclick }, a.label)),
     onDelete ? el('button', { class: 'btn btn-danger btn-sm', onclick: onDelete }, deleteLabel || 'Delete') : null,
     el('button', { class: 'btn btn-ghost btn-sm', onclick: onClear }, 'Clear'),
   ]);
@@ -2205,7 +2239,12 @@ async function openContact(id) {
 
   const right = el('div', {}, [
     el('h3', { style: 'font-size:13px;font-weight:700;color:var(--navy);margin-bottom:10px' }, 'Activity'),
-    el('button', { class: 'btn btn-ghost btn-sm mb-16', onclick: () => openInteractionForm(contact.id) }, '+ Log interaction'),
+    el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px' }, [
+      el('button', { class: 'btn btn-ghost btn-sm', onclick: () => openInteractionForm(contact.id) }, '+ Log interaction'),
+      (contact.email && can('editContacts') && state.firm.smtpConfigured)
+        ? el('button', { class: 'btn btn-ghost btn-sm', onclick: () => openEmailCompose(contact.id, contact) }, '✉ Send email')
+        : null,
+    ]),
     (interactions.length === 0) ? el('div', { class: 'empty' }, 'No interactions logged yet.') :
       el('div', { class: 'timeline' }, interactions.map(i => el('div', { class: 'timeline-item' }, [
         el('div', { class: 'ti-head', style: 'display:flex;align-items:flex-start;gap:6px' }, [
@@ -2413,6 +2452,57 @@ async function openInteractionForm(contactId, existing) {
     el('button', { class: 'btn btn-primary btn-sm', onclick: save }, isNew ? 'Log' : 'Save'),
   ]);
   openModal(isNew ? 'Log interaction' : 'Edit interaction', body, footer);
+}
+
+function openEmailCompose(contactId, contact) {
+  const formBody = el('div', {}, [
+    el('div', { class: 'field' }, [
+      el('label', {}, 'To'),
+      el('input', { id: 'compose-to', type: 'email', value: contact.email || '', placeholder: 'recipient@example.com' }),
+    ]),
+    el('div', { class: 'field' }, [
+      el('label', {}, 'CC'),
+      el('input', { id: 'compose-cc', type: 'email', placeholder: 'optional' }),
+    ]),
+    el('div', { class: 'field' }, [
+      el('label', {}, 'Subject'),
+      el('input', { id: 'compose-subject', placeholder: 'Subject' }),
+    ]),
+    el('div', { class: 'field' }, [
+      el('label', {}, 'Message'),
+      el('textarea', { id: 'compose-body', style: 'min-height:180px;width:100%', placeholder: 'Write your message…' }),
+    ]),
+    el('div', { style: 'font-size:11px;color:var(--text-muted);margin-top:4px' },
+      'Email will be sent from your firm address. A copy is automatically logged as an interaction.'),
+  ]);
+
+  const footer = el('div', {}, [
+    el('button', { class: 'btn btn-ghost btn-sm', onclick: closeModal }, 'Cancel'),
+    el('div', { class: 'spacer' }),
+    el('button', { class: 'btn btn-primary btn-sm', id: 'compose-send-btn', onclick: async () => {
+      const btn = $('#compose-send-btn');
+      const to      = $('#compose-to').value.trim();
+      const cc      = $('#compose-cc').value.trim();
+      const subject = $('#compose-subject').value.trim();
+      const body    = $('#compose-body').value.trim();
+      if (!to || !subject || !body) return toast('To, subject, and message are required', true);
+      btn.disabled = true; btn.textContent = 'Sending…';
+      try {
+        await api('/api/contacts/' + contactId + '/email', {
+          method: 'POST',
+          body: { to, cc: cc || undefined, subject, body },
+        });
+        toast('Email sent and logged');
+        closeModal();
+        openContact(contactId);
+      } catch (err) {
+        btn.disabled = false; btn.textContent = 'Send';
+        toast(err.message || 'Failed to send', true);
+      }
+    }}, 'Send'),
+  ]);
+
+  openModal('Send email — ' + (contact.full_name || 'Contact'), formBody, footer);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -3447,13 +3537,19 @@ async function openMatterForm(existing) {
     ]),
     el('div', { class: 'field' }, [ el('label', {}, 'Description'), el('textarea', { name: 'description' }, m.description || '') ]),
     !isNew && can('manageBilling') ? el('div', { id: 'matter-billing-wrap' }) : null,
+    !isNew && can('manageBilling') ? el('div', { id: 'matter-recurring-wrap' }) : null,
     !isNew && can('viewRates') ? el('div', { id: 'matter-rates-wrap' }) : null,
     !isNew && can('manageBilling') ? el('div', { id: 'matter-invoices-wrap' }) : null,
+    !isNew ? el('div', { id: 'matter-tasks-wrap' }) : null,
+    !isNew ? el('div', { id: 'matter-docs-wrap' }) : null,
   ]);
 
   if (!isNew && can('manageBilling')) renderMatterBillingSummary(body.querySelector('#matter-billing-wrap'), m);
+  if (!isNew && can('manageBilling')) renderMatterRecurring(body.querySelector('#matter-recurring-wrap'), m);
   if (!isNew && can('viewRates')) renderMatterRates(body.querySelector('#matter-rates-wrap'), m);
   if (!isNew && can('manageBilling')) renderMatterInvoices(body.querySelector('#matter-invoices-wrap'), m);
+  if (!isNew) renderMatterTasks(body.querySelector('#matter-tasks-wrap'), m);
+  if (!isNew) renderMatterDocuments(body.querySelector('#matter-docs-wrap'), m);
 
   const save = async () => {
     const d = {};
@@ -3584,6 +3680,259 @@ async function renderMatterInvoices(wrap, matter) {
         el('td', {}, el('button', { class: 'btn btn-ghost btn-sm', onclick: () => openInvoiceDetail(i.id) }, 'View')),
       ]);
     })),
+  ]));
+}
+
+function renderMatterRecurring(wrap, matter) {
+  wrap.innerHTML = '';
+  let sched = {};
+  try { sched = matter.billing_schedule ? JSON.parse(matter.billing_schedule) : {}; } catch { sched = {}; }
+  const isActive = !!sched.active;
+  const today = new Date().toISOString().slice(0, 10);
+  const defaultDesc = `Recurring fee — ${matter.name || 'this matter'}`;
+  const trustMin = Number(matter.trust_min_balance || 0);
+  const trustTo  = matter.trust_replenish_to != null ? Number(matter.trust_replenish_to) : '';
+
+  const card = el('div', { class: 'card mb-24' }, [
+    el('h3', { style: 'font-size:13px;font-weight:700;color:var(--navy);margin-top:8px' }, 'Recurring billing'),
+    el('div', { style: 'font-size:12px;color:var(--text-muted);margin-bottom:12px' },
+      'Generate a flat-fee invoice automatically on a schedule. Time entries on this matter still bill normally — recurring fees are separate.'),
+
+    el('div', { class: 'checkbox-row', style: 'margin-bottom:12px' }, [
+      el('input', { type: 'checkbox', id: 'rec-active', ...(isActive ? { checked: 'checked' } : {}) }),
+      el('label', { for: 'rec-active' }, 'Active'),
+    ]),
+    el('div', { class: 'form-row' }, [
+      el('div', { class: 'field' }, [
+        el('label', {}, 'Frequency'),
+        el('select', { id: 'rec-kind' }, [
+          el('option', { value: 'monthly',   ...(sched.kind === 'monthly'   || !sched.kind ? { selected: 'selected' } : {}) }, 'Monthly'),
+          el('option', { value: 'quarterly', ...(sched.kind === 'quarterly' ? { selected: 'selected' } : {}) }, 'Quarterly'),
+        ]),
+      ]),
+      el('div', { class: 'field' }, [
+        el('label', {}, 'Day of period (1–28)'),
+        el('input', { id: 'rec-day', type: 'number', min: '1', max: '28', value: sched.day_of_period || 1 }),
+      ]),
+      el('div', { class: 'field' }, [
+        el('label', {}, 'Amount ($)'),
+        el('input', { id: 'rec-amt', type: 'number', step: '0.01', min: '0', value: sched.amount || '' }),
+      ]),
+      el('div', { class: 'field' }, [
+        el('label', {}, 'Next run'),
+        el('input', { id: 'rec-next', type: 'date', value: sched.next_run_at || today }),
+      ]),
+    ]),
+    el('div', { class: 'field' }, [
+      el('label', {}, 'Invoice line description'),
+      el('input', { id: 'rec-desc', value: sched.description || defaultDesc }),
+    ]),
+
+    el('h4', { style: 'font-size:12px;font-weight:700;color:var(--navy);margin:18px 0 4px;text-transform:uppercase;letter-spacing:.04em' }, 'Trust replenishment'),
+    el('div', { style: 'font-size:12px;color:var(--text-muted);margin-bottom:10px' },
+      'When the trust balance for this matter falls below the floor, generate an invoice for the shortfall. Set floor to 0 to disable.'),
+    el('div', { class: 'form-row' }, [
+      el('div', { class: 'field' }, [
+        el('label', {}, 'Floor ($)'),
+        el('input', { id: 'rec-trust-min', type: 'number', step: '0.01', min: '0', value: trustMin || '' }),
+      ]),
+      el('div', { class: 'field' }, [
+        el('label', {}, 'Replenish to ($)'),
+        el('input', { id: 'rec-trust-to', type: 'number', step: '0.01', min: '0', placeholder: 'Same as floor', value: trustTo }),
+      ]),
+    ]),
+
+    el('div', { style: 'display:flex;gap:8px;margin-top:12px' }, [
+      el('button', { class: 'btn btn-primary btn-sm', onclick: async () => {
+        const active = $('#rec-active', wrap).checked;
+        const kind   = $('#rec-kind', wrap).value;
+        const day    = Math.max(1, Math.min(28, parseInt($('#rec-day', wrap).value, 10) || 1));
+        const amt    = parseFloat($('#rec-amt', wrap).value) || 0;
+        const next   = $('#rec-next', wrap).value || today;
+        const desc   = $('#rec-desc', wrap).value.trim() || defaultDesc;
+        const tMin   = parseFloat($('#rec-trust-min', wrap).value) || 0;
+        const tToRaw = $('#rec-trust-to', wrap).value;
+        const tTo    = tToRaw === '' ? null : (parseFloat(tToRaw) || 0);
+        if (active && amt <= 0) return toast('Amount must be > 0 when active', true);
+        const body = {
+          billingSchedule: (active || amt > 0) ? { active, kind, day_of_period: day, amount: amt, next_run_at: next, description: desc } : null,
+          trustMinBalance: tMin,
+          trustReplenishTo: tTo,
+        };
+        try {
+          const updated = await api('/api/matters/' + matter.id, { method: 'PUT', body });
+          Object.assign(matter, updated);
+          toast('Saved');
+          renderMatterRecurring(wrap, matter);
+        } catch(e) { /* api() already toasted */ }
+      } }, 'Save'),
+      el('button', { class: 'btn btn-ghost btn-sm', onclick: async () => {
+        if (!confirm('Generate any due recurring or replenishment invoices for this matter now?')) return;
+        try {
+          const r = await api('/api/matters/' + matter.id + '/billing-schedule/run-now', { method: 'POST' });
+          const parts = [];
+          if (r.generated)   parts.push('Invoice ' + (r.generated.number || '') + ' created');
+          if (r.replenished) parts.push('Replenishment ' + (r.replenished.number || '') + ' created');
+          toast(parts.length ? parts.join(' · ') : 'Nothing due');
+          // Re-render with the advanced next_run_at by issuing a no-op PUT — the
+          // route's response includes the latest matter row.
+          const fresh = await api('/api/matters/' + matter.id, { method: 'PUT', body: {} }).catch(() => null);
+          if (fresh) { Object.assign(matter, fresh); renderMatterRecurring(wrap, matter); }
+        } catch(e) { /* api() already toasted */ }
+      } }, 'Run now'),
+    ]),
+  ]);
+  wrap.appendChild(card);
+}
+
+async function renderMatterTasks(wrap, matter) {
+  const reload = () => renderMatterTasks(wrap, matter);
+  let tasks, users;
+  try {
+    [tasks, users] = await Promise.all([
+      api('/api/matters/' + matter.id + '/tasks'),
+      (state._users ||= (await api('/api/seats')).users) && Promise.resolve(state._users),
+    ]);
+  } catch {
+    wrap.innerHTML = '';
+    wrap.appendChild(el('div', { class: 'empty', style: 'padding:8px 0' }, 'Could not load tasks.'));
+    return;
+  }
+
+  wrap.innerHTML = '';
+  wrap.appendChild(el('h3', { style: 'font-size:13px;font-weight:700;color:var(--navy);margin-top:16px' }, 'Tasks'));
+
+  // ── Add task form ──
+  const descIn   = el('input', { placeholder: 'Task description', style: 'flex:1;min-width:160px' });
+  const dueIn    = el('input', { type: 'date', style: 'width:140px' });
+  const assignIn = el('select', { style: 'width:160px' }, [
+    el('option', { value: '' }, '— Unassigned —'),
+    ...(users || []).map(u => el('option', { value: u.email }, u.name || u.email)),
+  ]);
+  const addBtn = el('button', { class: 'btn btn-ghost btn-sm', onclick: async () => {
+    const description = descIn.value.trim();
+    if (!description) return toast('Description required', true);
+    addBtn.disabled = true;
+    try {
+      await api('/api/matters/' + matter.id + '/tasks', {
+        method: 'POST',
+        body: { description, dueDate: dueIn.value || undefined, assignedTo: assignIn.value || undefined },
+      });
+      reload();
+    } catch (e) { toast(e.message || 'Failed', true); addBtn.disabled = false; }
+  }}, '+ Add');
+
+  wrap.appendChild(el('div', { style: 'display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px' }, [
+    descIn, dueIn, assignIn, addBtn,
+  ]));
+
+  if (!tasks.length) {
+    wrap.appendChild(el('div', { class: 'empty', style: 'padding:6px 0' }, 'No tasks yet.'));
+    return;
+  }
+
+  const overdue = d => d && new Date(d + 'T00:00:00') < new Date() && new Date(d + 'T00:00:00').toDateString() !== new Date().toDateString();
+
+  wrap.appendChild(el('div', {}, tasks.map(t => {
+    const isDone = t.status === 'done';
+    const isOver = !isDone && overdue(t.due_date);
+    return el('div', {
+      style: 'display:flex;gap:8px;align-items:flex-start;padding:7px 0;border-top:1px solid var(--border);'
+           + (isDone ? 'opacity:0.5' : ''),
+    }, [
+      el('input', { type: 'checkbox', checked: isDone ? 'checked' : undefined,
+        style: 'margin-top:3px;flex-shrink:0;cursor:pointer',
+        onchange: async (e) => {
+          e.target.disabled = true;
+          await api('/api/matters/' + matter.id + '/tasks/' + t.id, {
+            method: 'PATCH', body: { status: e.target.checked ? 'done' : 'open' },
+          }).catch(() => {});
+          reload();
+        },
+      }),
+      el('div', { style: 'flex:1;min-width:0' }, [
+        el('div', { style: 'font-weight:500' }, t.description),
+        el('div', { style: 'font-size:11px;color:' + (isOver ? 'var(--red)' : 'var(--text-muted)') }, [
+          t.due_date ? ('Due ' + fmt.date(t.due_date)) : 'No due date',
+          t.assigned_to ? ' · ' + (t.assigned_to) : '',
+        ]),
+      ]),
+      el('button', { class: 'btn btn-ghost btn-sm', style: 'color:var(--text-muted);padding:0 4px;font-size:12px', onclick: async () => {
+        if (!confirm('Delete this task?')) return;
+        await api('/api/matters/' + matter.id + '/tasks/' + t.id, { method: 'DELETE' }).catch(() => {});
+        reload();
+      }}, '✕'),
+    ]);
+  })));
+}
+
+async function renderMatterDocuments(wrap, matter) {
+  const fmtBytes = n => n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.ceil(n / 1024) + ' KB';
+  const reload = () => renderMatterDocuments(wrap, matter);
+
+  let docs;
+  try { docs = await api('/api/matters/' + matter.id + '/documents'); }
+  catch { wrap.innerHTML = ''; wrap.appendChild(el('div', { class: 'empty', style: 'padding:8px 0' }, 'Could not load documents.')); return; }
+
+  wrap.innerHTML = '';
+  wrap.appendChild(el('h3', { style: 'font-size:13px;font-weight:700;color:var(--navy);margin-top:16px' }, 'Documents'));
+
+  const fileInput = el('input', { type: 'file', style: 'display:none', id: 'matter-doc-input',
+    accept: '.pdf,.doc,.docx,.xls,.xlsx,.txt,.jpg,.jpeg,.png,.gif,.webp',
+    onchange: async () => {
+      const file = fileInput.files[0];
+      if (!file) return;
+      if (file.size > 10 * 1024 * 1024) return toast('File too large (max 10 MB)', true);
+      const reader = new FileReader();
+      reader.onload = async () => {
+        const dataBase64 = reader.result.split(',')[1];
+        try {
+          await api('/api/matters/' + matter.id + '/documents', {
+            method: 'POST',
+            body: { filename: file.name, mimeType: file.type, dataBase64 },
+          });
+          toast('Uploaded');
+          reload();
+        } catch (e) { toast(e.message || 'Upload failed', true); }
+      };
+      reader.readAsDataURL(file);
+    },
+  });
+
+  wrap.appendChild(el('div', { style: 'display:flex;align-items:center;gap:8px;margin-bottom:8px' }, [
+    fileInput,
+    el('button', { class: 'btn btn-ghost btn-sm', onclick: () => fileInput.click() }, '+ Attach file'),
+    el('div', { style: 'font-size:11px;color:var(--text-muted)' }, 'PDF, Word, Excel, plain text, images — max 10 MB'),
+  ]));
+
+  if (!docs.length) {
+    wrap.appendChild(el('div', { class: 'empty', style: 'padding:6px 0' }, 'No documents attached yet.'));
+    return;
+  }
+
+  wrap.appendChild(el('table', { class: 'data' }, [
+    el('thead', {}, el('tr', {}, [
+      el('th', {}, 'Filename'), el('th', {}, 'Size'), el('th', {}, 'Uploaded by'), el('th', {}, 'Date'), el('th', {}, ''),
+    ])),
+    el('tbody', {}, docs.map(doc => el('tr', {}, [
+      el('td', {}, el('a', {
+        href: '/api/matters/' + matter.id + '/documents/' + doc.id,
+        target: '_blank',
+        rel: 'noopener',
+        style: 'color:var(--accent)',
+      }, doc.filename)),
+      el('td', {}, fmtBytes(doc.size)),
+      el('td', {}, doc.uploaded_by),
+      el('td', {}, fmt.date(doc.created_at)),
+      el('td', {}, el('button', { class: 'btn btn-ghost btn-sm', style: 'color:var(--danger)', onclick: async () => {
+        if (!confirm('Delete "' + doc.filename + '"?')) return;
+        try {
+          await api('/api/matters/' + matter.id + '/documents/' + doc.id, { method: 'DELETE' });
+          toast('Deleted');
+          reload();
+        } catch (e) { toast(e.message || 'Delete failed', true); }
+      }}, 'Delete')),
+    ]))),
   ]));
 }
 
@@ -4872,6 +5221,7 @@ function openTimeForm(existing, matters, defaults = {}) {
     if (defaults.fromTimerId) {
       try { await api('/api/timers/' + defaults.fromTimerId, { method: 'DELETE' }); } catch {}
       removeTimerLocal(defaults.fromTimerId);
+      saveTimerCache();
       renderTimerWidget();
       notifyTimerChange();
     }
@@ -4888,14 +5238,54 @@ function openTimeForm(existing, matters, defaults = {}) {
 // ─────────────────────────────────────────────────────────────────────────
 // TIMER WIDGET (persistent topbar) — multi-timer
 // ─────────────────────────────────────────────────────────────────────────
-const Timer = { list: [], interval: null, subs: new Set() };
+const Timer = { list: [], interval: null, subs: new Set(), fromCache: false };
+const TIMER_CACHE_KEY = 'crm_timers_cache_v1';
 
 function timerById(id) { return Timer.list.find(x => String(x.id) === String(id)); }
 function notifyTimerChange() { Timer.subs.forEach(fn => { try { fn(); } catch(e) {} }); }
 function onTimerChange(fn) { Timer.subs.add(fn); return () => Timer.subs.delete(fn); }
 
+// Snapshot the in-memory timer list to localStorage after every successful
+// server interaction. If the server is briefly unreachable on a page reload,
+// initTimer() falls back to this cache and advances running clocks by the
+// elapsed wall-clock since cachedAt — so a refresh during a deploy doesn't
+// "lose" the running timer.
+function saveTimerCache() {
+  try {
+    localStorage.setItem(TIMER_CACHE_KEY, JSON.stringify({
+      cachedAt: Date.now(),
+      list: Timer.list.map(t => ({ ...t })),
+    }));
+  } catch(e) { /* quota, private mode, etc. — best effort */ }
+}
+function loadTimerCache() {
+  try {
+    const raw = localStorage.getItem(TIMER_CACHE_KEY);
+    if (!raw) return null;
+    const snap = JSON.parse(raw);
+    if (!snap || !Array.isArray(snap.list)) return null;
+    const driftSec = Math.max(0, Math.floor((Date.now() - (snap.cachedAt || 0)) / 1000));
+    return snap.list.map(t => t.running
+      ? { ...t, elapsedSeconds: (t.elapsedSeconds || 0) + driftSec }
+      : t);
+  } catch(e) { return null; }
+}
+
 async function initTimer() {
-  try { Timer.list = await api('/api/timers') || []; } catch(e) { Timer.list = []; }
+  Timer.fromCache = false;
+  try {
+    Timer.list = await api('/api/timers') || [];
+    saveTimerCache();
+  } catch(e) {
+    const cached = loadTimerCache();
+    if (cached && cached.length) {
+      Timer.list = cached;
+      Timer.fromCache = true;
+      toast('Showing cached timers — reconnecting…', true);
+    } else {
+      Timer.list = [];
+    }
+  }
   renderTimerWidget();
   notifyTimerChange();
   // Tick every 1s to update clocks; refetch from server every 30s for drift correction.
@@ -4911,7 +5301,13 @@ async function initTimer() {
 }
 
 async function refreshTimer() {
-  try { Timer.list = await api('/api/timers') || []; renderTimerWidget(); notifyTimerChange(); } catch(e) {}
+  try {
+    Timer.list = await api('/api/timers') || [];
+    if (Timer.fromCache) { Timer.fromCache = false; toast('Reconnected'); }
+    saveTimerCache();
+    renderTimerWidget();
+    notifyTimerChange();
+  } catch(e) { /* keep showing what we have — next tick will retry */ }
 }
 
 function fmtClock(sec) {
@@ -4996,7 +5392,7 @@ function removeTimerLocal(id) {
 
 async function pauseTimer(id) {
   const tj = await api('/api/timers/' + id + '/pause', { method: 'POST' });
-  upsertTimerLocal(tj); renderTimerWidget(); notifyTimerChange();
+  upsertTimerLocal(tj); saveTimerCache(); renderTimerWidget(); notifyTimerChange();
 }
 // Resume auto-pauses every other running timer server-side, so refetch the full
 // list to reflect the state of every pill.
@@ -5069,13 +5465,13 @@ async function openTimerEditModal(id) {
   const save = async () => {
     const { matterId } = picker.getValues();
     const tj = await api('/api/timers/' + id, { method: 'PATCH', body: { matterId, description: descInput.value } });
-    upsertTimerLocal(tj);
+    upsertTimerLocal(tj); saveTimerCache();
     toast('Updated'); closeModal(); renderTimerWidget(); notifyTimerChange();
   };
   const discard = async () => {
     if (!confirm('Discard timer without saving?')) return;
     await api('/api/timers/' + id, { method: 'DELETE' });
-    removeTimerLocal(id);
+    removeTimerLocal(id); saveTimerCache();
     toast('Discarded'); closeModal(); renderTimerWidget(); notifyTimerChange();
   };
   openModal('Edit timer', body, el('div', {}, [
@@ -5094,7 +5490,7 @@ async function openTimerStopModal(id) {
   if (t.running) {
     try {
       const tj = await api('/api/timers/' + id + '/pause', { method: 'POST' });
-      upsertTimerLocal(tj);
+      upsertTimerLocal(tj); saveTimerCache();
       renderTimerWidget();
     } catch {}
   }
@@ -5707,6 +6103,23 @@ async function renderInvoicesListPanel(mount, matters, view, persist) {
               r.errors.length > 0);
         navigate('invoices');
       } : null,
+      extraActions: (can('manageBilling') && state.firm.smtpConfigured) ? [
+        {
+          label: 'Send reminders',
+          onclick: async () => {
+            const picked = invoices.filter(inv => iv.selection.has(inv.id) && inv.status === 'sent');
+            if (!picked.length) return toast('No "sent" invoices in selection — reminders only go to sent invoices', true);
+            if (!confirm('Send payment reminders for ' + picked.length + ' invoice' + (picked.length === 1 ? '' : 's') + '?\n\nEach reminder will be logged as an interaction.')) return;
+            let sent = 0, failed = 0;
+            for (const inv of picked) {
+              try { await api('/api/invoices/' + inv.id + '/reminder', { method: 'POST' }); sent++; }
+              catch { failed++; }
+            }
+            iv.selection.clear(); refreshToolbar(); renderTable();
+            toast(sent + ' reminder' + (sent === 1 ? '' : 's') + ' sent' + (failed ? ' · ' + failed + ' failed' : ''), failed > 0);
+          },
+        },
+      ] : [],
     });
     if (tb) slot.appendChild(tb);
   };
@@ -6258,6 +6671,21 @@ async function openInvoiceDetail(id) {
     inv.status === 'draft' ? el('button', { class: 'btn btn-ghost btn-sm', onclick: () => openInvoiceEdit(id) }, 'Edit') : null,
     (can('manageBilling') && inv.status !== 'void' && balance > 0.005)
       ? el('button', { class: 'btn btn-ghost btn-sm', onclick: () => copyPayLinkForInvoice(id) }, 'Pay link')
+      : null,
+    (can('manageBilling') && inv.status === 'sent' && balance > 0.005 && state.firm.smtpConfigured && inv.client_contact_id)
+      ? el('button', { class: 'btn btn-ghost btn-sm', onclick: async (e) => {
+          const btn = e.currentTarget;
+          if (!confirm('Send a payment reminder to the client?\n\nA copy will be logged as an interaction.')) return;
+          btn.disabled = true; btn.textContent = 'Sending…';
+          try {
+            const r = await api('/api/invoices/' + id + '/reminder', { method: 'POST' });
+            toast('Reminder sent to ' + r.sentTo);
+            btn.disabled = false; btn.textContent = 'Send reminder';
+          } catch (err) {
+            toast(err.message || 'Failed to send reminder', true);
+            btn.disabled = false; btn.textContent = 'Send reminder';
+          }
+        }}, 'Send reminder')
       : null,
     el('a', { class: 'btn btn-gold btn-sm', href: '/api/invoices/' + id + '/pdf', target: '_blank' }, 'Download PDF'),
     el('button', { class: 'btn btn-primary btn-sm', onclick: closeModal }, 'Close'),
@@ -8140,6 +8568,143 @@ function renderSettingsFirm(mount) {
     }}, 'Find duplicates'),
     dupResultsSlot,
   ]));
+
+  if (can('manageFirm')) {
+    const backupsCard = el('div', { class: 'card mb-24' }, [
+      el('h3', {}, 'Backups'),
+      el('div', { style: 'font-size:12px;color:var(--text-muted);margin-bottom:12px' },
+        'Nightly snapshots of the CRM database. The most recent ' + 14 + ' are retained on disk. Download a copy before a risky deploy.'),
+      el('div', { id: 'backups-meta', style: 'font-size:12px;color:var(--text-muted);margin-bottom:12px' }, 'Loading…'),
+      el('div', { style: 'display:flex;gap:8px;margin-bottom:12px' }, [
+        el('button', { class: 'btn btn-primary btn-sm', id: 'backup-now-btn', onclick: async () => {
+          const btn = $('#backup-now-btn'); btn.disabled = true; btn.textContent = 'Backing up…';
+          try { await api('/api/admin/backups/run', { method: 'POST' }); toast('Backup created'); await refreshBackups(); }
+          catch(e) { toast('Backup failed: ' + (e.message || 'unknown'), true); }
+          finally { btn.disabled = false; btn.textContent = 'Backup now'; }
+        } }, 'Backup now'),
+        el('button', { class: 'btn btn-ghost btn-sm', onclick: () => refreshBackups() }, 'Refresh'),
+      ]),
+      el('div', { id: 'backups-list' }),
+    ]);
+    mount.appendChild(backupsCard);
+
+    async function refreshBackups() {
+      const data = await api('/api/admin/backups').catch(() => null);
+      const meta = $('#backups-meta');
+      const list = $('#backups-list');
+      if (!meta || !list) return;
+      if (!data) { meta.textContent = 'Could not load backups.'; return; }
+      const fmt = (iso) => iso ? new Date(iso).toLocaleString() : '—';
+      meta.textContent = 'Last successful backup: ' + fmt(data.lastSuccessAt)
+        + (data.lastError ? '  ·  Last error: ' + data.lastError : '');
+      list.innerHTML = '';
+      if (!data.backups.length) {
+        list.appendChild(el('div', { style: 'font-size:13px;color:var(--text-muted)' }, 'No backups yet. The first will run automatically within an hour, or click "Backup now".'));
+        return;
+      }
+      const table = el('table', { class: 'data', style: 'width:100%;font-size:13px' }, [
+        el('thead', {}, el('tr', {}, [
+          el('th', { style: 'text-align:left' }, 'File'),
+          el('th', { style: 'text-align:right' }, 'Size'),
+          el('th', { style: 'text-align:left' }, 'Created'),
+          el('th', {}, ''),
+        ])),
+        el('tbody', {}, data.backups.map(b => el('tr', {}, [
+          el('td', { style: 'font-family:monospace;font-size:12px' }, b.filename),
+          el('td', { style: 'text-align:right' }, (b.size / 1024 / 1024).toFixed(2) + ' MB'),
+          el('td', {}, fmt(b.createdAt)),
+          el('td', { style: 'text-align:right' }, [
+            el('a', { href: '/api/admin/backups/' + encodeURIComponent(b.filename) + '/download',
+                      class: 'btn btn-ghost btn-sm', style: 'margin-right:6px' }, 'Download'),
+            el('button', { class: 'btn btn-ghost btn-sm', style: 'color:var(--red,#dc2626)', onclick: async () => {
+              if (!confirm('Delete backup ' + b.filename + '?')) return;
+              await api('/api/admin/backups/' + encodeURIComponent(b.filename), { method: 'DELETE' });
+              await refreshBackups();
+            } }, 'Delete'),
+          ]),
+        ]))),
+      ]);
+      list.appendChild(table);
+    }
+    refreshBackups();
+  }
+
+  if (can('manageFirm')) {
+    const inboundOn  = !!state.firm.inboundEmailConfigured;
+    const inboundAddr = state.firm.inboundEmailAddress || '';
+    const webhookUrl  = window.location.origin + '/api/webhooks/inbound-email';
+    mount.appendChild(el('div', { class: 'card mb-24' }, [
+      el('h3', {}, [
+        'Inbound email logging ',
+        el('span', {
+          style: `font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;vertical-align:middle;`
+               + (inboundOn ? 'background:var(--green-light,#d1fae5);color:var(--green-dark,#065f46)' : 'background:var(--bg-muted,#f1f5f9);color:var(--text-muted)'),
+        }, inboundOn ? 'Enabled' : 'Not configured'),
+      ]),
+      el('div', { style: 'font-size:12px;color:var(--text-muted);margin-bottom:12px' },
+        'BCC this address on outgoing emails to auto-create an interaction log entry for any matched CRM contact.'),
+      ...(inboundOn ? [
+        el('div', { style: 'margin-bottom:12px' }, [
+          el('label', { style: 'font-size:12px;font-weight:600;display:block;margin-bottom:4px' }, 'BCC address'),
+          el('div', { style: 'display:flex;gap:8px;align-items:center' }, [
+            el('input', { id: 'inbound-addr-display', readonly: 'readonly', value: inboundAddr,
+              style: 'flex:1;font-family:monospace;font-size:13px;background:var(--bg-muted,#f8fafc)' }),
+            el('button', { class: 'btn btn-ghost btn-sm', onclick: () => {
+              navigator.clipboard.writeText(inboundAddr).then(() => toast('Copied!')).catch(() => {
+                const inp = $('#inbound-addr-display'); inp.select(); document.execCommand('copy'); toast('Copied!');
+              });
+            }}, 'Copy'),
+          ]),
+        ]),
+        el('div', { style: 'margin-bottom:12px' }, [
+          el('label', { style: 'font-size:12px;font-weight:600;display:block;margin-bottom:4px' }, 'Webhook URL'),
+          el('div', { style: 'display:flex;gap:8px;align-items:center' }, [
+            el('input', { id: 'inbound-webhook-display', readonly: 'readonly', value: webhookUrl,
+              style: 'flex:1;font-family:monospace;font-size:12px;background:var(--bg-muted,#f8fafc)' }),
+            el('button', { class: 'btn btn-ghost btn-sm', onclick: () => {
+              navigator.clipboard.writeText(webhookUrl).then(() => toast('Copied!')).catch(() => {
+                const inp = $('#inbound-webhook-display'); inp.select(); document.execCommand('copy'); toast('Copied!');
+              });
+            }}, 'Copy'),
+          ]),
+        ]),
+        el('details', { style: 'margin-top:8px' }, [
+          el('summary', { style: 'font-size:12px;font-weight:600;cursor:pointer;color:var(--accent)' }, 'Setup instructions'),
+          el('div', { style: 'font-size:12px;color:var(--text-muted);margin-top:8px;line-height:1.6' }, [
+            el('p', { style: 'margin:0 0 6px' }, el('strong', {}, 'Required env vars (set in Render → Environment):')),
+            el('ul', { style: 'margin:0 0 10px;padding-left:18px' }, [
+              el('li', {}, [el('code', {}, 'INBOUND_EMAIL_SECRET'), ' — shared secret; must match X-Webhook-Secret header your mail service sends']),
+              el('li', {}, [el('code', {}, 'INBOUND_EMAIL_ADDRESS'), ' — the BCC address shown above (e.g. ', el('code', {}, 'log@crm.phillipacevedo.com'), ')']),
+            ]),
+            el('p', { style: 'margin:0 0 6px' }, el('strong', {}, 'Mailgun:')),
+            el('ol', { style: 'margin:0 0 10px;padding-left:18px' }, [
+              el('li', {}, 'Add a receiving domain (or subdomain) in Mailgun → Receiving'),
+              el('li', {}, ['Create a Route: match recipient ', el('code', {}, inboundAddr || 'log@your-domain.com'), ', action = Forward to webhook URL above']),
+              el('li', {}, ['Add custom header ', el('code', {}, 'X-Webhook-Secret: <your-secret>'), ' in the route or use the ', el('code', {}, '?secret='), ' query param']),
+            ]),
+            el('p', { style: 'margin:0 0 6px' }, el('strong', {}, 'SendGrid Inbound Parse:')),
+            el('ol', { style: 'margin:0 0 10px;padding-left:18px' }, [
+              el('li', {}, 'Settings → Inbound Parse → Add Host & URL'),
+              el('li', {}, 'Set URL to the webhook URL above with ', el('code', {}, '?secret=<your-secret>')),
+            ]),
+            el('p', { style: 'margin:0 0 6px' }, el('strong', {}, 'Postmark:')),
+            el('ol', { style: 'margin:0 0 10px;padding-left:18px' }, [
+              el('li', {}, 'Inbound → Inbound Webhook URL → paste webhook URL above with ', el('code', {}, '?secret=<your-secret>')),
+              el('li', {}, 'Postmark sends JSON — no additional config needed'),
+            ]),
+          ]),
+        ]),
+      ] : [
+        el('div', { style: 'font-size:12px;line-height:1.6' }, [
+          el('p', { style: 'margin:0 0 6px' }, 'To enable, set these environment variables and redeploy:'),
+          el('ul', { style: 'margin:0;padding-left:18px;color:var(--text-muted)' }, [
+            el('li', {}, [el('code', {}, 'INBOUND_EMAIL_SECRET'), ' — any strong random string (e.g. 32+ hex chars)']),
+            el('li', {}, [el('code', {}, 'INBOUND_EMAIL_ADDRESS'), ' — the BCC address to display (e.g. ', el('code', {}, 'log@crm.phillipacevedo.com'), ')']),
+          ]),
+        ]),
+      ]),
+    ]));
+  }
 }
 
 async function renderSettingsTeam(mount) {

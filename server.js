@@ -39,6 +39,8 @@ const BCRYPT_ROUNDS  = 12;
 const COOKIE_MAX_AGE = 7 * 24 * 60 * 60;
 const DB_PATH = process.env.DB_PATH
   || (process.env.RENDER ? '/data/crm.db' : path.join(__dirname, 'data', 'crm.db'));
+const BACKUP_DIR = process.env.BACKUP_DIR || path.join(path.dirname(DB_PATH), 'backups');
+const BACKUP_RETAIN = parseInt(process.env.BACKUP_RETAIN, 10) || 14;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const DT_URL  = (process.env.DT_URL  || 'https://dt.phillipacevedo.com').replace(/\/$/, '');
 const SPV_URL = (process.env.SPV_URL || 'https://spv.phillipacevedo.com').replace(/\/$/, '');
@@ -83,6 +85,8 @@ function requireCap(capName) {
 
 // ── EMAIL (optional SMTP) ───────────────────────────────────────────────
 const smtpConfigured = !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+const INBOUND_EMAIL_SECRET  = process.env.INBOUND_EMAIL_SECRET  || '';
+const INBOUND_EMAIL_ADDRESS = process.env.INBOUND_EMAIL_ADDRESS || '';
 const mailer = smtpConfigured
   ? nodemailer.createTransport({
       host:   process.env.SMTP_HOST,
@@ -474,6 +478,33 @@ db.exec(`
     updated_at   TEXT DEFAULT (datetime('now'))
   );
 
+  -- Tasks / deadlines on matters (Phase 5.5)
+  CREATE TABLE IF NOT EXISTS matter_tasks (
+    id          TEXT PRIMARY KEY,
+    matter_id   TEXT NOT NULL REFERENCES matters(id) ON DELETE CASCADE,
+    firm_id     TEXT NOT NULL REFERENCES firms(id)   ON DELETE CASCADE,
+    description TEXT NOT NULL,
+    due_date    TEXT,
+    assigned_to TEXT,
+    status      TEXT NOT NULL DEFAULT 'open',
+    created_by  TEXT NOT NULL,
+    created_at  TEXT DEFAULT (datetime('now')),
+    updated_at  TEXT DEFAULT (datetime('now'))
+  );
+
+  -- Documents attached to matters (Phase 5.3)
+  CREATE TABLE IF NOT EXISTS matter_documents (
+    id           TEXT PRIMARY KEY,
+    matter_id    TEXT NOT NULL REFERENCES matters(id) ON DELETE CASCADE,
+    firm_id      TEXT NOT NULL REFERENCES firms(id)   ON DELETE CASCADE,
+    filename     TEXT NOT NULL,
+    mime_type    TEXT NOT NULL,
+    size         INTEGER NOT NULL,
+    data         BLOB NOT NULL,
+    uploaded_by  TEXT NOT NULL,
+    created_at   TEXT DEFAULT (datetime('now'))
+  );
+
   -- Receipt PDFs / images attached to expenses (stored as BLOBs in SQLite)
   CREATE TABLE IF NOT EXISTS expense_attachments (
     id           TEXT PRIMARY KEY,
@@ -612,6 +643,9 @@ const migrations = [
   `ALTER TABLE bank_transactions ADD COLUMN source TEXT DEFAULT 'mercury'`,
   `ALTER TABLE users   ADD COLUMN dt_subscriber INTEGER DEFAULT 0`,
   `ALTER TABLE matters ADD COLUMN dt_data TEXT`,
+  `ALTER TABLE matters ADD COLUMN billing_schedule TEXT`,
+  `ALTER TABLE matters ADD COLUMN trust_min_balance REAL DEFAULT 0`,
+  `ALTER TABLE matters ADD COLUMN trust_replenish_to REAL`,
 ];
 // Only swallow "duplicate column" errors (idempotency). Anything else — syntax
 // typos, missing table, permission issues — is a real problem and should fail
@@ -762,6 +796,9 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_expenses_firm_date ON expenses(firm_id, date);
   CREATE INDEX IF NOT EXISTS idx_expenses_matter ON expenses(matter_id);
   CREATE INDEX IF NOT EXISTS idx_expenses_invoice ON expenses(invoice_id);
+  CREATE INDEX IF NOT EXISTS idx_matter_tasks_matter   ON matter_tasks(matter_id);
+  CREATE INDEX IF NOT EXISTS idx_matter_tasks_assignee ON matter_tasks(firm_id, assigned_to, status);
+  CREATE INDEX IF NOT EXISTS idx_matter_documents_matter ON matter_documents(matter_id);
   CREATE INDEX IF NOT EXISTS idx_expense_attachments_expense ON expense_attachments(expense_id);
   CREATE INDEX IF NOT EXISTS idx_token_denylist_expires ON token_denylist(expires_at);
   CREATE INDEX IF NOT EXISTS idx_timers_user ON timers(user_email);
@@ -1033,7 +1070,63 @@ function recomputeInvoiceTotals(invoiceId, firmId) {
   return { amountPaid, amountWritedown, netBilled, status: nextStatus };
 }
 
+// ── BACKUPS ─────────────────────────────────────────────────────────────
+const backupState = { lastRunAt: null, lastSuccessAt: null, lastError: null, inProgress: false };
+
+function listBackupFiles() {
+  if (!fs.existsSync(BACKUP_DIR)) return [];
+  return fs.readdirSync(BACKUP_DIR)
+    .filter(f => /^crm-\d{4}-\d{2}-\d{2}(?:T\d{6})?\.db$/.test(f))
+    .map(f => {
+      const st = fs.statSync(path.join(BACKUP_DIR, f));
+      return { filename: f, size: st.size, createdAt: st.mtime.toISOString() };
+    })
+    .sort((a, b) => b.filename.localeCompare(a.filename));
+}
+
+async function runBackup({ manual = false } = {}) {
+  if (backupState.inProgress) return { skipped: 'already running' };
+  backupState.inProgress = true;
+  backupState.lastRunAt = new Date().toISOString();
+  try {
+    if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    const today = new Date().toISOString().slice(0, 10);
+    const base = manual ? `crm-${new Date().toISOString().replace(/[-:]/g,'').slice(0,15)}.db` : `crm-${today}.db`;
+    const dest = path.join(BACKUP_DIR, base);
+    await db.backup(dest);
+    // Retention: keep newest BACKUP_RETAIN, delete the rest
+    const all = listBackupFiles();
+    for (const f of all.slice(BACKUP_RETAIN)) {
+      try { fs.unlinkSync(path.join(BACKUP_DIR, f.filename)); } catch(e) { /* ignore */ }
+    }
+    backupState.lastSuccessAt = new Date().toISOString();
+    backupState.lastError = null;
+    console.log(`[backup] wrote ${dest} (${fs.statSync(dest).size} bytes)`);
+    return { filename: base, size: fs.statSync(dest).size };
+  } catch (e) {
+    backupState.lastError = e.message || String(e);
+    console.warn('[backup] failed:', e.message);
+    throw e;
+  } finally {
+    backupState.inProgress = false;
+  }
+}
+
+// Daily backup scheduler: run once on startup if today's backup missing,
+// then check every hour. Idempotent — a date-stamped file is only written
+// once per calendar day unless manually triggered.
+function scheduleBackups() {
+  const tick = () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const have = listBackupFiles().some(f => f.filename === `crm-${today}.db`);
+    if (!have) runBackup().catch(() => {});
+  };
+  setTimeout(tick, 30 * 1000); // startup grace
+  setInterval(tick, 60 * 60 * 1000);
+}
+
 app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public'), {
   etag: false,
   lastModified: false,
@@ -1419,7 +1512,7 @@ app.get('/api/firm', authRequired, verifyFirmMembership, (req, res) => {
   const f = db.prepare('SELECT * FROM firms WHERE id = ?').get(req.user.firmId);
   const s = parseJSON(f.settings, {});
   const data = parseJSON(db.prepare('SELECT data FROM firm_data WHERE firm_id = ?').get(req.user.firmId)?.data || '{}', {});
-  res.json({ id: f.id, name: f.name, settings: s, pipelineStages: data.pipelineStages || [], tags: data.tags || [], expenseCategories: data.expenseCategories || [], hasLogo: !!f.logo_data });
+  res.json({ id: f.id, name: f.name, settings: s, pipelineStages: data.pipelineStages || [], tags: data.tags || [], expenseCategories: data.expenseCategories || [], hasLogo: !!f.logo_data, smtpConfigured, inboundEmailConfigured: !!INBOUND_EMAIL_SECRET, inboundEmailAddress: INBOUND_EMAIL_ADDRESS });
 });
 
 app.put('/api/firm', authRequired, requireCap('manageFirm'), (req, res) => {
@@ -1467,6 +1560,44 @@ app.post('/api/firm/logo', authRequired, requireCap('manageFirm'), (req, res) =>
 });
 app.delete('/api/firm/logo', authRequired, requireCap('manageFirm'), (req, res) => {
   db.prepare('UPDATE firms SET logo_data = NULL, logo_mime = NULL WHERE id = ?').run(req.user.firmId);
+  res.json({ ok: true });
+});
+
+// ── BACKUP ROUTES ───────────────────────────────────────────────────────
+app.get('/api/admin/backups', authRequired, requireCap('manageFirm'), (req, res) => {
+  res.json({
+    backups: listBackupFiles(),
+    retain: BACKUP_RETAIN,
+    lastRunAt:     backupState.lastRunAt,
+    lastSuccessAt: backupState.lastSuccessAt,
+    lastError:     backupState.lastError,
+    inProgress:    backupState.inProgress,
+  });
+});
+
+app.post('/api/admin/backups/run', authRequired, requireCap('manageFirm'), async (req, res) => {
+  try {
+    const result = await runBackup({ manual: true });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Backup failed' });
+  }
+});
+
+app.get('/api/admin/backups/:filename/download', authRequired, requireCap('manageFirm'), (req, res) => {
+  const name = req.params.filename;
+  if (!/^crm-\d{4}-\d{2}-\d{2}(?:T\d{6})?\.db$/.test(name)) return res.status(400).json({ error: 'Invalid filename' });
+  const full = path.join(BACKUP_DIR, name);
+  if (!fs.existsSync(full)) return res.status(404).json({ error: 'Not found' });
+  res.download(full, name);
+});
+
+app.delete('/api/admin/backups/:filename', authRequired, requireCap('manageFirm'), (req, res) => {
+  const name = req.params.filename;
+  if (!/^crm-\d{4}-\d{2}-\d{2}(?:T\d{6})?\.db$/.test(name)) return res.status(400).json({ error: 'Invalid filename' });
+  const full = path.join(BACKUP_DIR, name);
+  if (!fs.existsSync(full)) return res.status(404).json({ error: 'Not found' });
+  fs.unlinkSync(full);
   res.json({ ok: true });
 });
 
@@ -2096,6 +2227,135 @@ app.delete('/api/interactions/:id', authRequired, verifyFirmMembership, (req, re
   res.json({ ok: true });
 });
 
+// ─── Outbound email from contact view (Phase 5.2) ───────────────────────
+// Sends an email via SMTP and auto-logs it as an email interaction.
+app.post('/api/contacts/:id/email', authRequired, verifyFirmMembership, requireCap('editContacts'), async (req, res) => {
+  if (!mailer) return res.status(503).json({ error: 'Email sending is not configured (SMTP env vars missing)' });
+  const contact = db.prepare('SELECT id, full_name, email FROM contacts WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  if (!contact) return res.status(404).json({ error: 'Contact not found' });
+
+  const { to, cc, subject, body } = req.body || {};
+  if (!to || !subject || !body) return res.status(400).json({ error: 'to, subject, and body are required' });
+  const e = lenErr(body, MAX_NOTE, 'Body');
+  if (e) return res.status(400).json({ error: e });
+
+  const fromAddr = process.env.SMTP_FROM || process.env.SMTP_USER;
+  try {
+    await mailer.sendMail({
+      from: fromAddr,
+      replyTo: req.user.email,
+      to:  sanitizeEmailHeader(to),
+      ...(cc ? { cc: sanitizeEmailHeader(cc) } : {}),
+      subject: sanitizeEmailHeader(subject),
+      text: body,
+    });
+  } catch (err) {
+    console.error('[send-email] SMTP error:', err.message);
+    return res.status(502).json({ error: 'Failed to send email: ' + err.message });
+  }
+
+  const iid = uid('i_');
+  db.prepare(`INSERT INTO interactions (id, firm_id, contact_id, kind, subject, body, occurred_at, created_by)
+              VALUES (?,?,?,'email',?,?,datetime('now'),?)`)
+    .run(iid, req.user.firmId, contact.id, subject.slice(0, 500), body, req.user.email);
+  db.prepare(`UPDATE contacts SET last_activity_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND firm_id = ?`)
+    .run(contact.id, req.user.firmId);
+
+  res.json({ ok: true, interactionId: iid });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// INBOUND EMAIL WEBHOOK (Phase 4.4)
+// ═══════════════════════════════════════════════════════════════════════
+// POST /api/webhooks/inbound-email
+// Called by Mailgun, SendGrid, or Postmark inbound routing when an email
+// is delivered to INBOUND_EMAIL_ADDRESS (the BCC logging address).
+// Caller must supply the shared secret in X-Webhook-Secret header.
+// Creates one interaction (kind='email') per CRM contact matched by address.
+
+function extractEmailAddresses(headerStr) {
+  if (!headerStr) return [];
+  const found = [];
+  const s = String(headerStr);
+  // angle-addr:  "Name" <user@host>
+  const angleRe = /<([^>@\s]+@[^>@\s]+)>/g;
+  let m;
+  while ((m = angleRe.exec(s)) !== null) found.push(m[1].toLowerCase());
+  // bare addr-spec (not already inside <>)
+  const stripped = s.replace(/<[^>]*>/g, '');
+  const bareRe = /(?:^|[\s,;])([^\s,;<>"@]+@[^\s,;<>"]+)(?:[\s,;]|$)/g;
+  while ((m = bareRe.exec(stripped)) !== null) found.push(m[1].toLowerCase());
+  return [...new Set(found)];
+}
+
+app.post('/api/webhooks/inbound-email', (req, res) => {
+  if (!INBOUND_EMAIL_SECRET) return res.status(503).json({ error: 'Inbound email not configured' });
+
+  const provided = req.headers['x-webhook-secret'] || req.query.secret || '';
+  if (!provided || provided !== INBOUND_EMAIL_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const b = req.body || {};
+
+  // Normalize fields across inbound email providers:
+  //   Mailgun:  sender, From, To, Cc, Subject, body-plain
+  //   SendGrid: from,   to,   cc, subject, text
+  //   Postmark: From,   To,   Cc, Subject, TextBody
+  const fromRaw  = b.sender || b.from || b.From || '';
+  const toRaw    = b.To     || b.to   || '';
+  const ccRaw    = b.Cc     || b.cc   || '';
+  const subject  = String(b.Subject || b.subject || '(no subject)').slice(0, 500);
+  const bodyText = String(b['body-plain'] || b.TextBody || b.text || b['body-html'] || '').slice(0, 50000);
+  const dateStr  = b.Date || b.date || new Date().toISOString();
+
+  const allAddresses = [
+    ...extractEmailAddresses(fromRaw),
+    ...extractEmailAddresses(toRaw),
+    ...extractEmailAddresses(ccRaw),
+  ];
+
+  if (!allAddresses.length) {
+    return res.status(400).json({ error: 'No email addresses found in From/To/Cc' });
+  }
+
+  const firm = db.prepare('SELECT id FROM firms LIMIT 1').get();
+  if (!firm) return res.status(500).json({ error: 'No firm found' });
+
+  const placeholders = allAddresses.map(() => '?').join(',');
+  const contacts = db.prepare(
+    `SELECT id, full_name FROM contacts WHERE firm_id = ? AND LOWER(email) IN (${placeholders})`
+  ).all(firm.id, ...allAddresses);
+
+  if (!contacts.length) {
+    return res.json({ ok: true, matched: 0, message: 'No matching contacts found' });
+  }
+
+  const occurredAt = (() => {
+    try { return new Date(dateStr).toISOString(); } catch { return new Date().toISOString(); }
+  })();
+
+  const createdBy = extractEmailAddresses(fromRaw)[0] || 'inbound@email';
+
+  const insertStmt = db.prepare(
+    `INSERT INTO interactions (id, firm_id, contact_id, kind, subject, body, occurred_at, created_by)
+     VALUES (?,?,?,'email',?,?,?,?)`
+  );
+  const touchContact = db.prepare(
+    `UPDATE contacts SET last_activity_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND firm_id = ?`
+  );
+
+  db.transaction(() => {
+    for (const c of contacts) {
+      insertStmt.run(uid('i_'), firm.id, c.id, subject, bodyText, occurredAt, createdBy);
+      touchContact.run(c.id, firm.id);
+    }
+  })();
+
+  console.log(`[inbound-email] "${subject}" from ${createdBy} → ${contacts.length} contact(s): ${contacts.map(c => c.full_name).join(', ')}`);
+  res.json({ ok: true, matched: contacts.length, contacts: contacts.map(c => c.full_name) });
+});
+
 // ═══════════════════════════════════════════════════════════════════════
 // MATTERS (CRM-local, optional link to DealTracker)
 // ═══════════════════════════════════════════════════════════════════════
@@ -2154,12 +2414,23 @@ app.put('/api/matters/:id', authRequired, verifyFirmMembership, requireCap('edit
   } else if (matterNumber == null) {
     matterNumber = newClientId ? nextMatterNumber(newClientId) : nextFirmMatterNumber(req.user.firmId);
   }
+  const nextBillingSchedule = 'billingSchedule' in b
+    ? (b.billingSchedule ? JSON.stringify(b.billingSchedule) : null)
+    : existing.billing_schedule;
+  const nextTrustMin = 'trustMinBalance' in b
+    ? (Number(b.trustMinBalance) || 0)
+    : (existing.trust_min_balance || 0);
+  const nextTrustTo  = 'trustReplenishTo' in b
+    ? (b.trustReplenishTo == null || b.trustReplenishTo === '' ? null : Number(b.trustReplenishTo))
+    : existing.trust_replenish_to;
+
   db.prepare(`UPDATE matters SET
       name = COALESCE(?, name), description = ?, billing_type = COALESCE(?, billing_type),
       flat_fee = COALESCE(?, flat_fee), status = COALESCE(?, status),
       client_contact_id = ?, client_name = ?, dt_matter_id = ?,
       billing_increment_minutes = ?,
       matter_number = ?,
+      billing_schedule = ?, trust_min_balance = ?, trust_replenish_to = ?,
       closed_at = CASE WHEN ? = 'closed' AND status != 'closed' THEN datetime('now') ELSE closed_at END,
       updated_at = datetime('now')
     WHERE id = ? AND firm_id = ?`).run(
@@ -2168,8 +2439,142 @@ app.put('/api/matters/:id', authRequired, verifyFirmMembership, requireCap('edit
     newClientId, b.clientName ?? existing.client_name, b.dtMatterId ?? null,
     inc,
     matterNumber,
+    nextBillingSchedule, nextTrustMin, nextTrustTo,
     b.status || '', req.params.id, req.user.firmId);
   res.json(db.prepare(MATTER_SELECT + ' WHERE m.id = ?').get(req.params.id));
+});
+
+// ── RECURRING BILLING HELPERS + CRON ────────────────────────────────────
+// A recurring invoice is just a 1-line flat-fee invoice generated on a schedule
+// stored as JSON on the matter. We deliberately do NOT sweep unbilled time —
+// that's the manual POST /api/invoices code path and would double-count work
+// the attorney was already logging against the same matter.
+function getMatterTrustBalance(firmId, matterId) {
+  const row = db.prepare(`SELECT COALESCE(SUM(amount), 0) AS bal FROM trust_ledger
+                          WHERE firm_id = ? AND matter_id = ?`).get(firmId, matterId);
+  return Number(row?.bal || 0);
+}
+
+function hasPendingReplenishment(firmId, matterId) {
+  const row = db.prepare(`SELECT 1 AS ok FROM invoices
+                          WHERE firm_id = ? AND matter_id = ?
+                            AND status IN ('draft','sent')
+                            AND notes LIKE 'Trust replenishment%'`).get(firmId, matterId);
+  return !!row;
+}
+
+// monthly: add 1 month; quarterly: add 3 months. day_of_period 1-28 only
+// (anything past 28 would skip Feb), clamped at the caller. Returns YYYY-MM-DD.
+function advanceNextRunAt(prev, kind, day) {
+  const d = new Date(prev + 'T00:00:00Z');
+  const months = kind === 'quarterly' ? 3 : 1;
+  d.setUTCMonth(d.getUTCMonth() + months);
+  const dayClamped = Math.max(1, Math.min(28, parseInt(day, 10) || 1));
+  d.setUTCDate(dayClamped);
+  return d.toISOString().slice(0, 10);
+}
+
+// Create a single-line invoice for `amount` against a matter. Mirrors the
+// transaction shape of POST /api/invoices (numbering, totals, draft status)
+// but skips time-entry / expense sweep and the manageBilling permission check
+// — callers are the cron job or an admin-gated route.
+function createRecurringInvoice(firmId, matter, amount, description, notes, createdBy = 'system@recurring') {
+  if (!matter || !amount || amount <= 0) return null;
+  const id = uid('inv_');
+  const number = nextInvoiceNumber(firmId);
+  const now = new Date().toISOString();
+  const subtotal = +Number(amount).toFixed(2);
+  const total = subtotal;
+  const lineId = uid('il_');
+  const tx = db.transaction(() => {
+    db.prepare(`INSERT INTO invoices (id, firm_id, number, client_contact_id, client_name, matter_id, issued_at, due_at, subtotal, tax, total, status, notes, created_by)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      id, firmId, number, matter.client_contact_id || null, matter.client_name || null, matter.id,
+      now, null, subtotal, 0, total, 'draft', notes || null, createdBy);
+    db.prepare(`INSERT INTO invoice_lines (id, invoice_id, kind, description, time_entry_id, quantity, rate, amount, sort_order)
+                VALUES (?,?,?,?,?,?,?,?,?)`).run(
+      lineId, id, 'flat', description, null, 1, subtotal, subtotal, 0);
+  });
+  tx();
+  return { id, number, total };
+}
+
+// One pass over the recurring schedule for one matter. Returns {generated, replenished}
+// counters. Idempotent — only fires when next_run_at <= today, and advances next_run_at
+// so a re-run on the same day is a no-op. The replenishment check skips when an
+// unpaid replenishment invoice is already outstanding.
+function runRecurringForMatter(firmId, matter, today) {
+  let generated = null, replenished = null;
+  // 1) Scheduled billing
+  if (matter.billing_schedule) {
+    let sched;
+    try { sched = JSON.parse(matter.billing_schedule); } catch { sched = null; }
+    if (sched && sched.active && sched.next_run_at && sched.next_run_at <= today && Number(sched.amount) > 0) {
+      const desc = sched.description || `Recurring fee — ${matter.name}`;
+      generated = createRecurringInvoice(firmId, matter, Number(sched.amount), desc, null);
+      sched.next_run_at = advanceNextRunAt(sched.next_run_at, sched.kind, sched.day_of_period);
+      db.prepare('UPDATE matters SET billing_schedule = ?, updated_at = datetime(\'now\') WHERE id = ?')
+        .run(JSON.stringify(sched), matter.id);
+    }
+  }
+  // 2) Trust replenishment
+  const floor = Number(matter.trust_min_balance || 0);
+  if (floor > 0) {
+    const bal = getMatterTrustBalance(firmId, matter.id);
+    if (bal < floor && !hasPendingReplenishment(firmId, matter.id)) {
+      const target = Number(matter.trust_replenish_to) > 0 ? Number(matter.trust_replenish_to) : floor;
+      const shortfall = +(target - bal).toFixed(2);
+      if (shortfall > 0) {
+        replenished = createRecurringInvoice(
+          firmId, matter, shortfall,
+          `Trust replenishment — ${matter.name}`,
+          `Trust replenishment (balance ${bal.toFixed(2)} below floor ${floor.toFixed(2)})`
+        );
+      }
+    }
+  }
+  return { generated, replenished };
+}
+
+function runRecurringBilling() {
+  const today = new Date().toISOString().slice(0, 10);
+  const matters = db.prepare(`SELECT * FROM matters WHERE status = 'active'
+                              AND (billing_schedule IS NOT NULL OR trust_min_balance > 0)`).all();
+  let totalGen = 0, totalRep = 0;
+  for (const m of matters) {
+    try {
+      const r = runRecurringForMatter(m.firm_id, m, today);
+      if (r.generated)   totalGen++;
+      if (r.replenished) totalRep++;
+    } catch (e) {
+      console.warn(`[recurring] matter ${m.id}: ${e.message}`);
+    }
+  }
+  if (totalGen || totalRep) {
+    console.log(`[recurring] ${today}: generated=${totalGen} replenished=${totalRep}`);
+  }
+  return { generated: totalGen, replenished: totalRep };
+}
+
+function scheduleRecurringBilling() {
+  // Run once on boot (after a grace) then every hour. Idempotent — same-day
+  // re-runs are no-ops because next_run_at advances after each generation.
+  setTimeout(() => { try { runRecurringBilling(); } catch(e) { console.warn('[recurring]', e.message); } }, 45 * 1000);
+  setInterval(() => { try { runRecurringBilling(); } catch(e) { console.warn('[recurring]', e.message); } }, 60 * 60 * 1000);
+}
+
+// Manual trigger — useful after editing a schedule or fixing a missed run.
+app.post('/api/matters/:id/billing-schedule/run-now', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const m = db.prepare('SELECT * FROM matters WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  if (!m) return res.status(404).json({ error: 'Matter not found' });
+  if (m.status !== 'active') return res.status(400).json({ error: 'Matter is not active' });
+  const today = new Date().toISOString().slice(0, 10);
+  try {
+    const r = runRecurringForMatter(req.user.firmId, m, today);
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Failed' });
+  }
 });
 
 app.delete('/api/matters/:id', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
@@ -2231,6 +2636,134 @@ app.get('/api/dt/matters', authRequired, verifyFirmMembership, async (req, res) 
   } catch(e) {
     res.json({ clients: [], hint: 'DT unreachable' });
   }
+});
+
+// ── Matter document attachments (Phase 5.3) ─────────────────────────────
+const DOC_MIME_WHITELIST = new Set([
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'text/plain',
+  'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+]);
+const MAX_DOC_BYTES = 10 * 1024 * 1024; // 10 MB
+
+function loadMatterForDoc(req, res) {
+  const m = db.prepare('SELECT id FROM matters WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  if (!m) { res.status(404).json({ error: 'Matter not found' }); return null; }
+  return m;
+}
+
+app.get('/api/matters/:id/documents', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
+  const m = loadMatterForDoc(req, res); if (!m) return;
+  const rows = db.prepare(`SELECT id, filename, mime_type, size, uploaded_by, created_at
+                           FROM matter_documents WHERE matter_id = ? ORDER BY created_at DESC`).all(m.id);
+  res.json(rows);
+});
+
+app.post('/api/matters/:id/documents', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
+  const m = loadMatterForDoc(req, res); if (!m) return;
+  const { filename, mimeType, dataBase64 } = req.body || {};
+  if (!filename || !mimeType || !dataBase64) return res.status(400).json({ error: 'filename, mimeType, dataBase64 required' });
+  if (!DOC_MIME_WHITELIST.has(mimeType)) return res.status(400).json({ error: 'File type not allowed. Accepted: PDF, Word, Excel, plain text, and images.' });
+  let buf;
+  try { buf = Buffer.from(dataBase64, 'base64'); }
+  catch { return res.status(400).json({ error: 'Invalid base64 data' }); }
+  if (buf.length === 0) return res.status(400).json({ error: 'Empty file' });
+  if (buf.length > MAX_DOC_BYTES) return res.status(413).json({ error: `File too large (max ${MAX_DOC_BYTES / 1024 / 1024} MB)` });
+  const id = uid('doc_');
+  const safeName = String(filename).slice(0, 255);
+  db.prepare(`INSERT INTO matter_documents (id, matter_id, firm_id, filename, mime_type, size, data, uploaded_by)
+              VALUES (?,?,?,?,?,?,?,?)`).run(id, m.id, req.user.firmId, safeName, mimeType, buf.length, buf, req.user.email);
+  res.json({ id, filename: safeName, mime_type: mimeType, size: buf.length, uploaded_by: req.user.email });
+});
+
+app.get('/api/matters/:id/documents/:docId', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
+  const m = loadMatterForDoc(req, res); if (!m) return;
+  const doc = db.prepare('SELECT * FROM matter_documents WHERE id = ? AND matter_id = ?').get(req.params.docId, m.id);
+  if (!doc) return res.status(404).json({ error: 'Document not found' });
+  const disposition = req.query.download ? 'attachment' : 'inline';
+  res.setHeader('Content-Type', doc.mime_type);
+  res.setHeader('Content-Length', doc.size);
+  res.setHeader('Content-Disposition', `${disposition}; filename="${doc.filename.replace(/"/g, '')}"`);
+  res.send(doc.data);
+});
+
+app.delete('/api/matters/:id/documents/:docId', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
+  const m = loadMatterForDoc(req, res); if (!m) return;
+  const doc = db.prepare('SELECT uploaded_by FROM matter_documents WHERE id = ? AND matter_id = ?').get(req.params.docId, m.id);
+  if (!doc) return res.status(404).json({ error: 'Document not found' });
+  if (doc.uploaded_by !== req.user.email && !req.user.isAdmin) return res.status(403).json({ error: 'Only the uploader or an admin can delete' });
+  db.prepare('DELETE FROM matter_documents WHERE id = ?').run(req.params.docId);
+  res.json({ ok: true });
+});
+
+// ── Matter task tracking (Phase 5.5) ────────────────────────────────────
+app.get('/api/matters/:id/tasks', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
+  const m = loadMatterForDoc(req, res); if (!m) return;
+  const rows = db.prepare(`SELECT * FROM matter_tasks WHERE matter_id = ? ORDER BY
+    CASE WHEN status = 'open' THEN 0 ELSE 1 END,
+    COALESCE(due_date, '9999-12-31'),
+    created_at`).all(m.id);
+  res.json(rows);
+});
+
+app.post('/api/matters/:id/tasks', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
+  const m = loadMatterForDoc(req, res); if (!m) return;
+  const { description, dueDate, assignedTo } = req.body || {};
+  if (!description || !String(description).trim()) return res.status(400).json({ error: 'description required' });
+  const id = uid('mt_');
+  db.prepare(`INSERT INTO matter_tasks (id, matter_id, firm_id, description, due_date, assigned_to, created_by)
+              VALUES (?,?,?,?,?,?,?)`)
+    .run(id, m.id, req.user.firmId, String(description).trim().slice(0, 500),
+         dueDate || null, assignedTo || null, req.user.email);
+  res.json(db.prepare('SELECT * FROM matter_tasks WHERE id = ?').get(id));
+});
+
+app.patch('/api/matters/:id/tasks/:taskId', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
+  const m = loadMatterForDoc(req, res); if (!m) return;
+  const task = db.prepare('SELECT * FROM matter_tasks WHERE id = ? AND matter_id = ?').get(req.params.taskId, m.id);
+  if (!task) return res.status(404).json({ error: 'Task not found' });
+  const { description, dueDate, assignedTo, status } = req.body || {};
+  const validStatuses = ['open', 'done'];
+  if (status && !validStatuses.includes(status)) return res.status(400).json({ error: 'status must be open or done' });
+  db.prepare(`UPDATE matter_tasks SET
+    description = ?, due_date = ?, assigned_to = ?, status = ?, updated_at = datetime('now')
+    WHERE id = ?`)
+    .run(
+      description != null ? String(description).trim().slice(0, 500) : task.description,
+      dueDate !== undefined ? (dueDate || null) : task.due_date,
+      assignedTo !== undefined ? (assignedTo || null) : task.assigned_to,
+      status || task.status,
+      task.id,
+    );
+  res.json(db.prepare('SELECT * FROM matter_tasks WHERE id = ?').get(task.id));
+});
+
+app.delete('/api/matters/:id/tasks/:taskId', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
+  const m = loadMatterForDoc(req, res); if (!m) return;
+  const task = db.prepare('SELECT created_by FROM matter_tasks WHERE id = ? AND matter_id = ?').get(req.params.taskId, m.id);
+  if (!task) return res.status(404).json({ error: 'Task not found' });
+  if (task.created_by !== req.user.email && !req.user.isAdmin) return res.status(403).json({ error: 'Only the creator or an admin can delete' });
+  db.prepare('DELETE FROM matter_tasks WHERE id = ?').run(req.params.taskId);
+  res.json({ ok: true });
+});
+
+// "My open tasks" — dashboard widget: tasks assigned to me, open, sorted by due date
+app.get('/api/tasks/mine', authRequired, verifyFirmMembership, (req, res) => {
+  const rows = db.prepare(`
+    SELECT t.*, m.name AS matter_name, m.id AS matter_id,
+           c.full_name AS client_name
+      FROM matter_tasks t
+      JOIN matters m ON m.id = t.matter_id
+      LEFT JOIN contacts c ON c.id = m.client_contact_id
+     WHERE t.firm_id = ? AND t.assigned_to = ? AND t.status = 'open'
+     ORDER BY COALESCE(t.due_date, '9999-12-31'), t.created_at
+     LIMIT 50
+  `).all(req.user.firmId, req.user.email);
+  res.json(rows);
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2792,6 +3325,80 @@ app.get('/api/invoices/:id/payment-links', authRequired, verifyFirmMembership, r
     url: base + '/pay/' + r.token,
     expired: r.expires_at && new Date(r.expires_at) < new Date(),
   })));
+});
+
+// ── Payment reminder email (Phase 5.4) ──────────────────────────────────
+app.post('/api/invoices/:id/reminder', authRequired, verifyFirmMembership, requireCap('manageBilling'), async (req, res) => {
+  if (!mailer) return res.status(503).json({ error: 'Email sending is not configured (SMTP env vars missing)' });
+
+  const inv = db.prepare(`SELECT i.*, c.email AS contact_email, c.full_name AS contact_full_name, c.id AS cid,
+                                 f.name AS firm_name, f.settings AS firm_settings
+                            FROM invoices i
+                            LEFT JOIN contacts c ON c.id = i.client_contact_id
+                            LEFT JOIN firms f ON f.id = i.firm_id
+                           WHERE i.id = ? AND i.firm_id = ?`).get(req.params.id, req.user.firmId);
+  if (!inv) return res.status(404).json({ error: 'Invoice not found' });
+  if (inv.status !== 'sent') return res.status(400).json({ error: 'Reminders can only be sent for invoices with status "sent"' });
+  if (!inv.contact_email) return res.status(400).json({ error: 'Client has no email address on file' });
+
+  const paidAmt  = +(Number(inv.amount_paid || 0)).toFixed(2);
+  const balance  = +(Number(inv.total || 0) - paidAmt).toFixed(2);
+  if (balance <= 0.005) return res.status(400).json({ error: 'Invoice is fully paid' });
+
+  const firmSettings = parseJSON(inv.firm_settings, {});
+  const firmPhone  = firmSettings.phone  || '';
+  const firmEmail  = firmSettings.email  || '';
+  const issuedFmt  = inv.issued_at ? inv.issued_at.slice(0, 10) : '—';
+  const dueFmt     = inv.due_at    ? inv.due_at.slice(0, 10)    : '—';
+  const balFmt     = '$' + balance.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  const clientName = inv.contact_full_name || inv.client_name || 'Client';
+  const firmName   = inv.firm_name || 'Our firm';
+
+  const subject = `Payment reminder: Invoice ${inv.number || inv.id} — ${balFmt} due`;
+  const textBody = [
+    `Dear ${clientName},`,
+    '',
+    `This is a friendly reminder that the following invoice remains outstanding:`,
+    '',
+    `  Invoice:  ${inv.number || inv.id}`,
+    `  Issued:   ${issuedFmt}`,
+    `  Due:      ${dueFmt}`,
+    `  Balance:  ${balFmt}`,
+    '',
+    `Please remit payment at your earliest convenience. If you believe this has already been paid or have any questions, please contact our office.`,
+    '',
+    ...(firmPhone ? [`Phone: ${firmPhone}`] : []),
+    ...(firmEmail ? [`Email: ${firmEmail}`] : []),
+    '',
+    `Thank you,`,
+    firmName,
+  ].join('\n');
+
+  const fromAddr = process.env.SMTP_FROM || process.env.SMTP_USER;
+  try {
+    await mailer.sendMail({
+      from: fromAddr,
+      replyTo: req.user.email,
+      to: sanitizeEmailHeader(inv.contact_email),
+      subject: sanitizeEmailHeader(subject),
+      text: textBody,
+    });
+  } catch (err) {
+    console.error('[reminder] SMTP error:', err.message);
+    return res.status(502).json({ error: 'Failed to send reminder: ' + err.message });
+  }
+
+  if (inv.cid) {
+    const iid = uid('i_');
+    db.prepare(`INSERT INTO interactions (id, firm_id, contact_id, kind, subject, body, occurred_at, created_by)
+                VALUES (?,?,?,'email',?,?,datetime('now'),?)`)
+      .run(iid, req.user.firmId, inv.cid, subject, textBody, req.user.email);
+    db.prepare(`UPDATE contacts SET last_activity_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND firm_id = ?`)
+      .run(inv.cid, req.user.firmId);
+  }
+
+  console.log(`[reminder] ${inv.number || inv.id} → ${inv.contact_email} (${balFmt})`);
+  res.json({ ok: true, sentTo: inv.contact_email });
 });
 
 // ── PUBLIC PAY PAGE (no auth; token proves authorization) ───────────────
@@ -5065,6 +5672,9 @@ setInterval(() => {
     db.prepare("DELETE FROM invites WHERE expires_at < datetime('now') AND used = 0").run();
   } catch(e) { console.warn('Cleanup error:', e.message); }
 }, 60*60*1000);
+
+scheduleBackups();
+scheduleRecurringBilling();
 
 app.listen(PORT, () => {
   console.log(`
