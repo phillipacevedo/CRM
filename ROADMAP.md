@@ -198,12 +198,20 @@ The app is now big enough that menu-hunting is the main friction.
 - Cmd-K opens a search palette overlay; results grouped by type with keyboard nav; Enter routes to the relevant detail modal
 - Scope respects existing `visibleContactWhere()` and matter visibility — Staff doesn't see contacts they don't own through search either
 
-### 6.4 Audit log (trust + billing + admin actions)
-IOLTA reviewers will eventually ask. Extend the append-only pattern already used by `trust_ledger`.
-- `audit_log` table: `(id, firm_id, actor_email, action, entity_type, entity_id, before_json, after_json, at)`
-- Wrap a `logAudit()` helper around the routes that matter: invoice void / status change, time-entry override (admin editing someone else's billed entry), rate change on a matter, trust ledger reversal, seat role changes, payment config changes
-- Settings → Firm → "Audit log" panel for admins: filter by actor, entity, date range; CSV export
-- Never edited, never deleted — same invariant as the trust ledger
+### 6.4 Audit log (trust + billing + admin actions) ✅
+**Schema:** `audit_log (id AUTOINCREMENT, firm_id, actor_email, action, entity_type, entity_id, before_json, after_json, at)` with indexes on `(firm_id, at DESC)`, `(firm_id, entity_type, entity_id)`, `(firm_id, actor_email)`. Append-only — same invariant as `trust_ledger`.
+
+**Server:** `logAudit(req, action, entityType, entityId, before, after)` helper wraps the routes that matter — never throws, logs on failure so audit gaps surface. Wired into:
+- `PATCH /api/invoices/:id/status` — `invoice.status_change` (skipped when status unchanged)
+- `PUT /api/time/:id`, `DELETE /api/time/:id` — `time_entry.admin_override` / `admin_delete` (only when admin acts on someone else's entry or on a billed/locked entry)
+- `PUT /api/matters/:id/rates` — `matter.rates_change` (full before/after rate list)
+- `DELETE /api/trust/:id` — `trust.reversal` (with reversal entry id)
+- `PUT /api/seats/:email`, `PATCH /api/seats/:email`, `DELETE /api/seats/:email` — `seat.update` / `seat.admin_toggle` / `seat.deactivate`
+- `PUT /api/firm/payments` — `payments.config_update` (secrets redacted to `[set]`/`null`)
+
+**Read routes:** `GET /api/audit-log` (paginated JSON; filters: actor, action, entityType, entityId, from, to; returns distinct actions/entityTypes for filter dropdowns) and `GET /api/audit-log.csv` (10k row cap, same filters). Both `manageFirm` gated and `firm_id`-scoped.
+
+**UI:** Settings → Firm → "Audit log" card (admin only) with filter row (actor email substring, action dropdown, entity-type dropdown, from/to dates), Apply/Clear/Export CSV buttons, paginated table showing time/actor/action/entity/before+after JSON (each in a collapsible `<details>`), and Prev/Next pager.
 
 ### 6.5 Automated nightly DB backup ✅
 **Server:** `runBackup()` uses `db.backup()` to write `./data/backups/crm-YYYY-MM-DD.db` (overridable via `BACKUP_DIR`). Retention keeps newest `BACKUP_RETAIN` (default 14). Hourly idempotency tick: only writes today's stamped file if it doesn't exist yet. Routes: `GET /api/admin/backups`, `POST /api/admin/backups/run` (manual, timestamp-suffixed filename so it doesn't collide with the daily), `GET /api/admin/backups/:filename/download`, `DELETE /api/admin/backups/:filename`. All `manageFirm` gated. S3/R2 upload deferred — local backups + manual downloads cover the immediate "one bad deploy from disaster" risk.
@@ -304,7 +312,8 @@ June 2026        Phase 2.4 (trust payment completion — revisit once Stripe goe
 May 2026         Phase 6.5 ✅ complete (automated nightly DB backup)
 May 2026         Phase 6.9 ✅ complete (time-entry widget — localStorage fallback layered on existing topbar timer)
 May 2026         Phase 6.1 ✅ complete (recurring invoices + trust auto-replenishment)
-July 2026        Phase 6.4, 6.6 (audit log, 2FA — compliance bundle)
+May 2026         Phase 6.4 ✅ complete (audit log: helper + 6 mutating routes + admin UI + CSV export)
+July 2026        Phase 6.6 (2FA — second half of compliance bundle)
 July 2026        Phase 6.2 (client portal v1: tokenized invoice share links)
 Aug  2026        Phase 6.3, 6.7 (global search, calendar feed — quality of life)
 Aug  2026        Phase 6.8 (document templates)

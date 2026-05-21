@@ -8630,6 +8630,143 @@ function renderSettingsFirm(mount) {
   }
 
   if (can('manageFirm')) {
+    const auditState = { actor: '', action: '', entityType: '', from: '', to: '', offset: 0, limit: 50 };
+    const auditCard = el('div', { class: 'card mb-24' }, [
+      el('h3', {}, 'Audit log'),
+      el('div', { style: 'font-size:12px;color:var(--text-muted);margin-bottom:12px' },
+        'Append-only record of consequential actions: invoice status changes, admin edits to billed time, matter rate changes, trust ledger reversals, seat role changes, and payment config updates. Never edited, never deleted.'),
+      el('div', { id: 'audit-filters', style: 'display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin-bottom:12px' }, [
+        el('div', {}, [
+          el('label', { style: 'display:block;font-size:11px;color:var(--text-muted)' }, 'Actor email contains'),
+          el('input', { id: 'audit-actor', type: 'text', placeholder: 'someone@', class: 'input', style: 'width:200px' }),
+        ]),
+        el('div', {}, [
+          el('label', { style: 'display:block;font-size:11px;color:var(--text-muted)' }, 'Action'),
+          el('select', { id: 'audit-action', class: 'input', style: 'min-width:180px' }, el('option', { value: '' }, '(any)')),
+        ]),
+        el('div', {}, [
+          el('label', { style: 'display:block;font-size:11px;color:var(--text-muted)' }, 'Entity type'),
+          el('select', { id: 'audit-entity-type', class: 'input', style: 'min-width:150px' }, el('option', { value: '' }, '(any)')),
+        ]),
+        el('div', {}, [
+          el('label', { style: 'display:block;font-size:11px;color:var(--text-muted)' }, 'From'),
+          el('input', { id: 'audit-from', type: 'date', class: 'input' }),
+        ]),
+        el('div', {}, [
+          el('label', { style: 'display:block;font-size:11px;color:var(--text-muted)' }, 'To'),
+          el('input', { id: 'audit-to', type: 'date', class: 'input' }),
+        ]),
+        el('button', { class: 'btn btn-primary btn-sm', onclick: () => { readAuditFilters(); auditState.offset = 0; refreshAudit(); } }, 'Apply'),
+        el('button', { class: 'btn btn-ghost btn-sm', onclick: () => {
+          $('#audit-actor').value = ''; $('#audit-action').value = ''; $('#audit-entity-type').value = '';
+          $('#audit-from').value = ''; $('#audit-to').value = '';
+          auditState.actor = ''; auditState.action = ''; auditState.entityType = ''; auditState.from = ''; auditState.to = ''; auditState.offset = 0;
+          refreshAudit();
+        } }, 'Clear'),
+        el('button', { class: 'btn btn-ghost btn-sm', onclick: () => {
+          readAuditFilters();
+          const qs = new URLSearchParams();
+          if (auditState.actor)      qs.set('actor',      auditState.actor);
+          if (auditState.action)     qs.set('action',     auditState.action);
+          if (auditState.entityType) qs.set('entityType', auditState.entityType);
+          if (auditState.from)       qs.set('from',       auditState.from);
+          if (auditState.to)         qs.set('to',         auditState.to);
+          window.open('/api/audit-log.csv' + (qs.toString() ? '?' + qs.toString() : ''), '_blank');
+        } }, 'Export CSV'),
+      ]),
+      el('div', { id: 'audit-meta',  style: 'font-size:12px;color:var(--text-muted);margin-bottom:8px' }, 'Loading…'),
+      el('div', { id: 'audit-list' }),
+      el('div', { id: 'audit-pager', style: 'display:flex;gap:8px;justify-content:flex-end;margin-top:12px' }),
+    ]);
+    mount.appendChild(auditCard);
+
+    function readAuditFilters() {
+      auditState.actor      = ($('#audit-actor')?.value || '').trim();
+      auditState.action     = $('#audit-action')?.value || '';
+      auditState.entityType = $('#audit-entity-type')?.value || '';
+      auditState.from       = $('#audit-from')?.value || '';
+      auditState.to         = $('#audit-to')?.value || '';
+    }
+
+    function fmtAuditAt(iso) { return iso ? new Date(iso.replace(' ', 'T') + 'Z').toLocaleString() : '—'; }
+    function safeParse(s) { if (!s) return null; try { return JSON.parse(s); } catch(e) { return s; } }
+    function renderJsonCell(label, val) {
+      if (val == null) return null;
+      const summary = el('summary', { style: 'cursor:pointer;font-size:11px;color:var(--text-muted)' }, label);
+      const pre = el('pre', { style: 'white-space:pre-wrap;font-family:monospace;font-size:11px;background:var(--bg-subtle,#f6f7f8);padding:6px;border-radius:4px;margin:4px 0 0;max-height:200px;overflow:auto' },
+        typeof val === 'string' ? val : JSON.stringify(val, null, 2));
+      return el('details', {}, [summary, pre]);
+    }
+
+    async function refreshAudit() {
+      const qs = new URLSearchParams();
+      if (auditState.actor)      qs.set('actor',      auditState.actor);
+      if (auditState.action)     qs.set('action',     auditState.action);
+      if (auditState.entityType) qs.set('entityType', auditState.entityType);
+      if (auditState.from)       qs.set('from',       auditState.from);
+      if (auditState.to)         qs.set('to',         auditState.to);
+      qs.set('limit',  auditState.limit);
+      qs.set('offset', auditState.offset);
+      const data = await api('/api/audit-log?' + qs.toString()).catch(() => null);
+      const meta  = $('#audit-meta');
+      const list  = $('#audit-list');
+      const pager = $('#audit-pager');
+      if (!meta || !list || !pager) return;
+      if (!data) { meta.textContent = 'Could not load audit log.'; return; }
+
+      // Populate filter dropdowns on first load (and keep current value)
+      const actionSel = $('#audit-action');
+      const entitySel = $('#audit-entity-type');
+      if (actionSel && actionSel.options.length <= 1) {
+        data.actions.forEach(a => actionSel.appendChild(el('option', { value: a }, a)));
+        if (auditState.action) actionSel.value = auditState.action;
+      }
+      if (entitySel && entitySel.options.length <= 1) {
+        data.entityTypes.forEach(t => entitySel.appendChild(el('option', { value: t }, t)));
+        if (auditState.entityType) entitySel.value = auditState.entityType;
+      }
+
+      const start = data.rows.length ? auditState.offset + 1 : 0;
+      const end   = auditState.offset + data.rows.length;
+      meta.textContent = data.total
+        ? `Showing ${start}–${end} of ${data.total}`
+        : 'No entries match these filters.';
+
+      list.innerHTML = '';
+      if (!data.rows.length) return;
+      const table = el('table', { class: 'data', style: 'width:100%;font-size:13px' }, [
+        el('thead', {}, el('tr', {}, [
+          el('th', { style: 'text-align:left;width:160px' }, 'When'),
+          el('th', { style: 'text-align:left;width:180px' }, 'Actor'),
+          el('th', { style: 'text-align:left' }, 'Action'),
+          el('th', { style: 'text-align:left' }, 'Entity'),
+          el('th', { style: 'text-align:left' }, 'Change'),
+        ])),
+        el('tbody', {}, data.rows.map(r => el('tr', {}, [
+          el('td', { style: 'white-space:nowrap' }, fmtAuditAt(r.at)),
+          el('td', {}, r.actor_email || '—'),
+          el('td', { style: 'font-family:monospace;font-size:12px' }, r.action),
+          el('td', { style: 'font-size:12px' }, r.entity_type + (r.entity_id ? ' · ' + r.entity_id : '')),
+          el('td', {}, [
+            renderJsonCell('before', safeParse(r.before_json)),
+            renderJsonCell('after',  safeParse(r.after_json)),
+          ].filter(Boolean)),
+        ]))),
+      ]);
+      list.appendChild(table);
+
+      pager.innerHTML = '';
+      const hasPrev = auditState.offset > 0;
+      const hasNext = end < data.total;
+      pager.appendChild(el('button', { class: 'btn btn-ghost btn-sm', disabled: hasPrev ? null : 'disabled',
+        onclick: () => { if (!hasPrev) return; auditState.offset = Math.max(0, auditState.offset - auditState.limit); refreshAudit(); } }, '← Prev'));
+      pager.appendChild(el('button', { class: 'btn btn-ghost btn-sm', disabled: hasNext ? null : 'disabled',
+        onclick: () => { if (!hasNext) return; auditState.offset += auditState.limit; refreshAudit(); } }, 'Next →'));
+    }
+    refreshAudit();
+  }
+
+  if (can('manageFirm')) {
     const inboundOn  = !!state.firm.inboundEmailConfigured;
     const inboundAddr = state.firm.inboundEmailAddress || '';
     const webhookUrl  = window.location.origin + '/api/webhooks/inbound-email';

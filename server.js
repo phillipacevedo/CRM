@@ -602,6 +602,26 @@ db.exec(`
     created_by   TEXT,
     created_at   TEXT DEFAULT (datetime('now'))
   );
+
+  -- Append-only audit log. Same invariant as trust_ledger: never updated,
+  -- never deleted. Records actor + action + entity + before/after JSON for the
+  -- mutating routes that IOLTA reviewers, partners, or post-incident reviews
+  -- care about (invoice status, time-entry admin override, matter rate change,
+  -- trust reversal, seat role/cap change, payment config).
+  CREATE TABLE IF NOT EXISTS audit_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    firm_id      TEXT NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
+    actor_email  TEXT,
+    action       TEXT NOT NULL,
+    entity_type  TEXT NOT NULL,
+    entity_id    TEXT,
+    before_json  TEXT,
+    after_json   TEXT,
+    at           TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_audit_firm_at      ON audit_log(firm_id, at DESC);
+  CREATE INDEX IF NOT EXISTS idx_audit_firm_entity  ON audit_log(firm_id, entity_type, entity_id);
+  CREATE INDEX IF NOT EXISTS idx_audit_firm_actor   ON audit_log(firm_id, actor_email);
 `);
 
 // ── MIGRATIONS (idempotent ALTERs) ──────────────────────────────────────
@@ -850,6 +870,30 @@ function uid(prefix='_') {
 }
 
 const fmtMoney = (n) => '$' + (Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+// Append-only audit log writer. Pass `req` (for actor + firm_id), a verb-like
+// action name, the entity type/id, and optional before/after snapshots. Stored
+// as JSON; pass plain objects or null. Never throws — audit failure must never
+// take down the underlying mutating route, but it does log so we notice.
+const _auditInsert = db.prepare(`
+  INSERT INTO audit_log (firm_id, actor_email, action, entity_type, entity_id, before_json, after_json)
+  VALUES (?, ?, ?, ?, ?, ?, ?)
+`);
+function logAudit(req, action, entityType, entityId, before, after) {
+  try {
+    _auditInsert.run(
+      req.user.firmId,
+      req.user.email || null,
+      String(action),
+      String(entityType),
+      entityId == null ? null : String(entityId),
+      before == null ? null : JSON.stringify(before),
+      after  == null ? null : JSON.stringify(after),
+    );
+  } catch(e) {
+    console.error('logAudit failed:', e.message, { action, entityType, entityId });
+  }
+}
 
 function makeToken(user, firm) {
   return jwt.sign({
@@ -1468,6 +1512,9 @@ app.put('/api/seats/:email', authRequired, adminRequired, (req, res) => {
   const newDtSub  = typeof dtSubscriber  === 'boolean' ? (dtSubscriber  ? 1 : 0) : u.dt_subscriber;
   db.prepare('UPDATE users SET first_name=?, last_name=?, name=?, role=?, default_rate=?, discount_rate=?, active=?, dt_subscriber=? WHERE email=?')
     .run(newFirst, newLast, newName, newRole, newRate, newDisc, newActive, newDtSub, emailLower);
+  logAudit(req, 'seat.update', 'user', emailLower,
+    { role: u.role, default_rate: u.default_rate, discount_rate: u.discount_rate, active: u.active, dt_subscriber: u.dt_subscriber, name: u.name },
+    { role: newRole, default_rate: newRate, discount_rate: newDisc, active: newActive, dt_subscriber: newDtSub, name: newName });
   res.json({ ok: true });
 });
 
@@ -1478,6 +1525,7 @@ app.patch('/api/seats/:email', authRequired, adminRequired, (req, res) => {
   if (!u) return res.status(404).json({ error: 'User not found' });
   const v = req.body.isAdmin ? 1 : 0;
   db.prepare('UPDATE users SET is_admin = ? WHERE email = ?').run(v, emailLower);
+  logAudit(req, 'seat.admin_toggle', 'user', emailLower, { is_admin: u.is_admin }, { is_admin: v });
   res.json({ ok: true });
 });
 
@@ -1488,6 +1536,7 @@ app.delete('/api/seats/:email', authRequired, adminRequired, (req, res) => {
   if (!u) return res.status(404).json({ error: 'User not found' });
   // Soft-delete: mark inactive so historical time entries / invoices remain readable.
   db.prepare('UPDATE users SET active = 0 WHERE email = ?').run(emailLower);
+  logAudit(req, 'seat.deactivate', 'user', emailLower, { active: u.active, role: u.role }, { active: 0 });
   res.json({ ok: true });
 });
 
@@ -1599,6 +1648,58 @@ app.delete('/api/admin/backups/:filename', authRequired, requireCap('manageFirm'
   if (!fs.existsSync(full)) return res.status(404).json({ error: 'Not found' });
   fs.unlinkSync(full);
   res.json({ ok: true });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// AUDIT LOG (append-only, admin-only read)
+// ═══════════════════════════════════════════════════════════════════════
+// Same invariant as trust_ledger: writes happen via logAudit() inside the
+// mutating routes (invoice status, time-entry admin override, matter rates,
+// trust reversals, seat changes, payments config). No public write route.
+
+function buildAuditQuery(req) {
+  const where  = ['firm_id = ?'];
+  const params = [req.user.firmId];
+  if (req.query.actor) {
+    where.push('LOWER(actor_email) LIKE ?');
+    params.push('%' + String(req.query.actor).toLowerCase() + '%');
+  }
+  if (req.query.entityType) { where.push('entity_type = ?'); params.push(String(req.query.entityType)); }
+  if (req.query.entityId)   { where.push('entity_id   = ?'); params.push(String(req.query.entityId)); }
+  if (req.query.action)     { where.push('action      = ?'); params.push(String(req.query.action)); }
+  if (req.query.from)       { where.push('at >= ?');         params.push(String(req.query.from)); }
+  if (req.query.to)         { where.push('at <= ?');         params.push(String(req.query.to) + 'T23:59:59'); }
+  return { whereSql: where.join(' AND '), params };
+}
+
+app.get('/api/audit-log', authRequired, verifyFirmMembership, requireCap('manageFirm'), (req, res) => {
+  const { whereSql, params } = buildAuditQuery(req);
+  const limit  = Math.min(parseInt(req.query.limit  || '100', 10) || 100, 500);
+  const offset = Math.max(parseInt(req.query.offset || '0',   10) || 0,   0);
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE ${whereSql}`).get(...params).n;
+  const rows  = db.prepare(`SELECT * FROM audit_log WHERE ${whereSql} ORDER BY at DESC, id DESC LIMIT ? OFFSET ?`)
+    .all(...params, limit, offset);
+  // Surface distinct action + entity_type values for filter dropdowns.
+  const actions      = db.prepare(`SELECT DISTINCT action      FROM audit_log WHERE firm_id = ? ORDER BY action`).all(req.user.firmId).map(r => r.action);
+  const entityTypes  = db.prepare(`SELECT DISTINCT entity_type FROM audit_log WHERE firm_id = ? ORDER BY entity_type`).all(req.user.firmId).map(r => r.entity_type);
+  res.json({ total, limit, offset, rows, actions, entityTypes });
+});
+
+app.get('/api/audit-log.csv', authRequired, verifyFirmMembership, requireCap('manageFirm'), (req, res) => {
+  const { whereSql, params } = buildAuditQuery(req);
+  const rows = db.prepare(`SELECT * FROM audit_log WHERE ${whereSql} ORDER BY at DESC, id DESC LIMIT 10000`).all(...params);
+  const csvCell = (v) => {
+    if (v == null) return '';
+    const s = String(v).replace(/"/g, '""');
+    return /[",\n\r]/.test(s) ? `"${s}"` : s;
+  };
+  const lines = ['id,at,actor_email,action,entity_type,entity_id,before_json,after_json'];
+  for (const r of rows) {
+    lines.push([r.id, r.at, r.actor_email, r.action, r.entity_type, r.entity_id, r.before_json, r.after_json].map(csvCell).join(','));
+  }
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="audit-log-${new Date().toISOString().slice(0,10)}.csv"`);
+  res.send(lines.join('\n'));
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1718,6 +1819,19 @@ app.put('/api/firm/payments', authRequired, requireCap('manageFirm'), (req, res)
     next.stripe_webhook_secret, next.mercury_token, next.mercury_operating_account_id,
     next.mercury_trust_account_id, next.ach_enabled, next.card_enabled
   );
+  // Redact secrets in the audit log — record presence/absence only for
+  // sensitive fields, full values for non-secret identifiers and toggles.
+  const redact = (c) => c ? {
+    stripe_account_id:            c.stripe_account_id,
+    stripe_publishable:           c.stripe_publishable,
+    stripe_secret_key:            c.stripe_secret_key ? '[set]' : null,
+    stripe_webhook_secret:        c.stripe_webhook_secret ? '[set]' : null,
+    mercury_token:                c.mercury_token ? '[set]' : null,
+    mercury_operating_account_id: c.mercury_operating_account_id,
+    mercury_trust_account_id:     c.mercury_trust_account_id,
+    ach_enabled:  c.ach_enabled, card_enabled: c.card_enabled,
+  } : null;
+  logAudit(req, 'payments.config_update', 'firm_payment_config', firmId, redact(cur), redact(next));
   res.json({ ok: true });
 });
 
@@ -2596,12 +2710,14 @@ app.put('/api/matters/:id/rates', authRequired, verifyFirmMembership, requireCap
   const list = (Array.isArray(req.body) ? req.body : [])
     .map(it => ({ userEmail: String(it.userEmail || '').toLowerCase(), rate: Number(it.rate) }))
     .filter(it => it.userEmail && Number.isFinite(it.rate) && it.rate > 0);
+  const before = db.prepare('SELECT user_email, rate FROM matter_rates WHERE matter_id = ?').all(req.params.id);
   const tx = db.transaction((items) => {
     db.prepare('DELETE FROM matter_rates WHERE matter_id = ?').run(req.params.id);
     const ins = db.prepare('INSERT INTO matter_rates (matter_id, user_email, rate) VALUES (?,?,?)');
     items.forEach(it => ins.run(req.params.id, it.userEmail, it.rate));
   });
   tx(list);
+  logAudit(req, 'matter.rates_change', 'matter', req.params.id, { rates: before }, { rates: list });
   res.json({ ok: true });
 });
 
@@ -2869,7 +2985,16 @@ app.put('/api/time/:id', authRequired, verifyFirmMembership, requireCap('logTime
     b.description ?? null, typeof b.billable === 'boolean' ? (b.billable?1:0) : null,
     startTime,
     req.params.id);
-  res.json(db.prepare('SELECT * FROM time_entries WHERE id = ?').get(req.params.id));
+  const after = db.prepare('SELECT * FROM time_entries WHERE id = ?').get(req.params.id);
+  // Only audit override cases: admin editing someone else's entry, or admin
+  // editing a billed (locked) entry. Self-edits on draft are routine.
+  const isOverride = existing.user_email !== req.user.email || existing.status === 'billed';
+  if (isOverride) {
+    logAudit(req, 'time_entry.admin_override', 'time_entry', existing.id,
+      { user_email: existing.user_email, date: existing.date, minutes: existing.minutes, description: existing.description, billable: existing.billable, status: existing.status },
+      { user_email: after.user_email,    date: after.date,    minutes: after.minutes,    description: after.description,    billable: after.billable,    status: after.status });
+  }
+  res.json(after);
 });
 
 app.delete('/api/time/:id', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
@@ -2878,6 +3003,10 @@ app.delete('/api/time/:id', authRequired, verifyFirmMembership, requireCap('logT
   if (t.user_email !== req.user.email && !CAPS.manageBilling(req.user)) return res.status(403).json({ error: 'Not your entry' });
   if (t.status === 'billed') return res.status(400).json({ error: 'Billed entries cannot be deleted' });
   db.prepare('DELETE FROM time_entries WHERE id = ?').run(req.params.id);
+  if (t.user_email !== req.user.email) {
+    logAudit(req, 'time_entry.admin_delete', 'time_entry', t.id,
+      { user_email: t.user_email, date: t.date, minutes: t.minutes, description: t.description, billable: t.billable, status: t.status }, null);
+  }
   res.json({ ok: true });
 });
 
@@ -3095,6 +3224,7 @@ app.patch('/api/invoices/:id/status', authRequired, verifyFirmMembership, requir
   if (!['draft','sent','paid','void'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
   const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
   if (!inv) return res.status(404).json({ error: 'Not found' });
+  if (inv.status === status) return res.json({ ok: true });
   db.prepare(`UPDATE invoices SET status = ?, amount_paid = CASE ? WHEN 'paid' THEN total WHEN 'void' THEN 0 ELSE amount_paid END, updated_at = datetime('now') WHERE id = ?`)
     .run(status, status, req.params.id);
   // If voided, release the time entries and expenses
@@ -3102,6 +3232,9 @@ app.patch('/api/invoices/:id/status', authRequired, verifyFirmMembership, requir
     db.prepare(`UPDATE time_entries SET invoice_id = NULL, status = 'draft', updated_at = datetime('now') WHERE invoice_id = ?`).run(req.params.id);
     db.prepare(`UPDATE expenses     SET invoice_id = NULL, status = 'draft', updated_at = datetime('now') WHERE invoice_id = ?`).run(req.params.id);
   }
+  logAudit(req, 'invoice.status_change', 'invoice', inv.id,
+    { status: inv.status, amount_paid: inv.amount_paid, invoice_number: inv.invoice_number, total: inv.total },
+    { status, invoice_number: inv.invoice_number, total: inv.total });
   res.json({ ok: true });
 });
 
@@ -4535,6 +4668,9 @@ app.delete('/api/trust/:id', authRequired, verifyFirmMembership, requireCap('man
     id, req.user.firmId, t.client_contact_id, t.client_name, t.matter_id,
     'refund', -t.amount, `REVERSE ${t.id}`, new Date().toISOString(),
     `Reversal of ${t.kind} posted ${t.occurred_at}`, req.user.email);
+  logAudit(req, 'trust.reversal', 'trust_ledger', t.id,
+    { kind: t.kind, amount: t.amount, client_name: t.client_name, client_contact_id: t.client_contact_id, matter_id: t.matter_id, occurred_at: t.occurred_at, reference: t.reference, notes: t.notes },
+    { reversal_id: id, amount: -t.amount });
   res.json({ ok: true, reversalId: id });
 });
 
