@@ -218,13 +218,25 @@ The app is now big enough that menu-hunting is the main friction.
 
 **UI:** "Backups" card in Settings → Firm. Shows last successful backup time and last error if any. Table of backup files with size, created date, Download/Delete buttons. "Backup now" + "Refresh" buttons.
 
-### 6.6 Two-factor auth (TOTP)
-A firm holding trust funds should offer this even if not required.
-- `users.totp_secret` (encrypted with `PAYMENTS_KEK` or a dedicated `AUTH_KEK`), `totp_enabled` boolean
-- `otplib` for verification, QR generation via `qrcode` (server-side, no extra dependency on a renderer)
-- Profile settings: "Enable 2FA" → show QR + manual key → confirm with a 6-digit code before flipping `totp_enabled`
-- Login flow: after password success, if `totp_enabled`, prompt for code before issuing the JWT
-- Admin override: admin can disable 2FA for a seat (logged to audit log) in case a user loses their device
+### 6.6 Two-factor auth (TOTP) ✅
+**Schema:** `users.totp_secret` (encrypted via existing `encryptSecret()` / `PAYMENTS_KEK`), `users.totp_enabled INTEGER DEFAULT 0`. If `PAYMENTS_KEK` is unset, 2FA endpoints return 503 — plaintext TOTP secrets in a stolen DB would defeat the second factor.
+
+**Deps:** `otplib@12` (sync API; v13 went async + breaking) and `qrcode` for server-side QR data URI generation.
+
+**Self-service endpoints:**
+- `GET  /api/me/2fa` — `{ enabled, available }` for the UI.
+- `POST /api/me/2fa/setup` — generates a fresh secret + otpauth URL + QR data URI; stateless (client holds the secret until enable).
+- `POST /api/me/2fa/enable` body `{ secret, code }` — verifies code, encrypts and persists, flips `totp_enabled=1`. Audit-logged.
+- `POST /api/me/2fa/disable` body `{ code }` — verifies current code (so a hijacked session can't simply turn it off), clears secret + flag. Audit-logged.
+
+**Login flow:** `POST /api/auth/login` returns `{ totpRequired: true, challengeToken }` (5-min JWT with `purpose: '2fa_challenge'`) instead of issuing a session when `totp_enabled`. `POST /api/auth/2fa-verify` body `{ challengeToken, code }` exchanges the challenge + code for the real session JWT. Both routes rate-limited via the existing `authLimiter`. (SSO exchanges `dt-exchange`/`spv-exchange` not gated — sibling apps remain trust boundary; revisit if needed.)
+
+**Admin override:** `POST /api/seats/:email/2fa/reset` clears `totp_*` for a seat (used when a user loses their device). Admin-only, can't target self (admin uses /api/me/2fa/disable). Audit-logged. `GET /api/seats` now returns `totpEnabled` for the UI badge + Reset button visibility.
+
+**UI:**
+- Login page (`public/index.html`): a second form replaces the password form when `totpRequired=true`. Shows a 6-digit input with `autocomplete="one-time-code"` for OS autofill; "Use a different account" link returns to password form.
+- Settings → Profile: "Two-factor authentication" card with status badge + Enable/Disable button. Enable modal shows the QR + manual key + 6-digit input. Disable modal requires a current code.
+- Settings → Team: a green "2FA" badge appears next to seats with it enabled. Edit modal exposes "Reset 2FA" (visible only when the seat has 2FA on).
 
 ### 6.7 Calendar feed (iCal)
 Surface deadlines without building an integration.
@@ -313,7 +325,7 @@ May 2026         Phase 6.5 ✅ complete (automated nightly DB backup)
 May 2026         Phase 6.9 ✅ complete (time-entry widget — localStorage fallback layered on existing topbar timer)
 May 2026         Phase 6.1 ✅ complete (recurring invoices + trust auto-replenishment)
 May 2026         Phase 6.4 ✅ complete (audit log: helper + 6 mutating routes + admin UI + CSV export)
-July 2026        Phase 6.6 (2FA — second half of compliance bundle)
+May 2026         Phase 6.6 ✅ complete (TOTP 2FA: enroll, login challenge, admin reset)
 July 2026        Phase 6.2 (client portal v1: tokenized invoice share links)
 Aug  2026        Phase 6.3, 6.7 (global search, calendar feed — quality of life)
 Aug  2026        Phase 6.8 (document templates)

@@ -15,6 +15,11 @@ const nodemailer = require('nodemailer');
 const Database   = require('better-sqlite3');
 const rateLimit  = require('express-rate-limit');
 const PDFDocument = require('pdfkit');
+const { authenticator } = require('otplib');
+const QRCode    = require('qrcode');
+// TOTP defaults are 30-second period, 6-digit code, sha1. Allow ±1 step of
+// drift so a code generated as the boundary ticks doesn't get rejected.
+authenticator.options = { window: 1 };
 
 // Optional: Anthropic SDK for receipt OCR. Server still boots if package or key is missing.
 let anthropicClient = null;
@@ -666,6 +671,11 @@ const migrations = [
   `ALTER TABLE matters ADD COLUMN billing_schedule TEXT`,
   `ALTER TABLE matters ADD COLUMN trust_min_balance REAL DEFAULT 0`,
   `ALTER TABLE matters ADD COLUMN trust_replenish_to REAL`,
+  // 2FA (TOTP). totp_secret stores ciphertext via encryptSecret() — same KEK
+  // as payments. totp_enabled is the source of truth for "this user must
+  // present a 6-digit code at login."
+  `ALTER TABLE users ADD COLUMN totp_secret TEXT`,
+  `ALTER TABLE users ADD COLUMN totp_enabled INTEGER DEFAULT 0`,
 ];
 // Only swallow "duplicate column" errors (idempotency). Anything else — syntax
 // typos, missing table, permission issues — is a real problem and should fail
@@ -1251,6 +1261,12 @@ app.post('/api/auth/logout', authRequired, (req, res) => {
   res.json({ ok: true });
 });
 
+// Short-lived JWT issued after password success when the user has 2FA on.
+// Carries no firm/role claims — its only valid use is /api/auth/2fa-verify.
+function make2faChallenge(email) {
+  return jwt.sign({ email, purpose: '2fa_challenge' }, JWT_SECRET, { expiresIn: '5m' });
+}
+
 app.post('/api/auth/login', authLimiter, async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
@@ -1260,6 +1276,40 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   if (!user.active) return res.status(403).json({ error: 'Account deactivated. Contact your admin.' });
   const ok = await bcrypt.compare(password, user.password_hash);
   if (!ok) return res.status(401).json({ error: 'Invalid email or password' });
+
+  if (user.totp_enabled) {
+    return res.json({ totpRequired: true, challengeToken: make2faChallenge(user.email) });
+  }
+
+  const firm = db.prepare('SELECT * FROM firms WHERE id = ?').get(user.firm_id);
+  const token = makeToken(user, firm);
+  setAuthCookie(res, token);
+  res.json({
+    token,
+    user: {
+      email: user.email, name: user.name, role: user.role, isAdmin: !!user.is_admin,
+      firmId: user.firm_id, firmName: firm?.name || '',
+    }
+  });
+});
+
+app.post('/api/auth/2fa-verify', authLimiter, (req, res) => {
+  const { challengeToken, code } = req.body || {};
+  if (!challengeToken || !code) return res.status(400).json({ error: 'challengeToken and code required' });
+  let payload;
+  try { payload = jwt.verify(challengeToken, JWT_SECRET); }
+  catch (e) { return res.status(401).json({ error: 'Challenge expired or invalid. Sign in again.' }); }
+  if (payload.purpose !== '2fa_challenge') return res.status(401).json({ error: 'Bad challenge token' });
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(payload.email);
+  if (!user || !user.active || !user.totp_enabled || !user.totp_secret) {
+    return res.status(401).json({ error: '2FA no longer active for this account' });
+  }
+  let ok = false;
+  try {
+    const secret = decryptSecret(user.totp_secret);
+    ok = authenticator.check(String(code).replace(/\s+/g, ''), secret);
+  } catch (e) { return res.status(500).json({ error: 'Stored secret could not be read' }); }
+  if (!ok) return res.status(401).json({ error: 'Invalid 6-digit code' });
 
   const firm = db.prepare('SELECT * FROM firms WHERE id = ?').get(user.firm_id);
   const token = makeToken(user, firm);
@@ -1293,6 +1343,83 @@ app.post('/api/auth/change-password', authRequired, async (req, res) => {
   if (!ok) return res.status(401).json({ error: 'Current password is incorrect' });
   const h = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
   db.prepare('UPDATE users SET password_hash = ? WHERE email = ?').run(h, req.user.email);
+  res.json({ ok: true });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 2FA (TOTP)
+// ═══════════════════════════════════════════════════════════════════════
+// Secrets are encrypted with PAYMENTS_KEK (same key the payments module uses).
+// If the KEK isn't set, 2FA endpoints return 503 — a plaintext TOTP secret
+// in a stolen DB would defeat the purpose of having a second factor at all.
+// The enroll flow is stateless: setup returns the new secret to the client,
+// enable accepts (secret, code) and persists once the code verifies.
+
+function require2faEnabled(res) {
+  if (!paymentsEnabled) {
+    res.status(503).json({ error: 'PAYMENTS_KEK not configured on server. 2FA cannot be enabled.' });
+    return false;
+  }
+  return true;
+}
+
+app.get('/api/me/2fa', authRequired, (req, res) => {
+  const u = db.prepare('SELECT totp_enabled FROM users WHERE email = ?').get(req.user.email);
+  res.json({ enabled: !!u?.totp_enabled, available: paymentsEnabled });
+});
+
+app.post('/api/me/2fa/setup', authRequired, async (req, res) => {
+  if (!require2faEnabled(res)) return;
+  const secret = authenticator.generateSecret();
+  const firm = db.prepare('SELECT name FROM firms WHERE id = ?').get(req.user.firmId);
+  const issuer = (firm?.name || 'CRM').replace(/[^A-Za-z0-9 .'-]/g, '').slice(0, 40) || 'CRM';
+  const otpauth = authenticator.keyuri(req.user.email, issuer, secret);
+  let qrDataUri = null;
+  try { qrDataUri = await QRCode.toDataURL(otpauth, { margin: 1, width: 240 }); }
+  catch (e) { console.error('QR generation failed:', e.message); }
+  res.json({ secret, otpauthUrl: otpauth, qrDataUri });
+});
+
+app.post('/api/me/2fa/enable', authRequired, (req, res) => {
+  if (!require2faEnabled(res)) return;
+  const { secret, code } = req.body || {};
+  if (!secret || !code) return res.status(400).json({ error: 'secret and code required' });
+  let ok = false;
+  try { ok = authenticator.check(String(code).replace(/\s+/g, ''), String(secret)); }
+  catch (e) { return res.status(400).json({ error: 'Invalid secret format' }); }
+  if (!ok) return res.status(401).json({ error: 'Code did not verify. Make sure your authenticator clock is correct and try again.' });
+  const u = db.prepare('SELECT totp_enabled FROM users WHERE email = ?').get(req.user.email);
+  db.prepare('UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE email = ?')
+    .run(encryptSecret(secret), req.user.email);
+  logAudit(req, '2fa.enable', 'user', req.user.email, { totp_enabled: u?.totp_enabled || 0 }, { totp_enabled: 1 });
+  res.json({ ok: true });
+});
+
+app.post('/api/me/2fa/disable', authRequired, (req, res) => {
+  const u = db.prepare('SELECT totp_enabled, totp_secret FROM users WHERE email = ?').get(req.user.email);
+  if (!u?.totp_enabled) return res.json({ ok: true });
+  const { code } = req.body || {};
+  if (!code) return res.status(400).json({ error: '6-digit code required to disable 2FA' });
+  let ok = false;
+  try {
+    const secret = decryptSecret(u.totp_secret);
+    ok = authenticator.check(String(code).replace(/\s+/g, ''), secret);
+  } catch (e) { return res.status(500).json({ error: 'Stored secret could not be read' }); }
+  if (!ok) return res.status(401).json({ error: 'Code did not verify' });
+  db.prepare('UPDATE users SET totp_secret = NULL, totp_enabled = 0 WHERE email = ?').run(req.user.email);
+  logAudit(req, '2fa.disable', 'user', req.user.email, { totp_enabled: 1 }, { totp_enabled: 0 });
+  res.json({ ok: true });
+});
+
+// Admin escape hatch — used when a seat has lost their authenticator device.
+app.post('/api/seats/:email/2fa/reset', authRequired, adminRequired, (req, res) => {
+  const emailLower = req.params.email.toLowerCase().trim();
+  if (emailLower === req.user.email) return res.status(400).json({ error: 'Use /api/me/2fa/disable for your own account' });
+  const u = db.prepare('SELECT totp_enabled FROM users WHERE email = ? AND firm_id = ?').get(emailLower, req.user.firmId);
+  if (!u) return res.status(404).json({ error: 'User not found' });
+  if (!u.totp_enabled) return res.json({ ok: true });
+  db.prepare('UPDATE users SET totp_secret = NULL, totp_enabled = 0 WHERE email = ?').run(emailLower);
+  logAudit(req, '2fa.admin_reset', 'user', emailLower, { totp_enabled: 1 }, { totp_enabled: 0 });
   res.json({ ok: true });
 });
 
@@ -1425,7 +1552,7 @@ app.put('/api/me', authRequired, (req, res) => {
 });
 
 app.get('/api/seats', authRequired, verifyFirmMembership, (req, res) => {
-  const users = db.prepare('SELECT email, first_name, last_name, name, role, is_admin, default_rate, discount_rate, active, dt_subscriber, created_at FROM users WHERE firm_id = ? ORDER BY created_at').all(req.user.firmId);
+  const users = db.prepare('SELECT email, first_name, last_name, name, role, is_admin, default_rate, discount_rate, active, dt_subscriber, totp_enabled, created_at FROM users WHERE firm_id = ? ORDER BY created_at').all(req.user.firmId);
   const canSeeRates = CAPS.viewRates(req.user);
   res.json({
     roles: Object.entries(ROLES).map(([id, v]) => ({ id, label: v.label, rank: v.rank })),
@@ -1433,6 +1560,7 @@ app.get('/api/seats', authRequired, verifyFirmMembership, (req, res) => {
       email: u.email, firstName: u.first_name, lastName: u.last_name, name: u.name,
       role: u.role, isAdmin: !!u.is_admin, active: !!u.active,
       dtSubscriber: !!u.dt_subscriber,
+      totpEnabled: !!u.totp_enabled,
       defaultRate:  canSeeRates ? u.default_rate  : null,
       discountRate: canSeeRates ? u.discount_rate : null,
       createdAt: u.created_at,

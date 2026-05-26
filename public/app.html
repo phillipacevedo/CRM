@@ -8353,7 +8353,107 @@ async function renderSettingsProfile(mount) {
     ]),
   ]));
 
+  await render2faCard(mount);
   renderAppearanceCard(mount, profile);
+}
+
+async function render2faCard(mount) {
+  const status = await api('/api/me/2fa').catch(() => ({ enabled: false, available: false }));
+  const card = el('div', { class: 'card mb-24' });
+  const renderBody = () => {
+    card.innerHTML = '';
+    card.appendChild(el('h3', {}, 'Two-factor authentication'));
+    if (!status.available) {
+      card.appendChild(el('div', { style: 'font-size:13px;color:var(--text-muted)' },
+        '2FA is unavailable because the server-side encryption key (PAYMENTS_KEK) is not configured. Ask your admin to set it before enabling 2FA.'));
+      return;
+    }
+    card.appendChild(el('div', { style: 'font-size:13px;color:var(--text-muted);margin-bottom:12px' },
+      status.enabled
+        ? 'Two-factor authentication is enabled on your account. You\'ll be prompted for a 6-digit code at sign-in.'
+        : 'Add an extra layer at sign-in. You\'ll need an authenticator app (Google Authenticator, 1Password, Authy, etc.).'));
+    card.appendChild(el('div', { class: 'row' }, [
+      el('div', {}, status.enabled
+        ? el('span', { style: 'display:inline-block;padding:2px 8px;background:#16a34a;color:#fff;border-radius:4px;font-size:12px' }, 'Enabled')
+        : el('span', { style: 'display:inline-block;padding:2px 8px;background:#94a3b8;color:#fff;border-radius:4px;font-size:12px' }, 'Disabled')),
+      el('div', { class: 'spacer' }),
+      status.enabled
+        ? el('button', { class: 'btn btn-ghost btn-sm', onclick: () => disable2faModal(() => { status.enabled = false; renderBody(); }) }, 'Disable 2FA')
+        : el('button', { class: 'btn btn-primary btn-sm', onclick: () => enable2faModal(() => { status.enabled = true; renderBody(); }) }, 'Enable 2FA'),
+    ]));
+  };
+  renderBody();
+  mount.appendChild(card);
+}
+
+async function enable2faModal(onDone) {
+  let setup;
+  try { setup = await api('/api/me/2fa/setup', { method: 'POST' }); }
+  catch(e) { toast('Could not start 2FA setup: ' + (e.message || ''), true); return; }
+  const body = el('div', {}, [
+    el('div', { style: 'font-size:13px;margin-bottom:12px' },
+      'Scan the QR with your authenticator app, or enter the key manually. Then enter the 6-digit code your app shows to confirm.'),
+    setup.qrDataUri
+      ? el('div', { style: 'text-align:center;margin-bottom:12px' },
+          el('img', { src: setup.qrDataUri, alt: 'QR code', style: 'max-width:240px' }))
+      : el('div', { style: 'color:var(--text-muted);font-size:12px;text-align:center;margin-bottom:12px' }, 'QR could not be generated. Use the manual key below.'),
+    el('div', { class: 'field' }, [
+      el('label', {}, 'Manual key'),
+      el('input', { id: 'totp-secret', readonly: 'readonly', value: setup.secret, style: 'font-family:monospace;font-size:12px' }),
+    ]),
+    el('div', { class: 'field' }, [
+      el('label', {}, '6-digit code'),
+      el('input', { id: 'totp-code-in', type: 'text', inputmode: 'numeric', maxlength: 6, autocomplete: 'one-time-code', placeholder: '123456' }),
+    ]),
+    el('div', { id: 'totp-enable-err', style: 'color:#dc2626;font-size:12px;display:none' }),
+  ]);
+  openModal('Enable two-factor authentication', body, el('div', {}, [
+    el('div', { class: 'spacer' }),
+    el('button', { class: 'btn btn-ghost btn-sm', onclick: closeModal }, 'Cancel'),
+    el('button', { class: 'btn btn-primary btn-sm', onclick: async () => {
+      const code = ($('#totp-code-in').value || '').trim();
+      if (!/^\d{6}$/.test(code)) {
+        const e = $('#totp-enable-err'); e.style.display = ''; e.textContent = 'Enter the 6-digit code from your authenticator.'; return;
+      }
+      try {
+        await api('/api/me/2fa/enable', { method: 'POST', body: { secret: setup.secret, code } });
+      } catch(e) {
+        const er = $('#totp-enable-err'); er.style.display = ''; er.textContent = e.message || 'Could not verify code.';
+        return;
+      }
+      toast('2FA enabled'); closeModal(); onDone && onDone();
+    } }, 'Verify & enable'),
+  ]));
+  setTimeout(() => $('#totp-code-in')?.focus(), 50);
+}
+
+function disable2faModal(onDone) {
+  const body = el('div', {}, [
+    el('div', { style: 'font-size:13px;margin-bottom:12px' },
+      'Enter a current 6-digit code from your authenticator to confirm.'),
+    el('div', { class: 'field' }, [
+      el('label', {}, '6-digit code'),
+      el('input', { id: 'totp-disable-code', type: 'text', inputmode: 'numeric', maxlength: 6, autocomplete: 'one-time-code', placeholder: '123456' }),
+    ]),
+    el('div', { id: 'totp-disable-err', style: 'color:#dc2626;font-size:12px;display:none' }),
+  ]);
+  openModal('Disable two-factor authentication', body, el('div', {}, [
+    el('div', { class: 'spacer' }),
+    el('button', { class: 'btn btn-ghost btn-sm', onclick: closeModal }, 'Cancel'),
+    el('button', { class: 'btn btn-sm', style: 'background:#dc2626;color:#fff', onclick: async () => {
+      const code = ($('#totp-disable-code').value || '').trim();
+      if (!/^\d{6}$/.test(code)) {
+        const e = $('#totp-disable-err'); e.style.display = ''; e.textContent = 'Enter the 6-digit code from your authenticator.'; return;
+      }
+      try { await api('/api/me/2fa/disable', { method: 'POST', body: { code } }); }
+      catch(e) {
+        const er = $('#totp-disable-err'); er.style.display = ''; er.textContent = e.message || 'Could not verify code.';
+        return;
+      }
+      toast('2FA disabled'); closeModal(); onDone && onDone();
+    } }, 'Disable 2FA'),
+  ]));
+  setTimeout(() => $('#totp-disable-code')?.focus(), 50);
 }
 
 function renderAppearanceCard(mount, profile) {
@@ -8869,6 +8969,7 @@ async function renderSettingsTeam(mount) {
           el('strong', {}, u.name || '—'),
           u.isAdmin      ? el('span', { class: 'badge', style: 'margin-left:6px;background:var(--gold-bg);color:#7a6119' }, 'Admin') : null,
           u.dtSubscriber ? el('span', { class: 'badge', style: 'margin-left:6px;background:#dbeafe;color:#1d4ed8' }, 'DT') : null,
+          u.totpEnabled  ? el('span', { class: 'badge', style: 'margin-left:6px;background:#dcfce7;color:#166534', title: '2FA enabled' }, '2FA') : null,
         ]),
         el('td', {}, u.email ? el('a', { href: 'mailto:' + u.email }, u.email) : '—'),
         el('td', {}, ROLE_LABELS[u.role] || u.role),
@@ -10148,6 +10249,14 @@ function editUserModal(u, roles) {
       await api('/api/seats/' + encodeURIComponent(u.email) + '/reset-password', { method: 'POST' });
       toast('Reset email sent');
     } }, 'Send reset email'),
+    u.totpEnabled ? el('button', { class: 'btn btn-ghost btn-sm', style: 'margin-left:6px', onclick: async () => {
+      if (!confirm('Reset 2FA for ' + u.email + '? They\'ll be able to sign in with just their password until they re-enroll.')) return;
+      try {
+        await api('/api/seats/' + encodeURIComponent(u.email) + '/2fa/reset', { method: 'POST' });
+        toast('2FA reset for ' + u.email);
+        state._users = null; closeModal();
+      } catch(e) { toast('Reset failed: ' + (e.message || ''), true); }
+    } }, 'Reset 2FA') : null,
     el('div', { class: 'spacer' }),
     el('button', { class: 'btn btn-ghost btn-sm', onclick: closeModal }, 'Cancel'),
     el('button', { class: 'btn btn-primary btn-sm', onclick: async () => {

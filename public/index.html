@@ -54,6 +54,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Inter','Segoe UI',sans-serif;
       </div>
       <button id="login-btn" class="btn" type="submit">Sign in</button>
     </form>
+    <form id="totp-form" style="display:none">
+      <div class="field">
+        <label for="totp-code">6-digit code</label>
+        <input id="totp-code" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" maxlength="6" required autofocus>
+      </div>
+      <button id="totp-btn" class="btn" type="submit">Verify</button>
+      <div style="margin-top:8px"><a href="#" id="totp-back">← Use a different account</a></div>
+    </form>
     <div class="links">
       <a href="#" id="forgot">Forgot password?</a>
     </div>
@@ -87,6 +95,19 @@ fetch('/api/auth/me', { credentials: 'include' }).then(r => { if (r.ok) window.l
   } catch(e) {}
 })();
 
+let _challengeToken = null;
+function showTotp() {
+  $('#login-form').style.display = 'none';
+  $('#totp-form').style.display = '';
+  setTimeout(() => $('#totp-code')?.focus(), 0);
+}
+function showLogin() {
+  $('#totp-form').style.display = 'none';
+  $('#login-form').style.display = '';
+  _challengeToken = null;
+  $('#totp-code').value = '';
+}
+
 $('#login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   hideErr();
@@ -100,10 +121,33 @@ $('#login-form').addEventListener('submit', async (e) => {
       body: JSON.stringify({ email: $('#email').value, password: $('#password').value }),
     });
     const d = await r.json();
-    if (!r.ok) { showErr(d.error || 'Sign-in failed'); btn.disabled = false; btn.textContent = 'Sign in'; return; }
+    btn.disabled = false; btn.textContent = 'Sign in';
+    if (!r.ok) { showErr(d.error || 'Sign-in failed'); return; }
+    if (d.totpRequired) { _challengeToken = d.challengeToken; showTotp(); return; }
     window.location.href = '/app';
   } catch(e) { showErr('Network error'); btn.disabled = false; btn.textContent = 'Sign in'; }
 });
+
+$('#totp-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  hideErr();
+  const btn = $('#totp-btn');
+  btn.disabled = true; btn.innerHTML = '<span class="loader"></span>';
+  try {
+    const r = await fetch('/api/auth/2fa-verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ challengeToken: _challengeToken, code: $('#totp-code').value }),
+    });
+    const d = await r.json();
+    btn.disabled = false; btn.textContent = 'Verify';
+    if (!r.ok) { showErr(d.error || 'Verification failed'); $('#totp-code').select(); return; }
+    window.location.href = '/app';
+  } catch(e) { showErr('Network error'); btn.disabled = false; btn.textContent = 'Verify'; }
+});
+
+$('#totp-back').addEventListener('click', (e) => { e.preventDefault(); hideErr(); showLogin(); });
 
 $('#forgot').addEventListener('click', async (e) => {
   e.preventDefault();
