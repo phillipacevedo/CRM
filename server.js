@@ -571,6 +571,21 @@ db.exec(`
     created_at   TEXT DEFAULT (datetime('now'))
   );
 
+  -- Phase 6.2 client portal: read-only invoice share links. Token grants
+  -- anonymous read access to one invoice (HTML view + PDF download); pay
+  -- button mints a payment_links token on demand.
+  CREATE TABLE IF NOT EXISTS invoice_share_tokens (
+    token        TEXT PRIMARY KEY,
+    firm_id      TEXT NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
+    invoice_id   TEXT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+    created_by   TEXT,
+    expires_at   TEXT,
+    revoked_at   TEXT,
+    last_viewed_at TEXT,
+    view_count   INTEGER DEFAULT 0,
+    created_at   TEXT DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS bank_transactions (
     id                    TEXT PRIMARY KEY,   -- Mercury's transaction id
     firm_id               TEXT NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
@@ -835,6 +850,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_invpay_invoice ON invoice_payments(invoice_id);
   CREATE INDEX IF NOT EXISTS idx_invpay_firm    ON invoice_payments(firm_id, status);
   CREATE INDEX IF NOT EXISTS idx_paylinks_invoice ON payment_links(invoice_id);
+  CREATE INDEX IF NOT EXISTS idx_sharetokens_invoice ON invoice_share_tokens(invoice_id);
+  CREATE INDEX IF NOT EXISTS idx_sharetokens_firm    ON invoice_share_tokens(firm_id);
   CREATE INDEX IF NOT EXISTS idx_banktx_firm   ON bank_transactions(firm_id, posted_at);
   CREATE INDEX IF NOT EXISTS idx_banktx_unrec  ON bank_transactions(firm_id) WHERE reconciled_payment_id IS NULL;
   CREATE INDEX IF NOT EXISTS idx_invadj_invoice ON invoice_adjustments(invoice_id);
@@ -3588,6 +3605,73 @@ app.get('/api/invoices/:id/payment-links', authRequired, verifyFirmMembership, r
   })));
 });
 
+// ── Phase 6.2: read-only invoice share links (client portal v1) ──────────
+// Mints a token that grants anonymous read-only access to one invoice at
+// /portal/invoice/:token. Reuses any active token to avoid piling up links
+// on repeated clicks.
+app.post('/api/invoices/:id/share-link', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const inv = db.prepare('SELECT id FROM invoices WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  if (!inv) return res.status(404).json({ error: 'Invoice not found' });
+
+  const expiresInDays = Math.max(1, Math.min(365, parseInt(req.body?.expiresInDays ?? 60, 10)));
+  const nowMs = Date.now();
+
+  // Reuse an active (unrevoked, unexpired) token so the same recipient can
+  // bookmark a stable URL rather than getting a new one each share.
+  const existing = db.prepare(`SELECT * FROM invoice_share_tokens
+                               WHERE invoice_id = ? AND firm_id = ?
+                                 AND revoked_at IS NULL
+                                 AND (expires_at IS NULL OR expires_at > datetime('now'))
+                               ORDER BY created_at DESC LIMIT 1`).get(inv.id, req.user.firmId);
+  if (existing) {
+    const base = (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host');
+    return res.json({
+      token: existing.token,
+      url: base + '/portal/invoice/' + existing.token,
+      expiresAt: existing.expires_at,
+      reused: true,
+    });
+  }
+
+  const token = crypto.randomBytes(32).toString('base64url');
+  const expiresAt = new Date(nowMs + expiresInDays * 86400000).toISOString();
+  db.prepare(`INSERT INTO invoice_share_tokens (token, firm_id, invoice_id, created_by, expires_at)
+              VALUES (?, ?, ?, ?, ?)`)
+    .run(token, req.user.firmId, inv.id, req.user.email, expiresAt);
+
+  logAudit(req, 'invoice.share_link_create', 'invoice', inv.id, null, { token, expires_at: expiresAt });
+
+  const base = (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host');
+  res.json({ token, url: base + '/portal/invoice/' + token, expiresAt, reused: false });
+});
+
+app.get('/api/invoices/:id/share-links', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const inv = db.prepare('SELECT id FROM invoices WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  if (!inv) return res.status(404).json({ error: 'Invoice not found' });
+  const rows = db.prepare(`SELECT token, created_by, created_at, expires_at, revoked_at, last_viewed_at, view_count
+                           FROM invoice_share_tokens
+                           WHERE invoice_id = ? AND firm_id = ?
+                           ORDER BY created_at DESC LIMIT 20`).all(inv.id, req.user.firmId);
+  const base = (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host');
+  res.json(rows.map(r => ({
+    ...r,
+    url: base + '/portal/invoice/' + r.token,
+    expired: r.expires_at && new Date(r.expires_at) < new Date(),
+    active: !r.revoked_at && (!r.expires_at || new Date(r.expires_at) > new Date()),
+  })));
+});
+
+app.post('/api/invoices/:id/share-links/:token/revoke', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  const row = db.prepare(`SELECT * FROM invoice_share_tokens
+                          WHERE token = ? AND invoice_id = ? AND firm_id = ?`)
+    .get(req.params.token, req.params.id, req.user.firmId);
+  if (!row) return res.status(404).json({ error: 'Share link not found' });
+  if (row.revoked_at) return res.json({ ok: true, alreadyRevoked: true });
+  db.prepare(`UPDATE invoice_share_tokens SET revoked_at = datetime('now') WHERE token = ?`).run(row.token);
+  logAudit(req, 'invoice.share_link_revoke', 'invoice', req.params.id, { token: row.token }, { revoked_at: new Date().toISOString() });
+  res.json({ ok: true });
+});
+
 // ── Payment reminder email (Phase 5.4) ──────────────────────────────────
 app.post('/api/invoices/:id/reminder', authRequired, verifyFirmMembership, requireCap('manageBilling'), async (req, res) => {
   if (!mailer) return res.status(503).json({ error: 'Email sending is not configured (SMTP env vars missing)' });
@@ -3818,6 +3902,227 @@ app.get('/pay/:token/complete', payLimiter, (req, res) => {
   }
   return res.type('html').send(renderSimplePayPage('Payment not completed',
     'The payment was not completed. You can return to the pay link and try again.'));
+});
+
+// ── Phase 6.2: client portal (read-only invoice view) ──────────────────
+// Resolves a share token to an invoice, applying expiry / revocation /
+// invoice-status gates. Returns `{ error, status }` on failure so callers
+// can choose the right HTTP code without redundant query work.
+function loadShareTokenForView(token) {
+  const link = db.prepare('SELECT * FROM invoice_share_tokens WHERE token = ?').get(token);
+  if (!link) return { error: 'Link not found', message: 'This share link is invalid or has been removed.', status: 404 };
+  if (link.revoked_at) return { error: 'Link revoked', message: 'This share link was revoked by the firm. Please contact them for a new one.', status: 410 };
+  if (link.expires_at && new Date(link.expires_at) < new Date()) {
+    return { error: 'Link expired', message: 'This share link has expired. Please contact the firm for a new one.', status: 410 };
+  }
+  const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?').get(link.invoice_id, link.firm_id);
+  if (!inv || inv.status === 'void' || inv.status === 'draft') {
+    return { error: 'Invoice unavailable', message: 'This invoice is no longer available.', status: 404 };
+  }
+  return { link, inv };
+}
+
+function formatMoney(n) {
+  return (Number(n) || 0).toLocaleString('en-US', { style: 'currency', currency: 'usd' });
+}
+
+app.get('/portal/invoice/:token', payLimiter, (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const resolved = loadShareTokenForView(req.params.token);
+  if (resolved.error) {
+    return res.status(resolved.status).type('html').send(renderSimplePayPage(resolved.error, resolved.message));
+  }
+  const { link, inv } = resolved;
+
+  db.prepare(`UPDATE invoice_share_tokens
+              SET last_viewed_at = datetime('now'), view_count = COALESCE(view_count,0) + 1
+              WHERE token = ?`).run(link.token);
+
+  const lines = db.prepare('SELECT * FROM invoice_lines WHERE invoice_id = ? ORDER BY sort_order, id').all(inv.id);
+  const adjustments = db.prepare(`SELECT amount FROM invoice_adjustments WHERE invoice_id = ?`).all(inv.id);
+  const adjustmentsTotal = adjustments.reduce((s, a) => s + (Number(a.amount) || 0), 0);
+  const firm = db.prepare('SELECT name, settings FROM firms WHERE id = ?').get(link.firm_id);
+  const firmSettings = parseJSON(firm.settings, {});
+  const balance = +(Number(inv.total || 0) + adjustmentsTotal - Number(inv.amount_paid || 0)).toFixed(2);
+  const paid = +Number(inv.amount_paid || 0).toFixed(2);
+  const cfg = readPaymentConfig(link.firm_id);
+  const canPay = balance > 0.005 && inv.status === 'sent' && cfg && cfg.stripe_secret_key && cfg.stripe_publishable && (cfg.card_enabled || cfg.ach_enabled);
+  const issuedFmt = inv.issued_at ? new Date(inv.issued_at).toLocaleDateString() : '—';
+  const dueFmt    = inv.due_at    ? new Date(inv.due_at).toLocaleDateString()    : '—';
+
+  const lineRows = lines.map(l => `
+    <tr>
+      <td>${escHtml(l.description || '')}</td>
+      <td class="num">${l.quantity != null ? escHtml(Number(l.quantity).toFixed(2)) : ''}</td>
+      <td class="num">${l.rate ? escHtml(formatMoney(l.rate)) : ''}</td>
+      <td class="num">${escHtml(formatMoney(l.amount))}</td>
+    </tr>`).join('');
+
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Invoice ${escHtml(inv.number || inv.id)} — ${escHtml(firm.name)}</title>
+<style>
+  :root{--navy:#0f1f3d;--gold:#c9a227;--cream:#f6f4ef;--muted:#666;--line:#e7e3da}
+  *{box-sizing:border-box}
+  body{font-family:system-ui,-apple-system,Segoe UI,Helvetica,Arial,sans-serif;background:var(--cream);margin:0;padding:24px 16px;color:#222}
+  .card{max-width:760px;margin:20px auto;background:#fff;padding:32px 36px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.06)}
+  .hdr{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid var(--navy);padding-bottom:18px;margin-bottom:22px;flex-wrap:wrap;gap:16px}
+  .hdr h1{font-size:24px;margin:0 0 4px;color:var(--navy);letter-spacing:.5px}
+  .hdr .firm{font-size:13px;color:var(--muted)}
+  .hdr .meta{text-align:right;font-size:13px;color:var(--muted);line-height:1.6}
+  .hdr .meta strong{color:#222;font-weight:600}
+  .bill{display:flex;gap:32px;flex-wrap:wrap;margin-bottom:24px;font-size:13px}
+  .bill .lbl{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-bottom:4px;font-weight:600}
+  table.lines{width:100%;border-collapse:collapse;margin-bottom:20px;font-size:13px}
+  table.lines th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);padding:8px 6px;border-bottom:1px solid var(--line);font-weight:600}
+  table.lines td{padding:9px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+  table.lines td.num,table.lines th.num{text-align:right;white-space:nowrap}
+  .totals{display:flex;justify-content:flex-end;margin-bottom:24px}
+  .totals .box{min-width:260px;font-size:13px}
+  .totals .row{display:flex;justify-content:space-between;padding:6px 0;border-top:1px solid var(--line)}
+  .totals .row:first-child{border-top:none}
+  .totals .row.due{border-top:2px solid var(--navy);padding-top:10px;margin-top:6px;font-size:17px;font-weight:700;color:var(--navy)}
+  .actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end;margin-top:8px}
+  .btn{display:inline-block;padding:11px 18px;font-size:14px;font-weight:600;border-radius:6px;border:0;cursor:pointer;text-decoration:none}
+  .btn-gold{background:var(--gold);color:var(--navy)}
+  .btn-ghost{background:#fff;color:var(--navy);border:1px solid var(--navy)}
+  .notes{margin-top:8px;padding:14px 16px;background:#fbf9f3;border-left:3px solid var(--gold);font-size:13px;color:#333;white-space:pre-wrap}
+  .paidbadge{display:inline-block;padding:4px 10px;border-radius:4px;background:#e6f5ea;color:#1a5c2e;font-size:12px;font-weight:600;letter-spacing:.4px}
+  .footnote{font-size:11px;color:var(--muted);margin-top:22px;text-align:center;border-top:1px solid var(--line);padding-top:14px}
+  @media (max-width:600px){.card{padding:22px 18px}.hdr .meta{text-align:left}}
+</style>
+</head><body>
+<div class="card">
+  <div class="hdr">
+    <div>
+      <h1>Invoice ${escHtml(inv.number || inv.id)}</h1>
+      <div class="firm">${escHtml(firm.name)}</div>
+    </div>
+    <div class="meta">
+      <div>Issued: <strong>${escHtml(issuedFmt)}</strong></div>
+      <div>Due: <strong>${escHtml(dueFmt)}</strong></div>
+      ${inv.status === 'paid' ? '<div style="margin-top:6px"><span class="paidbadge">PAID</span></div>' : ''}
+    </div>
+  </div>
+
+  <div class="bill">
+    <div>
+      <div class="lbl">Billed to</div>
+      <div>${escHtml(inv.client_name || '—')}</div>
+    </div>
+  </div>
+
+  <table class="lines">
+    <thead><tr>
+      <th>Description</th>
+      <th class="num">Qty</th>
+      <th class="num">Rate</th>
+      <th class="num">Amount</th>
+    </tr></thead>
+    <tbody>${lineRows || '<tr><td colspan="4" style="color:var(--muted);text-align:center;padding:18px">No line items.</td></tr>'}</tbody>
+  </table>
+
+  <div class="totals">
+    <div class="box">
+      <div class="row"><span>Subtotal</span><span>${escHtml(formatMoney(inv.subtotal))}</span></div>
+      ${Number(inv.tax) ? `<div class="row"><span>Tax</span><span>${escHtml(formatMoney(inv.tax))}</span></div>` : ''}
+      <div class="row"><span>Total</span><span>${escHtml(formatMoney(inv.total))}</span></div>
+      ${adjustmentsTotal ? `<div class="row"><span>Adjustments</span><span>${escHtml(formatMoney(adjustmentsTotal))}</span></div>` : ''}
+      ${paid ? `<div class="row"><span>Paid to date</span><span>${escHtml(formatMoney(paid))}</span></div>` : ''}
+      <div class="row due"><span>Amount due</span><span>${escHtml(formatMoney(balance))}</span></div>
+    </div>
+  </div>
+
+  ${inv.notes ? `<div class="notes">${escHtml(inv.notes)}</div>` : ''}
+
+  <div class="actions">
+    <a class="btn btn-ghost" href="/portal/invoice/${escHtml(link.token)}/pdf">Download PDF</a>
+    ${canPay ? `<form method="POST" action="/portal/invoice/${escHtml(link.token)}/pay" style="margin:0"><button class="btn btn-gold" type="submit">Pay ${escHtml(formatMoney(balance))}</button></form>` : ''}
+  </div>
+
+  <div class="footnote">If you have questions about this invoice, please contact ${escHtml(firm.name)} directly.</div>
+</div>
+</body></html>`);
+});
+
+// Streams the invoice PDF for the share-token holder. Same rendering as the
+// authed /api/invoices/:id/pdf route, just with token gating.
+app.get('/portal/invoice/:token/pdf', payLimiter, (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const resolved = loadShareTokenForView(req.params.token);
+  if (resolved.error) return res.status(resolved.status).type('html').send(renderSimplePayPage(resolved.error, resolved.message));
+  const { link, inv } = resolved;
+
+  const lines = db.prepare('SELECT * FROM invoice_lines WHERE invoice_id = ? ORDER BY sort_order').all(inv.id);
+  const firm  = db.prepare('SELECT * FROM firms WHERE id = ?').get(link.firm_id);
+  const firmSettings = parseJSON(firm.settings, {});
+  const logoBuffer = firm.logo_data || null;
+  const matter = fetchMatterForInvoice(inv.matter_id, link.firm_id);
+  const client = inv.client_contact_id ? db.prepare('SELECT * FROM contacts WHERE id = ? AND firm_id = ?').get(inv.client_contact_id, link.firm_id) : null;
+  const timeEntries = db.prepare(`
+    SELECT t.*, u.name AS user_name, u.first_name AS user_first, u.last_name AS user_last
+    FROM time_entries t LEFT JOIN users u ON u.email = t.user_email
+    WHERE t.invoice_id = ? ORDER BY t.date, t.created_at
+  `).all(inv.id);
+  const outstandingRow = inv.client_contact_id ? db.prepare(`
+    SELECT COALESCE(SUM(total - amount_paid), 0) AS bal
+    FROM invoices WHERE firm_id = ? AND client_contact_id = ? AND id != ? AND status = 'sent'
+  `).get(link.firm_id, inv.client_contact_id, inv.id) : { bal: 0 };
+  const outstanding = Number(outstandingRow.bal) || 0;
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="${inv.number || inv.id}.pdf"`);
+  const doc = new PDFDocument({ size: 'LETTER', margin: 50 });
+  doc.on('error', (e) => { console.error('Portal PDF stream error:', e); try { res.end(); } catch {} });
+  res.on('close', () => { if (!res.writableEnded) doc.destroy(); });
+  doc.pipe(res);
+  renderInvoicePdf(doc, { firm, firmSettings, inv, lines, matter, client, timeEntries, outstanding, logoBuffer });
+  doc.end();
+});
+
+// Pay button on the portal view mints a payment_links token on demand and
+// redirects to the existing /pay/:token Stripe checkout. Keeping the two
+// token systems separate lets share-link holders pay (or just look) without
+// the firm having to pre-create a pay link.
+app.post('/portal/invoice/:token/pay', payLimiter, (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const resolved = loadShareTokenForView(req.params.token);
+  if (resolved.error) return res.status(resolved.status).type('html').send(renderSimplePayPage(resolved.error, resolved.message));
+  const { link, inv } = resolved;
+
+  const adjustments = db.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM invoice_adjustments WHERE invoice_id = ?`).get(inv.id).s;
+  const balanceCents = Math.max(0, Math.round(((inv.total || 0) + (adjustments || 0) - (inv.amount_paid || 0)) * 100));
+  if (balanceCents <= 0) {
+    return res.status(400).type('html').send(renderSimplePayPage('Nothing to pay', 'This invoice has no outstanding balance. Thank you!'));
+  }
+
+  const cfg = readPaymentConfig(link.firm_id);
+  if (!cfg || !cfg.stripe_secret_key) {
+    return res.status(503).type('html').send(renderSimplePayPage('Payments unavailable',
+      'This firm has not finished connecting Stripe. Please contact them to arrange payment another way.'));
+  }
+
+  // Reuse a live pay-link for this invoice if one exists to avoid creating
+  // a fresh row on every click (and to share the in-flight PaymentIntent
+  // already attached to that token).
+  let payToken = null;
+  const existing = db.prepare(`SELECT token, expires_at, used_at FROM payment_links
+                               WHERE invoice_id = ? AND firm_id = ? AND used_at IS NULL
+                                 AND (expires_at IS NULL OR expires_at > datetime('now'))
+                               ORDER BY created_at DESC LIMIT 1`)
+    .get(inv.id, link.firm_id);
+  if (existing) {
+    payToken = existing.token;
+  } else {
+    payToken = crypto.randomBytes(32).toString('base64url');
+    const expiresAt = new Date(Date.now() + 7 * 86400000).toISOString();
+    db.prepare(`INSERT INTO payment_links
+                (token, firm_id, invoice_id, destination, amount_cents, expires_at, created_by)
+                VALUES (?, ?, ?, 'operating', ?, ?, ?)`)
+      .run(payToken, link.firm_id, inv.id, balanceCents, expiresAt, 'portal:' + link.token);
+  }
+
+  res.redirect(302, '/pay/' + payToken);
 });
 
 // Creates (or reuses) a Stripe PaymentIntent for the pay link. One pending
