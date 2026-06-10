@@ -1543,8 +1543,11 @@ function comboSearch({ items, placeholder, initial, onChange }) {
 
 function csvCell(v) {
   if (v == null) return '';
-  const s = String(v);
-  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  let s = String(v);
+  // Neutralize spreadsheet formula injection (leading =,+,-,@,tab,CR).
+  const formula = /^[=+\-@\t\r]/.test(s);
+  if (formula) s = "'" + s;
+  return (formula || /[",\n\r]/.test(s)) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
 function csvDownload(filename, headers, rows) {

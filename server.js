@@ -50,6 +50,10 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const DT_URL  = (process.env.DT_URL  || 'https://dt.phillipacevedo.com').replace(/\/$/, '');
 const SPV_URL = (process.env.SPV_URL || 'https://spv.phillipacevedo.com').replace(/\/$/, '');
 const LB_URL  = (process.env.LB_URL  || 'https://lb.phillipacevedo.com').replace(/\/$/, '');
+// Shared secret that Leaderboard must present (header X-Export-Token or ?token=)
+// to read the public export endpoints. Unset → endpoints stay open (back-compat)
+// with a startup warning, so this can deploy before LB is updated.
+const LB_EXPORT_TOKEN = process.env.LB_EXPORT_TOKEN || '';
 
 // ── ROLES ───────────────────────────────────────────────────────────────
 // Rank determines permission level. Higher rank = more access.
@@ -152,6 +156,12 @@ const forgotPasswordLimiter = rateLimit({
   windowMs: 60*60*1000, max: 5, standardHeaders: true, legacyHeaders: false,
   message: { error: 'Too many reset requests. Try again later.' },
 });
+// Public, unauthenticated export endpoints (Leaderboard). Rate-limited to blunt
+// scraping even when LB_EXPORT_TOKEN is configured.
+const exportLimiter = rateLimit({
+  windowMs: 15*60*1000, max: 60, standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many export requests. Try again later.' },
+});
 
 // ── PAYMENT-SECRET ENCRYPTION (Stripe keys, Mercury token) ──────────────
 // AES-256-GCM keyed off PAYMENTS_KEK (base64, 32 bytes). If the KEK is missing,
@@ -192,6 +202,14 @@ function decryptSecret(stored) {
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8');
 }
+// One-way hash for single-use links (password resets, invites). The raw token
+// lives only in the emailed URL; the DB stores its SHA-256 so a database read
+// can't be replayed into account takeover. Lookups hash the presented token
+// and compare.
+function hashToken(t) {
+  return crypto.createHash('sha256').update(String(t)).digest('hex');
+}
+
 // Masks secret keys for read endpoints — show only the last 4 chars.
 function maskSecret(s) {
   if (!s) return null;
@@ -928,7 +946,7 @@ function makeToken(user, firm) {
     email: user.email, name: user.name, role: user.role,
     isAdmin: !!user.is_admin, firmId: user.firm_id,
     firmName: firm?.name || '',
-  }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
+  }, JWT_SECRET, { algorithm: 'HS256', expiresIn: JWT_EXPIRY, issuer: 'crm', audience: 'crm' });
 }
 
 function parseJSON(s, fallback) { try { return JSON.parse(s); } catch(e) { return fallback; } }
@@ -943,6 +961,13 @@ app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  // CSS/JS are inlined in the single-file SPA, so 'unsafe-inline' is required;
+  // the remaining directives still block external script origins, framing,
+  // plugins, and base-tag hijacking. img-src allows data: for inline logos.
+  res.setHeader('Content-Security-Policy',
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
+    "img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; " +
+    "base-uri 'self'; frame-ancestors 'none'");
   if (process.env.NODE_ENV === 'production') {
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   }
@@ -951,6 +976,9 @@ app.use((req, res, next) => {
 
 if (ALLOWED_ORIGIN === '*' && process.env.NODE_ENV === 'production') {
   console.warn('WARNING: ALLOWED_ORIGIN is "*" in production. Set it to your domain.');
+}
+if (!LB_EXPORT_TOKEN) {
+  console.warn('WARNING: LB_EXPORT_TOKEN is not set — /api/contacts/export and /api/staff/export are publicly readable. Set it and update Leaderboard to send the X-Export-Token header.');
 }
 app.use(cors(ALLOWED_ORIGIN === '*' ? {} : { origin: ALLOWED_ORIGIN, credentials: true }));
 
@@ -1233,7 +1261,7 @@ function authRequired(req, res, next) {
   const token = getTokenFromRequest(req);
   if (!token) return res.status(401).json({ error: 'Authentication required' });
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
+    const payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'], issuer: 'crm', audience: 'crm' });
     if (payload.jti) {
       const denied = db.prepare('SELECT 1 FROM token_denylist WHERE jti = ?').get(payload.jti);
       if (denied) return res.status(401).json({ error: 'Session revoked. Sign in again.' });
@@ -1281,7 +1309,7 @@ app.post('/api/auth/logout', authRequired, (req, res) => {
 // Short-lived JWT issued after password success when the user has 2FA on.
 // Carries no firm/role claims — its only valid use is /api/auth/2fa-verify.
 function make2faChallenge(email) {
-  return jwt.sign({ email, purpose: '2fa_challenge' }, JWT_SECRET, { expiresIn: '5m' });
+  return jwt.sign({ email, purpose: '2fa_challenge' }, JWT_SECRET, { algorithm: 'HS256', expiresIn: '5m', issuer: 'crm', audience: 'crm' });
 }
 
 app.post('/api/auth/login', authLimiter, async (req, res) => {
@@ -1290,9 +1318,11 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   const emailLower = email.toLowerCase().trim();
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(emailLower);
   if (!user) return res.status(401).json({ error: 'Invalid email or password' });
-  if (!user.active) return res.status(403).json({ error: 'Account deactivated. Contact your admin.' });
   const ok = await bcrypt.compare(password, user.password_hash);
   if (!ok) return res.status(401).json({ error: 'Invalid email or password' });
+  // Only reveal deactivation AFTER the password is verified, so the message
+  // isn't an enumeration oracle for valid emails.
+  if (!user.active) return res.status(403).json({ error: 'Account deactivated. Contact your admin.' });
 
   if (user.totp_enabled) {
     return res.json({ totpRequired: true, challengeToken: make2faChallenge(user.email) });
@@ -1314,7 +1344,7 @@ app.post('/api/auth/2fa-verify', authLimiter, (req, res) => {
   const { challengeToken, code } = req.body || {};
   if (!challengeToken || !code) return res.status(400).json({ error: 'challengeToken and code required' });
   let payload;
-  try { payload = jwt.verify(challengeToken, JWT_SECRET); }
+  try { payload = jwt.verify(challengeToken, JWT_SECRET, { algorithms: ['HS256'], issuer: 'crm', audience: 'crm' }); }
   catch (e) { return res.status(401).json({ error: 'Challenge expired or invalid. Sign in again.' }); }
   if (payload.purpose !== '2fa_challenge') return res.status(401).json({ error: 'Bad challenge token' });
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(payload.email);
@@ -1449,7 +1479,7 @@ app.post('/api/auth/forgot-password', forgotPasswordLimiter, async (req, res) =>
   db.prepare('DELETE FROM password_resets WHERE email = ?').run(emailLower);
   const t = crypto.randomBytes(32).toString('hex');
   const exp = new Date(Date.now() + 3600*1000).toISOString();
-  db.prepare('INSERT INTO password_resets (token, email, expires_at) VALUES (?,?,?)').run(t, emailLower, exp);
+  db.prepare('INSERT INTO password_resets (token, email, expires_at) VALUES (?,?,?)').run(hashToken(t), emailLower, exp);
   const base = req.headers.origin || `${req.protocol}://${req.get('host')}`;
   await sendResetEmail(emailLower, `${base}/reset-password?token=${t}`);
   res.json({ ok: true });
@@ -1459,12 +1489,13 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   const { token, newPassword } = req.body;
   if (!token || !newPassword) return res.status(400).json({ error: 'Token and new password required' });
   if (newPassword.length < 8) return res.status(400).json({ error: 'Password must be at least 8 chars' });
-  const r = db.prepare('SELECT * FROM password_resets WHERE token = ? AND used = 0').get(token);
+  const tokenHash = hashToken(token);
+  const r = db.prepare('SELECT * FROM password_resets WHERE token = ? AND used = 0').get(tokenHash);
   if (!r) return res.status(400).json({ error: 'Invalid or used reset link' });
   if (new Date(r.expires_at) < new Date()) return res.status(400).json({ error: 'Reset link expired' });
   const h = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
   db.prepare('UPDATE users SET password_hash = ? WHERE email = ?').run(h, r.email);
-  db.prepare('UPDATE password_resets SET used = 1 WHERE token = ?').run(token);
+  db.prepare('UPDATE password_resets SET used = 1 WHERE token = ?').run(tokenHash);
   const u = db.prepare('SELECT * FROM users WHERE email = ?').get(r.email);
   const f = db.prepare('SELECT * FROM firms WHERE id = ?').get(u.firm_id);
   const at = makeToken(u, f);
@@ -1475,6 +1506,7 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
 app.post('/api/auth/refresh', authRequired, (req, res) => {
   const u = db.prepare('SELECT * FROM users WHERE email = ?').get(req.user.email);
   if (!u) return res.status(404).json({ error: 'User not found' });
+  if (!u.active) return res.status(403).json({ error: 'Your account has been deactivated' });
   const f = db.prepare('SELECT * FROM firms WHERE id = ?').get(u.firm_id);
   const t = makeToken(u, f);
   setAuthCookie(res, t);
@@ -1499,13 +1531,13 @@ async function exchangeFrom(url, token, res) {
   res.json({ ok: true });
 }
 
-app.post('/api/auth/dt-exchange', async (req, res) => {
+app.post('/api/auth/dt-exchange', authLimiter, async (req, res) => {
   if (!req.body?.token) return res.status(400).json({ error: 'token required' });
   try { await exchangeFrom(DT_URL, req.body.token, res); }
   catch(e) { res.status(503).json({ error: 'Could not reach DealTracker' }); }
 });
 
-app.post('/api/auth/spv-exchange', async (req, res) => {
+app.post('/api/auth/spv-exchange', authLimiter, async (req, res) => {
   if (!req.body?.token) return res.status(400).json({ error: 'token required' });
   try { await exchangeFrom(SPV_URL, req.body.token, res); }
   catch(e) { res.status(503).json({ error: 'Could not reach SPV Tracker' }); }
@@ -1597,7 +1629,7 @@ app.post('/api/seats/invite', authRequired, adminRequired, async (req, res) => {
   const token = crypto.randomBytes(32).toString('hex');
   const exp   = new Date(Date.now() + 72*3600*1000).toISOString();
   db.prepare('INSERT INTO invites (token, email, firm_id, role, is_admin, expires_at) VALUES (?,?,?,?,?,?)')
-    .run(token, emailLower, req.user.firmId, role || 'associate', isAdmin ? 1 : 0, exp);
+    .run(hashToken(token), emailLower, req.user.firmId, role || 'associate', isAdmin ? 1 : 0, exp);
   const firm = db.prepare('SELECT * FROM firms WHERE id = ?').get(req.user.firmId);
   const base = req.headers.origin || `${req.protocol}://${req.get('host')}`;
   await sendInviteEmail(emailLower, `${base}/accept-invite?token=${token}`, firm.name, req.user.name);
@@ -1607,7 +1639,7 @@ app.post('/api/seats/invite', authRequired, adminRequired, async (req, res) => {
 app.get('/api/auth/invite-info', (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).json({ error: 'Token required' });
-  const i = db.prepare('SELECT * FROM invites WHERE token = ? AND used = 0').get(token);
+  const i = db.prepare('SELECT * FROM invites WHERE token = ? AND used = 0').get(hashToken(token));
   if (!i) return res.status(404).json({ error: 'Invalid or used invite' });
   if (new Date(i.expires_at) < new Date()) return res.status(410).json({ error: 'Invite expired' });
   const f = db.prepare('SELECT name FROM firms WHERE id = ?').get(i.firm_id);
@@ -1618,7 +1650,8 @@ app.post('/api/auth/accept-invite', authLimiter, async (req, res) => {
   const { token, firstName, lastName, password } = req.body;
   if (!token || !firstName || !lastName || !password) return res.status(400).json({ error: 'All fields required' });
   if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 chars' });
-  const i = db.prepare('SELECT * FROM invites WHERE token = ? AND used = 0').get(token);
+  const tokenHash = hashToken(token);
+  const i = db.prepare('SELECT * FROM invites WHERE token = ? AND used = 0').get(tokenHash);
   if (!i) return res.status(404).json({ error: 'Invalid invite' });
   if (new Date(i.expires_at) < new Date()) return res.status(410).json({ error: 'Invite expired' });
   const exists = db.prepare('SELECT email FROM users WHERE email = ?').get(i.email);
@@ -1629,7 +1662,7 @@ app.post('/api/auth/accept-invite', authLimiter, async (req, res) => {
   db.transaction(() => {
     db.prepare('INSERT INTO users (email, password_hash, first_name, last_name, name, role, firm_id, is_admin) VALUES (?,?,?,?,?,?,?,?)')
       .run(i.email, hash, firstName.trim(), lastName.trim(), full, i.role, i.firm_id, i.is_admin);
-    db.prepare('UPDATE invites SET used = 1 WHERE token = ?').run(token);
+    db.prepare('UPDATE invites SET used = 1 WHERE token = ?').run(tokenHash);
   })();
 
   const u = db.prepare('SELECT * FROM users WHERE email = ?').get(i.email);
@@ -1692,7 +1725,7 @@ app.post('/api/seats/:email/reset-password', authRequired, adminRequired, async 
   db.prepare('DELETE FROM password_resets WHERE email = ?').run(emailLower);
   const t = crypto.randomBytes(32).toString('hex');
   const exp = new Date(Date.now() + 3600*1000).toISOString();
-  db.prepare('INSERT INTO password_resets (token, email, expires_at) VALUES (?,?,?)').run(t, emailLower, exp);
+  db.prepare('INSERT INTO password_resets (token, email, expires_at) VALUES (?,?,?)').run(hashToken(t), emailLower, exp);
   const base = req.headers.origin || `${req.protocol}://${req.get('host')}`;
   await sendResetEmail(emailLower, `${base}/reset-password?token=${t}`);
   res.json({ ok: true });
@@ -1835,8 +1868,11 @@ app.get('/api/audit-log.csv', authRequired, verifyFirmMembership, requireCap('ma
   const rows = db.prepare(`SELECT * FROM audit_log WHERE ${whereSql} ORDER BY at DESC, id DESC LIMIT 10000`).all(...params);
   const csvCell = (v) => {
     if (v == null) return '';
-    const s = String(v).replace(/"/g, '""');
-    return /[",\n\r]/.test(s) ? `"${s}"` : s;
+    let raw = String(v);
+    const formula = /^[=+\-@\t\r]/.test(raw);
+    if (formula) raw = "'" + raw;
+    const s = raw.replace(/"/g, '""');
+    return (formula || /[",\n\r]/.test(s)) ? `"${s}"` : s;
   };
   const lines = ['id,at,actor_email,action,entity_type,entity_id,before_json,after_json'];
   for (const r of rows) {
@@ -2331,7 +2367,7 @@ app.patch('/api/contacts/:id/stage', authRequired, verifyFirmMembership, require
 // unless ?log=0 is passed (used only by the UI's read-only "view past check" flow).
 app.get('/api/conflict-check', authRequired, verifyFirmMembership, (req, res) => {
   const raw = String(req.query.q || '');
-  const terms = raw.split(/[,\n]+/).map(s => s.trim()).filter(t => t.length >= 2);
+  const terms = raw.split(/[,\n]+/).map(s => s.trim()).filter(t => t.length >= 2).slice(0, 25);
   if (terms.length === 0) return res.json({ results: [], logId: null });
 
   const results = terms.map(term => {
@@ -3370,13 +3406,17 @@ app.patch('/api/invoices/:id/status', authRequired, verifyFirmMembership, requir
   const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
   if (!inv) return res.status(404).json({ error: 'Not found' });
   if (inv.status === status) return res.json({ ok: true });
-  db.prepare(`UPDATE invoices SET status = ?, amount_paid = CASE ? WHEN 'paid' THEN total WHEN 'void' THEN 0 ELSE amount_paid END, updated_at = datetime('now') WHERE id = ?`)
-    .run(status, status, req.params.id);
-  // If voided, release the time entries and expenses
-  if (status === 'void') {
-    db.prepare(`UPDATE time_entries SET invoice_id = NULL, status = 'draft', updated_at = datetime('now') WHERE invoice_id = ?`).run(req.params.id);
-    db.prepare(`UPDATE expenses     SET invoice_id = NULL, status = 'draft', updated_at = datetime('now') WHERE invoice_id = ?`).run(req.params.id);
-  }
+  // Status flip and the void-release of time/expenses must be all-or-nothing:
+  // a partial failure would leave an invoice voided but its entries still locked.
+  db.transaction(() => {
+    db.prepare(`UPDATE invoices SET status = ?, amount_paid = CASE ? WHEN 'paid' THEN total WHEN 'void' THEN 0 ELSE amount_paid END, updated_at = datetime('now') WHERE id = ?`)
+      .run(status, status, req.params.id);
+    // If voided, release the time entries and expenses
+    if (status === 'void') {
+      db.prepare(`UPDATE time_entries SET invoice_id = NULL, status = 'draft', updated_at = datetime('now') WHERE invoice_id = ?`).run(req.params.id);
+      db.prepare(`UPDATE expenses     SET invoice_id = NULL, status = 'draft', updated_at = datetime('now') WHERE invoice_id = ?`).run(req.params.id);
+    }
+  })();
   logAudit(req, 'invoice.status_change', 'invoice', inv.id,
     { status: inv.status, amount_paid: inv.amount_paid, invoice_number: inv.invoice_number, total: inv.total },
     { status, invoice_number: inv.invoice_number, total: inv.total });
@@ -5615,8 +5655,12 @@ app.patch('/api/bank/transactions/:id/unreconcile', authRequired, verifyFirmMemb
 
 function csvEscape(v) {
   if (v == null) return '';
-  const s = String(v);
-  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  let s = String(v);
+  // Neutralize spreadsheet formula injection: a leading =,+,-,@,tab,CR makes
+  // Excel/Sheets evaluate the cell. Prefix with ' and force quoting.
+  const formula = /^[=+\-@\t\r]/.test(s);
+  if (formula) s = "'" + s;
+  if (formula || /[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
 }
 
@@ -5634,6 +5678,7 @@ app.get('/api/contacts/export.csv', authRequired, verifyFirmMembership, (req, re
 // CSV import — accepts { rows: [...] } after the client parses CSV.
 app.post('/api/contacts/import', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
   const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  if (rows.length > 5000) return res.status(400).json({ error: 'Too many rows — import at most 5000 at a time.' });
   let inserted = 0, skipped = 0;
   const tx = db.transaction(() => {
     const ins = db.prepare(`INSERT INTO contacts (
@@ -5854,13 +5899,26 @@ app.get('/api/reports/unbilled-wip', authRequired, verifyFirmMembership, require
 // PUBLIC EXPORTS (for Leaderboard)
 // ═══════════════════════════════════════════════════════════════════════
 
-app.get('/api/contacts/export', (req, res) => {
+// Gate the public exports behind the shared LB token when one is configured.
+// Constant-time compare avoids leaking the token via response timing.
+function requireExportToken(req, res, next) {
+  if (!LB_EXPORT_TOKEN) return next();  // open until a token is configured
+  const presented = req.get('X-Export-Token') || (req.query.token ? String(req.query.token) : '');
+  const a = Buffer.from(presented);
+  const b = Buffer.from(LB_EXPORT_TOKEN);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(401).json({ error: 'Invalid or missing export token' });
+  }
+  next();
+}
+
+app.get('/api/contacts/export', exportLimiter, requireExportToken, (req, res) => {
   // Simple list of client/prospect names. No PII beyond name + company.
   const rows = db.prepare(`SELECT full_name, company_name, type FROM contacts WHERE type IN ('client','prospect') ORDER BY full_name`).all();
   res.json(rows.map(r => ({ name: r.full_name, company: r.company_name || '', type: r.type })));
 });
 
-app.get('/api/staff/export', (req, res) => {
+app.get('/api/staff/export', exportLimiter, requireExportToken, (req, res) => {
   const users = db.prepare(`SELECT name, email FROM users WHERE active = 1 ORDER BY name`).all();
   res.json(users.map(u => ({ name: u.name, email: u.email })));
 });

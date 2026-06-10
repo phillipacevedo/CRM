@@ -33,6 +33,7 @@ button{width:100%;padding:11px;background:#0f1f3d;color:#fff;border:none;border-
   </form>
 </div>
 <script>
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const token = new URLSearchParams(location.search).get('token');
 async function load() {
   if (!token) { document.getElementById('sub').textContent = 'Missing token.'; return; }
@@ -40,7 +41,7 @@ async function load() {
     const r = await fetch('/api/auth/invite-info?token=' + encodeURIComponent(token));
     const d = await r.json();
     if (!r.ok) { document.getElementById('sub').textContent = d.error || 'Invite invalid.'; return; }
-    document.getElementById('sub').innerHTML = `You're invited to join <strong>${d.firmName}</strong> as <strong>${d.role}</strong> (${d.email}).`;
+    document.getElementById('sub').innerHTML = `You're invited to join <strong>${esc(d.firmName)}</strong> as <strong>${esc(d.role)}</strong> (${esc(d.email)}).`;
     document.getElementById('f').style.display = 'block';
   } catch(e) { document.getElementById('sub').textContent = 'Network error.'; }
 }

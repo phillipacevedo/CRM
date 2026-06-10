@@ -14,6 +14,12 @@ if (!email || !newPassword) {
   console.error('Usage: node reset-password.js <email> <new-password>');
   process.exit(1);
 }
+if (newPassword.length < 8) {
+  console.error('Password must be at least 8 characters.');
+  process.exit(1);
+}
+
+const BCRYPT_ROUNDS = 12;  // keep in sync with server.js
 
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'crm.db');
 const db = new Database(DB_PATH);
@@ -26,6 +32,6 @@ if (!user) {
   process.exit(1);
 }
 
-const hash = bcrypt.hashSync(newPassword, 10);
+const hash = bcrypt.hashSync(newPassword, BCRYPT_ROUNDS);
 db.prepare('UPDATE users SET password_hash = ? WHERE email = ?').run(hash, user.email);
 console.log(`Password reset for ${user.name} (${user.email}). You can now log in with the new password.`);
