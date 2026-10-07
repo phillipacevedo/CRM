@@ -119,10 +119,13 @@ a:hover{text-decoration:underline}
 
 /* Grids */
 .grid{display:grid;gap:16px}
-.grid-4{grid-template-columns:repeat(4,1fr)}.grid-5{grid-template-columns:repeat(5,1fr)}
+/* Let grid cells shrink below their content's min width so wide tables scroll inside the card instead of widening the page. */
+.grid > *{min-width:0}
+.grid-4{grid-template-columns:repeat(4,1fr)}.grid-trust{grid-template-columns:minmax(280px,1fr) 2fr}.grid-5{grid-template-columns:repeat(5,1fr)}
 .grid-3{grid-template-columns:repeat(3,1fr)}
 .grid-2{grid-template-columns:repeat(2,1fr)}
 @media (max-width:1100px){.grid-4,.grid-5{grid-template-columns:repeat(2,1fr)}.grid-3{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:1100px){.grid-trust{grid-template-columns:1fr}}
 @media (max-width:700px){.grid-5,.grid-4,.grid-3,.grid-2{grid-template-columns:1fr}}
 
 /* Narrow-viewport responsiveness: let wide data tables scroll horizontally
@@ -141,12 +144,9 @@ a:hover{text-decoration:underline}
   .kanban{flex-direction:column;overflow-x:visible;min-height:auto}
   .kanban-col{width:100%;max-height:none}
   .kanban-cards{max-height:50vh}
-  /* Modal forms tower on small phones (iPhone SE etc.); shrink inputs/labels
-     fluidly. Clamp ceiling matches the existing desktop sizes (13.5/11.5px) so
-     wider screens are unaffected; clamp floor keeps text legible at ~320px. */
-  .modal-body input,.modal-body select,.modal-body textarea{font-size:clamp(12px,3vw,13.5px)}
-  .modal-body label{font-size:clamp(10px,2.5vw,11.5px)}
 }
+
+
 
 .stat-card{background:#fff;border:1px solid var(--border);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow)}
 .stat-card .stat-label{font-size:11px;font-weight:600;color:var(--text-light);text-transform:uppercase;letter-spacing:.5px}
@@ -226,13 +226,14 @@ details.form-section .section-body{padding-top:4px}
 }
 .modal-overlay.open{display:flex}
 .modal{
-  background:#fff;border-radius:12px;width:100%;max-width:640px;max-height:90vh;overflow-y:auto;
+  background:#fff;border-radius:12px;width:100%;max-width:640px;max-height:90vh;overflow:hidden;
   box-shadow:var(--shadow-md);display:flex;flex-direction:column;
 }
 .modal.wide{max-width:900px}
 .modal-header{padding:18px 22px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
 .modal-header h3{font-size:16px;font-weight:700;color:var(--navy)}
-.modal-body{padding:20px 22px;overflow-y:auto}
+.modal-body{padding:20px 22px;overflow-y:auto;flex:1 1 auto;min-height:0}
+.modal-header,.modal-footer{flex-shrink:0}
 .modal-footer{padding:14px 22px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap;align-items:center}
 .modal-footer > .spacer{flex:1;min-width:8px}
 .close-btn{font-size:22px;color:var(--text-light);padding:0;line-height:1}
@@ -832,6 +833,58 @@ table.data.contacts tbody tr.is-client td:first-child{box-shadow:inset 3px 0 0 v
 .row-timer-btn:hover{background:var(--navy);color:#fff}
 table.data tbody tr:hover .row-timer-btn{color:var(--navy)}
 table.data tbody tr:hover .row-timer-btn:hover{color:#fff}
+
+/* ── Responsive overrides — kept last so they win over the base rules above. */
+/* Menu button + drawer backdrop: hidden on desktop. */
+.nav-toggle{display:none;width:36px;height:36px;align-items:center;justify-content:center;border-radius:6px;color:var(--navy);margin-left:-6px}
+.nav-toggle:hover{background:var(--gray-bg)}
+.nav-backdrop{display:none}
+
+/* ── Phone / small tablet ───────────────────────────────────────────────
+   Sidebar becomes an off-canvas drawer opened by the menu button; topbar is
+   one row (menu, title, actions) with search on its own row; forms stack;
+   modals go full-screen; inputs are 16px so iOS doesn't zoom on focus. */
+@media (max-width:768px){
+  .sidebar{
+    position:fixed;top:0;bottom:0;left:0;z-index:950;width:260px;max-width:82vw;
+    transform:translateX(-100%);transition:transform .2s ease;
+  }
+  body.nav-open .sidebar{transform:none;box-shadow:var(--shadow-md)}
+  body.nav-open .nav-backdrop{display:block;position:fixed;inset:0;background:rgba(15,31,61,.45);z-index:940}
+  .nav-toggle{display:inline-flex}
+
+  .topbar{flex-direction:row;flex-wrap:wrap;align-items:center;padding:10px 14px;gap:8px;row-gap:8px}
+  .topbar h2{font-size:16px;flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .topbar .search{order:10;flex:1 1 100%;max-width:none;min-width:0}
+  .topbar .actions{margin-left:auto;justify-content:flex-end}
+  #timer-widget{order:11;flex:1 1 100%}
+
+  .content{padding:14px}
+  .card{padding:14px}
+  .stat-card{padding:14px}
+  .stat-card .stat-value{font-size:21px}
+  .grid{gap:10px}
+
+  .form-row{flex-direction:column;gap:0;margin-bottom:0}
+  .form-row > *{margin-bottom:12px}
+  .field input,.field select,.field textarea,
+  .modal-body input,.modal-body select,.modal-body textarea,
+  .topbar .search input{font-size:16px}
+
+  .modal-overlay{padding:0;align-items:stretch}
+  .modal,.modal.wide{max-width:none;max-height:none;height:100%;border-radius:0}
+  .modal-header{padding:14px 16px}
+  .modal-body{padding:16px}
+  .modal-footer{padding:10px 16px;padding-bottom:max(10px, env(safe-area-inset-bottom))}
+
+  body .settings-tabs{overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch}
+  body .settings-tabs button{white-space:nowrap;padding:10px 12px}
+  .btn-group{max-width:100%;overflow-x:auto}
+}
+@media (max-width:700px){
+  /* Stat tiles read better two-up than one per row on phones. */
+  .grid-5,.grid-4{grid-template-columns:repeat(2,1fr)}
+}
 </style>
 <script>
 // Theme presets and applyTheme — declared in <head> so a cached theme can apply
@@ -883,7 +936,7 @@ window.THEME_PRESETS = {
 </head>
 <body>
 <div class="app" id="app" style="display:none">
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar">
     <div class="sidebar-header">
       <h1>CRM</h1>
       <div class="firm-name" id="firm-name-label"></div>
@@ -905,6 +958,9 @@ window.THEME_PRESETS = {
 
   <main class="main">
     <div class="topbar">
+      <button class="nav-toggle" id="nav-toggle" aria-label="Open menu" aria-controls="sidebar" aria-expanded="false" onclick="toggleNav()">
+        <svg width="20" height="20" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
       <h2 id="page-title">Dashboard</h2>
       <div class="search">
         <svg width="14" height="14" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
@@ -919,6 +975,7 @@ window.THEME_PRESETS = {
   </main>
 </div>
 
+<div class="nav-backdrop" onclick="toggleNav(false)"></div>
 <div class="modal-overlay" id="modal-overlay"></div>
 <div class="toast" id="toast"></div>
 
@@ -1205,6 +1262,17 @@ const ICONS = {
   settings:'<svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
 };
 
+// Mobile drawer. On desktop the sidebar is always visible and this is a no-op visually.
+function toggleNav(force) {
+  const open = typeof force === 'boolean' ? force : !document.body.classList.contains('nav-open');
+  document.body.classList.toggle('nav-open', open);
+  const btn = document.getElementById('nav-toggle');
+  if (btn) btn.setAttribute('aria-expanded', String(open));
+}
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && document.body.classList.contains('nav-open')) toggleNav(false);
+});
+
 function renderNav() {
   const nav = $('#sidebar-nav');
   nav.innerHTML = '';
@@ -1221,9 +1289,16 @@ function renderNav() {
 }
 
 async function navigate(view, opts={}) {
-  if ($('#modal-overlay').classList.contains('open') && _modalDirty) {
+  const modalOpen = $('#modal-overlay').classList.contains('open');
+  const changingView = state.currentView !== view;
+  if (modalOpen && changingView && _modalDirty) {
     if (!confirm('Discard unsaved changes?')) return;
   }
+  // A modal belongs to the page it was opened on — moving to another page
+  // (sidebar, back/forward) closes it. Same-view refreshes after a save keep
+  // whatever the caller left open.
+  if (modalOpen && changingView) closeModal();
+  toggleNav(false);
   runViewCleanups();
   const v = ++state._renderVersion;
   // Push to history on a distinct view change so browser back/forward works
@@ -6998,7 +7073,11 @@ function svgEl(tag, attrs, children) {
 
 // Horizontal bar chart — buckets: [{label, value, color?}]
 function svgHbarChart(buckets) {
-  const W = 480, rowH = 38, padV = 6, labelW = 84, valW = 80, barPad = 10;
+  // Size the label column to the longest label (~6.6px per char at 12px) so
+  // long labels like "1–30 days past due" aren't clipped.
+  const longest = Math.max(0, ...buckets.map(b => String(b.label || '').length));
+  const labelW = Math.max(84, Math.ceil(longest * 6.6) + 12);
+  const rowH = 38, padV = 6, valW = 80, barPad = 10, W = 396 + labelW;
   const barW = W - labelW - valW - barPad;
   const H = buckets.length * rowH + padV * 2;
   const total = buckets.reduce((s, b) => s + b.value, 0);
@@ -7840,6 +7919,15 @@ async function renderTrust(mount, v) {
 
   const balances = trust.balances || [];
   const entries  = trust.entries  || [];
+  // Per client+matter buckets; matter_id null = unallocated client funds.
+  const bucketsByClient = new Map();
+  for (const mb of (trust.matterBalances || [])) {
+    if (!bucketsByClient.has(mb.client_contact_id)) bucketsByClient.set(mb.client_contact_id, []);
+    bucketsByClient.get(mb.client_contact_id).push(mb);
+  }
+  const bucketLabel = (mb) => mb.matter_id
+    ? [fmtMatterFullId(mb), mb.matter_name].filter(Boolean).join(' · ')
+    : 'Unallocated';
   const totalBal = balances.reduce((s, b) => s + Number(b.balance || 0), 0);
 
   mount.innerHTML = '';
@@ -8020,12 +8108,14 @@ async function renderTrust(mount, v) {
         (t.client_name || '').toLowerCase().includes(q) ||
         (t.reference  || '').toLowerCase().includes(q) ||
         (t.notes      || '').toLowerCase().includes(q) ||
-        (t.kind       || '').toLowerCase().includes(q)
+        (t.kind       || '').toLowerCase().includes(q) ||
+        (t.matter_name || '').toLowerCase().includes(q)
       );
     }
     const txKey = {
       date:   t => t.occurred_at || '',
       client: t => (t.client_name || '').toLowerCase(),
+      matter: t => (t.matter_name || '').toLowerCase(),
       kind:   t => t.kind || '',
       amount: t => Number(t.amount || 0),
       reference: t => (t.reference || '').toLowerCase(),
@@ -8045,26 +8135,33 @@ async function renderTrust(mount, v) {
       },
     }, label + txArrow(key));
 
-    bodyWrap.appendChild(el('div', { class: 'grid grid-2' }, [
+    bodyWrap.appendChild(el('div', { class: 'grid grid-trust' }, [
       el('div', { class: 'card' }, [
-        el('h3', {}, 'Balances by client' + (q ? ` (${balSorted.length})` : '')),
+        el('h3', {}, 'Balances by client & matter' + (q ? ` (${balSorted.length})` : '')),
         balances.length === 0 ? el('div', { class: 'empty' }, 'No trust balances.') :
         balSorted.length === 0 ? el('div', { class: 'empty' }, 'No clients match the search.') :
           el('table', { class: 'data' }, [
-            el('thead', {}, el('tr', {}, [ balTh('client', 'Client'), balTh('balance', 'Balance', 'num') ])),
-            el('tbody', {}, balSorted.map(b => el('tr', {
-              title: 'Click to filter by this client',
-              style: 'cursor:pointer',
-              onclick: () => {
+            el('thead', {}, el('tr', {}, [ balTh('client', 'Client / matter'), balTh('balance', 'Balance', 'num') ])),
+            el('tbody', {}, balSorted.flatMap(b => {
+              const filterTo = () => {
                 tv.search = b.client_name || '';
                 searchInput.value = tv.search;
                 updateRightAffix();
                 renderBody();
-              },
-            }, [
-              el('td', {}, b.client_name || '—'),
-              el('td', { class: 'num', style: b.balance < 0 ? 'color:var(--red)' : '' }, fmt.money(b.balance)),
-            ]))),
+              };
+              const subs = (bucketsByClient.get(b.client_contact_id) || [])
+                .filter(mb => Math.abs(mb.balance) > 0.004 || mb.matter_id);
+              return [
+                el('tr', { title: 'Click to filter by this client', style: 'cursor:pointer', onclick: filterTo }, [
+                  el('td', { style: 'font-weight:600' }, b.client_name || '—'),
+                  el('td', { class: 'num', style: 'font-weight:600;' + (b.balance < 0 ? 'color:var(--red)' : '') }, fmt.money(b.balance)),
+                ]),
+                ...subs.map(mb => el('tr', { class: 'trust-bucket', style: 'cursor:pointer', onclick: filterTo }, [
+                  el('td', { style: 'padding-left:24px;font-size:12.5px;color:var(--text-muted)' }, bucketLabel(mb)),
+                  el('td', { class: 'num', style: 'font-size:12.5px;' + (mb.balance < 0 ? 'color:var(--red)' : 'color:var(--text-muted)') }, fmt.money(mb.balance)),
+                ])),
+              ];
+            })),
           ]),
       ]),
       el('div', { class: 'card' }, [
@@ -8075,6 +8172,7 @@ async function renderTrust(mount, v) {
             el('thead', {}, el('tr', {}, [
               txTh('date', 'Date'),
               txTh('client', 'Client'),
+              txTh('matter', 'Matter'),
               txTh('kind', 'Kind'),
               txTh('reference', 'Reference'),
               txTh('amount', 'Amount', 'num'),
@@ -8082,6 +8180,7 @@ async function renderTrust(mount, v) {
             el('tbody', {}, txRows.map(t => el('tr', { title: t.notes || '' }, [
               el('td', {}, fmt.date(t.occurred_at)),
               el('td', {}, t.client_name || '—'),
+              el('td', { style: t.matter_id ? '' : 'color:var(--text-light)' }, t.matter_id ? bucketLabel(t) : 'Unallocated'),
               el('td', {}, t.kind),
               el('td', {}, t.reference || '—'),
               el('td', { class: 'num', style: 'font-weight:600;' + (t.amount < 0 ? 'color:var(--red)' : 'color:var(--green)') }, fmt.money(t.amount)),
