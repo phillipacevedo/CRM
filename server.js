@@ -3065,6 +3065,12 @@ app.get('/api/matters', authRequired, verifyFirmMembership, (req, res) => {
 app.post('/api/matters', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
   const b = req.body || {};
   if (!b.name?.trim()) return res.status(400).json({ error: 'Matter name required' });
+  // Secretaries/Staff can open matters, but billing terms are set by billing roles.
+  if (!CAPS.manageBilling(req.user) &&
+      ((b.billingType && b.billingType !== 'hourly') || Number(b.flatFee) > 0 ||
+       (b.billingIncrementMinutes != null && b.billingIncrementMinutes !== ''))) {
+    return res.status(403).json({ error: 'Only Partners/Admins can set billing terms. Open the matter as hourly with defaults and ask a partner to set terms.' });
+  }
   if (b.billingType && !['hourly','flat','contingency'].includes(b.billingType)) return res.status(400).json({ error: 'Invalid billingType' });
   let inc;
   try { inc = validateIncrement(b.billingIncrementMinutes); } catch(e) { return res.status(400).json({ error: e.message }); }
@@ -3095,6 +3101,10 @@ app.put('/api/matters/:id', authRequired, verifyFirmMembership, requireCap('edit
   const newClientId = ('clientContactId' in b) ? (b.clientContactId || null) : existing.client_contact_id;
   let matterNumber = existing.matter_number;
   if (newClientId !== existing.client_contact_id) {
+    // The matter number is printed on invoices; once billed, the matter can't
+    // move to another client (which would re-issue its number).
+    const billed = db.prepare('SELECT COUNT(*) AS n FROM invoices WHERE matter_id = ? AND firm_id = ?').get(existing.id, req.user.firmId).n;
+    if (billed) return res.status(409).json({ error: `This matter has ${billed} invoice${billed === 1 ? '' : 's'} under its current number; it can't be moved to a different client. Open a new matter instead.` });
     matterNumber = newClientId ? nextMatterNumber(newClientId) : nextFirmMatterNumber(req.user.firmId);
   } else if (matterNumber == null) {
     matterNumber = newClientId ? nextMatterNumber(newClientId) : nextFirmMatterNumber(req.user.firmId);
@@ -3109,6 +3119,19 @@ app.put('/api/matters/:id', authRequired, verifyFirmMembership, requireCap('edit
     ? (b.trustReplenishTo == null || b.trustReplenishTo === '' ? null : Number(b.trustReplenishTo))
     : existing.trust_replenish_to;
 
+  // Billing terms are for billing roles only. Non-billing editors (Secretary,
+  // Staff) may resubmit the form unchanged, so compare against stored values.
+  if (!CAPS.manageBilling(req.user)) {
+    const changed = [];
+    if (b.billingType && b.billingType !== existing.billing_type) changed.push('billing type');
+    if (typeof b.flatFee === 'number' && Math.abs(b.flatFee - Number(existing.flat_fee || 0)) > 0.001) changed.push('flat fee');
+    if ((inc ?? null) !== (existing.billing_increment_minutes ?? null)) changed.push('billing increment');
+    if ((nextBillingSchedule ?? null) !== (existing.billing_schedule ?? null)) changed.push('billing schedule');
+    if (Math.abs(nextTrustMin - Number(existing.trust_min_balance || 0)) > 0.001) changed.push('trust minimum');
+    if ((nextTrustTo ?? null) !== (existing.trust_replenish_to ?? null)) changed.push('trust replenish-to');
+    if (changed.length) return res.status(403).json({ error: `Only Partners/Admins can change billing terms (${changed.join(', ')}).` });
+  }
+
   db.prepare(`UPDATE matters SET
       name = COALESCE(?, name), description = ?, billing_type = COALESCE(?, billing_type),
       flat_fee = COALESCE(?, flat_fee), status = COALESCE(?, status),
@@ -3116,7 +3139,9 @@ app.put('/api/matters/:id', authRequired, verifyFirmMembership, requireCap('edit
       billing_increment_minutes = ?,
       matter_number = ?,
       billing_schedule = ?, trust_min_balance = ?, trust_replenish_to = ?,
-      closed_at = CASE WHEN ? = 'closed' AND status != 'closed' THEN datetime('now') ELSE closed_at END,
+      closed_at = CASE WHEN ? = 'closed' AND status != 'closed' THEN datetime('now')
+                       WHEN ? NOT IN ('', 'closed') THEN NULL
+                       ELSE closed_at END,
       updated_at = datetime('now')
     WHERE id = ? AND firm_id = ?`).run(
     // Partial updates (e.g. the recurring-billing panel) omit description and
@@ -3130,7 +3155,7 @@ app.put('/api/matters/:id', authRequired, verifyFirmMembership, requireCap('edit
     inc,
     matterNumber,
     nextBillingSchedule, nextTrustMin, nextTrustTo,
-    b.status || '', req.params.id, req.user.firmId);
+    b.status || '', b.status || '', req.params.id, req.user.firmId);
   res.json(db.prepare(MATTER_SELECT + ' WHERE m.id = ?').get(req.params.id));
 });
 

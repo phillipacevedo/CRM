@@ -3455,6 +3455,8 @@ async function renderMatters(mount, v) {
 }
 
 async function openMatterForm(existing) {
+  // Billing terms are editable by Partners/Admins only (server enforces too).
+  const billingLock = can('manageBilling') ? {} : { disabled: 'disabled', title: 'Only Partners/Admins can change billing terms' };
   const contacts = (await api('/api/contacts?type=client')).concat(await api('/api/contacts?type=prospect'));
   const isNew = !existing?.id, m = existing || {};
   const body = el('div', {}, [
@@ -3548,13 +3550,13 @@ async function openMatterForm(existing) {
         style: initialFlat ? '' : 'display:none',
       }, [
         el('label', {}, 'Flat fee'),
-        el('input', { name: 'flatFee', type: 'number', step: '0.01', value: m.flat_fee || 0,
+        el('input', { name: 'flatFee', type: 'number', step: '0.01', value: m.flat_fee || 0, ...billingLock,
           title: 'When > 0, this amount is always added to the matter’s next invoice in addition to any hourly time entries.' }),
       ]);
       return el('div', { class: 'form-row' }, [
         el('div', { class: 'field' }, [ el('label', {}, 'Billing type'),
           el('select', {
-            name: 'billingType',
+            name: 'billingType', ...billingLock,
             onchange: (e) => { flatField.style.display = e.target.value === 'flat' ? '' : 'none'; },
           }, ['hourly','flat','contingency'].map(t =>
             el('option', { value: t, ...((m.billing_type||'hourly') === t ? { selected: 'selected' } : {}) }, t))) ]),
@@ -3566,7 +3568,7 @@ async function openMatterForm(existing) {
     })(),
     el('div', { class: 'field' }, [
       el('label', {}, 'Billing increment (timer rounding)'),
-      el('select', { name: 'billingIncrementMinutes' }, [
+      el('select', { name: 'billingIncrementMinutes', ...billingLock }, [
         el('option', { value: '', ...(!m.billing_increment_minutes ? { selected: 'selected' } : {}) }, 'Inherit from client or firm default'),
         el('option', { value: '6',  ...(m.billing_increment_minutes === 6  ? { selected: 'selected' } : {}) }, '0.1 hr (6 min)'),
         el('option', { value: '15', ...(m.billing_increment_minutes === 15 ? { selected: 'selected' } : {}) }, '0.25 hr (15 min)'),
@@ -3593,6 +3595,7 @@ async function openMatterForm(existing) {
     $$('input, select, textarea', body).forEach(i => d[i.name] = i.value);
     d.flatFee = d.billingType === 'flat' ? (parseFloat(d.flatFee) || 0) : 0;
     d.billingIncrementMinutes = d.billingIncrementMinutes ? parseInt(d.billingIncrementMinutes, 10) : null;
+    if (!can('manageBilling')) { delete d.billingType; delete d.flatFee; delete d.billingIncrementMinutes; }
     const client = contacts.find(c => c.id === d.clientContactId);
     if (client) d.clientName = client.full_name;
     if (!d.name.trim()) return toast('Name required', true);
