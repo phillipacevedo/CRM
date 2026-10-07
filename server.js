@@ -729,6 +729,17 @@ const migrations = [
   // (`tv`); bumping it (password change/reset, deactivation, 2FA reset)
   // invalidates every outstanding session for that user.
   `ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 0`,
+  // 'fees' (earned — operating) or 'trust_request' (retainer/replenishment —
+  // unearned, must be deposited to trust).
+  `ALTER TABLE invoices ADD COLUMN kind TEXT DEFAULT 'fees'`,
+  // Stripe refunds are stored as their own negative rows pointing at the
+  // original payment, so partial refunds net correctly.
+  `ALTER TABLE invoice_payments ADD COLUMN refund_of TEXT`,
+  // Trust rows created by an invoice payment carry its id, so reversing the
+  // payment reverses exactly those rows. reverses_id links a reversal to the
+  // entry it undoes (one reversal per entry — unique index below).
+  `ALTER TABLE trust_ledger ADD COLUMN payment_id TEXT`,
+  `ALTER TABLE trust_ledger ADD COLUMN reverses_id TEXT`,
 ];
 // Only swallow "duplicate column" errors (idempotency). Anything else — syntax
 // typos, missing table, permission issues — is a real problem and should fail
@@ -751,6 +762,17 @@ for (const m of migrations) {
     if (!has) { console.error(`Migration post-check failed: ${table}.${column} missing after ALTER`); throw new Error(`Migration post-check: ${table}.${column} not applied`); }
   }
 }
+
+// Post-column data fixes (idempotent).
+db.exec(`UPDATE invoices SET kind = 'trust_request'
+         WHERE (kind IS NULL OR kind = 'fees') AND notes LIKE 'Trust replenishment%'`);
+// Legacy reversals referenced the original as 'REVERSE <id>' in reference.
+db.exec(`UPDATE trust_ledger SET reverses_id = substr(reference, 9)
+         WHERE reverses_id IS NULL AND reference LIKE 'REVERSE tr_%'
+           AND NOT EXISTS (SELECT 1 FROM trust_ledger t2 WHERE t2.reverses_id = substr(trust_ledger.reference, 9))
+           AND id = (SELECT MIN(t3.id) FROM trust_ledger t3 WHERE t3.reference = trust_ledger.reference)`);
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_trust_reverses ON trust_ledger(reverses_id) WHERE reverses_id IS NOT NULL`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_trust_payment ON trust_ledger(payment_id) WHERE payment_id IS NOT NULL`);
 
 // Multi-timer migration: the original timers table had user_email as PRIMARY KEY
 // (one row per user). Detect that and rebuild with id as PK so one user can hold
@@ -1070,11 +1092,29 @@ app.post('/api/pay/stripe-webhook', express.raw({ type: 'application/json', limi
 
   try {
     if (event.type === 'payment_intent.succeeded') {
-      handlePaymentIntentSucceeded(firmId, event.data.object);
-    } else if (event.type === 'payment_intent.payment_failed') {
+      const pi = event.data.object;
+      // Since Stripe API 2022-11-15 the PI no longer embeds `charges`; the
+      // charge is referenced by `latest_charge`. Fetch it for the payment
+      // method type (card vs ACH) — best effort, the handler has a fallback.
+      let charge = null;
+      const chargeId = typeof pi.latest_charge === 'string' ? pi.latest_charge : pi.latest_charge?.id;
+      if (pi.latest_charge && typeof pi.latest_charge === 'object') charge = pi.latest_charge;
+      else if (chargeId) {
+        try { charge = await getStripeClient(firmId).client.charges.retrieve(chargeId); }
+        catch (e) { console.warn('[stripe-webhook] could not retrieve charge', chargeId, e.message); }
+      }
+      handlePaymentIntentSucceeded(firmId, pi, charge, chargeId || null);
+    } else if (event.type === 'payment_intent.processing') {
+      // ACH: funds are in flight for days. Mark it so the pay page doesn't
+      // let the client start a second payment meanwhile.
+      const pi = event.data.object;
+      db.prepare(`UPDATE invoice_payments SET status='processing', raw_json=?
+                  WHERE stripe_payment_intent_id=? AND firm_id=? AND status='pending'`)
+        .run(JSON.stringify(pi), pi.id, firmId);
+    } else if (event.type === 'payment_intent.payment_failed' || event.type === 'payment_intent.canceled') {
       const pi = event.data.object;
       db.prepare(`UPDATE invoice_payments SET status='failed', raw_json=?
-                  WHERE stripe_payment_intent_id=? AND firm_id=?`)
+                  WHERE stripe_payment_intent_id=? AND firm_id=? AND status IN ('pending','processing')`)
         .run(JSON.stringify(pi), pi.id, firmId);
     } else if (event.type === 'charge.refunded') {
       handleChargeRefunded(firmId, event.data.object);
@@ -1093,7 +1133,7 @@ app.post('/api/pay/stripe-webhook', express.raw({ type: 'application/json', limi
 // Webhook event handlers. Kept out of the route body so they can be tested
 // (and so the route stays readable). All DB writes are idempotent — Stripe
 // retries events and the same event may arrive multiple times.
-function handlePaymentIntentSucceeded(firmId, pi) {
+function handlePaymentIntentSucceeded(firmId, pi, charge = null, chargeId = null) {
   const existing = db.prepare(
     'SELECT * FROM invoice_payments WHERE stripe_payment_intent_id = ? AND firm_id = ?'
   ).get(pi.id, firmId);
@@ -1103,76 +1143,151 @@ function handlePaymentIntentSucceeded(firmId, pi) {
   }
   if (existing.status === 'succeeded') return;
 
-  const charge = pi.charges?.data?.[0] || null;
-  const method = charge?.payment_method_details?.type === 'us_bank_account'
-    ? 'stripe_ach' : 'stripe_card';
+  const pmType = charge?.payment_method_details?.type
+    || (Array.isArray(pi.payment_method_types) && pi.payment_method_types.length === 1 ? pi.payment_method_types[0] : null);
+  const method = pmType === 'us_bank_account' ? 'stripe_ach' : 'stripe_card';
+  const amount = round2((pi.amount_received || pi.amount || 0) / 100) || existing.amount;
 
   db.transaction(() => {
     db.prepare(`UPDATE invoice_payments
-                SET status='succeeded', method=?, stripe_charge_id=?,
+                SET status='succeeded', method=?, stripe_charge_id=?, amount=?,
                     occurred_at=datetime('now'), raw_json=?
                 WHERE id=?`)
-      .run(method, charge?.id || null, JSON.stringify(pi), existing.id);
+      .run(method, charge?.id || chargeId || null, amount, JSON.stringify(pi), existing.id);
 
-    if (existing.destination === 'operating' && existing.invoice_id) {
-      const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?')
-        .get(existing.invoice_id, firmId);
-      if (inv) {
-        const newPaid = Math.round(((inv.amount_paid || 0) + existing.amount) * 100) / 100;
-        const fullyPaid = newPaid >= (inv.total || 0) - 0.005;
-        const newStatus = fullyPaid ? 'paid' : (inv.status === 'draft' ? 'sent' : inv.status);
-        db.prepare(`UPDATE invoices SET amount_paid=?, status=?, updated_at=datetime('now') WHERE id=?`)
-          .run(newPaid, newStatus, inv.id);
-      }
-    } else if (existing.destination === 'trust') {
-      // Trust-destination payments should write a trust_ledger deposit row.
-      // Not yet implemented (step 3 of the payments rollout). Fail loudly so
-      // the 202-on-error webhook path logs a RECONCILE NEEDED entry — the
-      // payment row is already marked succeeded; a human needs to post the
-      // matching trust ledger entry manually until the handler ships.
-      throw new Error(`Trust-destination payment ${existing.id} succeeded but trust_ledger writer is not implemented yet — manual reconciliation required.`);
+    const inv = existing.invoice_id
+      ? db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?').get(existing.invoice_id, firmId)
+      : null;
+
+    if (existing.destination === 'trust') {
+      // Unearned funds: post the IOLTA deposit in the same transaction so the
+      // payment and the ledger can never disagree.
+      const clientId = inv?.client_contact_id || existing.client_contact_id;
+      if (!clientId) throw new Error(`Trust payment ${existing.id} has no client — cannot post trust deposit`);
+      const trId = insertTrustRow({
+        firmId, clientId, clientName: inv?.client_name || null, matterId: inv?.matter_id || null,
+        kind: 'deposit', amount, reference: inv ? (inv.number || inv.id) : pi.id,
+        notes: `Stripe ${method === 'stripe_ach' ? 'ACH' : 'card'} payment ${pi.id}`,
+        createdBy: 'stripe@webhook', paymentId: existing.id,
+      });
+      db.prepare('UPDATE invoice_payments SET trust_ledger_id = ? WHERE id = ?').run(trId, existing.id);
     }
 
-    if (existing.invoice_id) {
-      db.prepare(`UPDATE payment_links SET used_at=datetime('now')
-                  WHERE firm_id=? AND invoice_id=? AND used_at IS NULL`)
-        .run(firmId, existing.invoice_id);
+    if (inv) {
+      if (inv.status === 'void') {
+        console.error(`[webhook] RECONCILE NEEDED — payment ${existing.id} succeeded on VOID invoice ${inv.number || inv.id}; refund or re-issue.`);
+      }
+      const r = recomputeInvoiceTotals(inv.id, firmId);
+      if (r && r.amountPaid > r.netBilled + 0.005) {
+        console.error(`[webhook] RECONCILE NEEDED — invoice ${inv.number || inv.id} overpaid by ${(r.amountPaid - r.netBilled).toFixed(2)}; credit or refund the client.`);
+      }
+      if (r && r.amountPaid >= r.netBilled - 0.005) {
+        db.prepare(`UPDATE payment_links SET used_at=datetime('now')
+                    WHERE firm_id=? AND invoice_id=? AND used_at IS NULL`).run(firmId, inv.id);
+      }
     }
   })();
 }
 
+// Stripe sends the cumulative `amount_refunded` on each charge.refunded event.
+// Each new increment becomes its own negative invoice_payments row linked to
+// the original (refund_of), so partial and repeated refunds net correctly and
+// replays are no-ops.
 function handleChargeRefunded(firmId, ch) {
-  // Full refunds only in step 2. Partial refunds are tracked but don't split
-  // into multiple rows — revisit when the manual refund flow lands (step 6).
+  const piId = typeof ch.payment_intent === 'string' ? ch.payment_intent : ch.payment_intent?.id;
   const row = db.prepare(
-    'SELECT * FROM invoice_payments WHERE stripe_charge_id = ? AND firm_id = ?'
-  ).get(ch.id, firmId);
-  if (!row || row.status === 'refunded') return;
-  const rawRefund = (ch.amount_refunded || 0) / 100;
-  if (rawRefund <= 0) return;
-  // Clamp to the original payment amount. Stripe itself enforces this, but a
-  // replayed/mangled webhook shouldn't be able to push our amount_paid math
-  // into absurd territory. Log if the values disagree so we notice.
-  const refundedAmount = Math.min(rawRefund, row.amount);
+    `SELECT * FROM invoice_payments
+     WHERE firm_id = ? AND refund_of IS NULL AND status = 'succeeded'
+       AND (stripe_charge_id = ? OR (? IS NOT NULL AND stripe_payment_intent_id = ?))`
+  ).get(firmId, ch.id, piId || null, piId || null);
+  if (!row) { console.warn('[webhook] charge.refunded with no matching payment:', ch.id, piId); return; }
+
+  const rawRefund = round2((ch.amount_refunded || 0) / 100);
   if (rawRefund > row.amount + 0.005) {
     console.warn('[webhook] refund amount exceeds original payment — clamping', { chargeId: ch.id, paymentId: row.id, rawRefund, original: row.amount });
   }
+  const targetRefunded = Math.min(rawRefund, row.amount);
+  const already = -Number(db.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM invoice_payments
+                                      WHERE refund_of = ? AND firm_id = ?`).get(row.id, firmId).s || 0);
+  const delta = round2(targetRefunded - already);
+  if (delta <= 0.005) return;
 
   db.transaction(() => {
-    db.prepare(`UPDATE invoice_payments SET status='refunded', raw_json=? WHERE id=?`)
-      .run(JSON.stringify(ch), row.id);
-    if (row.destination === 'operating' && row.invoice_id) {
-      const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?')
-        .get(row.invoice_id, firmId);
-      if (inv) {
-        const newPaid = Math.max(0, Math.round(((inv.amount_paid || 0) - refundedAmount) * 100) / 100);
-        const shouldReopen = inv.status === 'paid' && newPaid < (inv.total || 0) - 0.005;
-        const newStatus = shouldReopen ? 'sent' : inv.status;
-        db.prepare(`UPDATE invoices SET amount_paid=?, status=?, updated_at=datetime('now') WHERE id=?`)
-          .run(newPaid, newStatus, inv.id);
+    const refundId = uid('pay_');
+    db.prepare(`INSERT INTO invoice_payments
+                  (id, firm_id, invoice_id, client_contact_id, destination, amount, currency,
+                   method, status, stripe_charge_id, refund_of, occurred_at, raw_json, notes, created_by)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,datetime('now'),?,?,?)`).run(
+      refundId, firmId, row.invoice_id, row.client_contact_id, row.destination, -delta, row.currency || 'usd',
+      'stripe_refund', 'succeeded', ch.id, row.id, JSON.stringify(ch),
+      `Stripe refund of ${row.id}`, 'stripe@webhook');
+
+    if (row.destination === 'trust') {
+      const inv = row.invoice_id ? db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?').get(row.invoice_id, firmId) : null;
+      const clientId = inv?.client_contact_id || row.client_contact_id;
+      const matterId = inv?.matter_id || null;
+      const bal = trustBucketBalance(firmId, clientId, matterId);
+      if (bal - delta < -0.001) {
+        console.error(`[webhook] RECONCILE NEEDED — Stripe refund ${ch.id} exceeds trust balance for client ${clientId} (balance ${bal.toFixed(2)}, refund ${delta.toFixed(2)}).`);
       }
+      insertTrustRow({
+        firmId, clientId, clientName: inv?.client_name || null, matterId,
+        kind: 'refund', amount: -delta, reference: ch.id,
+        notes: `Stripe refund of payment ${row.id}`, createdBy: 'stripe@webhook', paymentId: refundId,
+      });
     }
+    if (row.invoice_id) recomputeInvoiceTotals(row.invoice_id, firmId);
   })();
+}
+
+const round2 = n => Math.round(Number(n || 0) * 100) / 100;
+
+// Where money received against an invoice belongs. Trust-request invoices
+// (retainers, replenishments) are unearned client funds and go to IOLTA.
+function invoiceDestination(inv) { return inv?.kind === 'trust_request' ? 'trust' : 'operating'; }
+
+// Current balance due, net of write-downs and recorded payments.
+function invoiceBalanceDue(inv) {
+  return round2(Number(inv.total || 0) + Number(inv.amount_writedown || 0) - Number(inv.amount_paid || 0));
+}
+
+// Trust balance of one client's bucket. matterId null = funds held for the
+// client but not allocated to a matter.
+function trustBucketBalance(firmId, clientId, matterId) {
+  return round2(db.prepare(`SELECT COALESCE(SUM(amount),0) AS b FROM trust_ledger
+                            WHERE firm_id = ? AND client_contact_id IS ? AND matter_id IS ?`)
+    .get(firmId, clientId || null, matterId || null).b);
+}
+
+function insertTrustRow({ firmId, clientId, clientName = null, matterId = null, kind, amount, reference = null,
+                          occurredAt = null, notes = null, createdBy, paymentId = null, reversesId = null }) {
+  const id = uid('tr_');
+  db.prepare(`INSERT INTO trust_ledger (id, firm_id, client_contact_id, client_name, matter_id, kind, amount, reference,
+                                        occurred_at, notes, created_by, payment_id, reverses_id)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    id, firmId, clientId || null, clientName, matterId || null, kind, round2(amount), reference,
+    occurredAt || new Date().toISOString(), notes, createdBy, paymentId, reversesId);
+  return id;
+}
+
+// Post the reversal of one trust entry. Refuses to reverse a reversal, to
+// reverse the same entry twice (also enforced by a unique index), or to
+// reverse money that has already left the bucket.
+function reverseTrustRow(firmId, t, createdBy, note) {
+  if (t.reverses_id) throw Object.assign(new Error('This entry is itself a reversal and cannot be reversed'), { status: 400 });
+  const done = db.prepare('SELECT id FROM trust_ledger WHERE reverses_id = ? AND firm_id = ?').get(t.id, firmId);
+  if (done) throw Object.assign(new Error('This entry has already been reversed'), { status: 409 });
+  if (t.amount > 0) {
+    const bal = trustBucketBalance(firmId, t.client_contact_id, t.matter_id);
+    if (bal - t.amount < -0.001) {
+      throw Object.assign(new Error(`Cannot reverse: funds already disbursed (bucket balance ${fmtMoney(bal)})`), { status: 400 });
+    }
+  }
+  return insertTrustRow({
+    firmId, clientId: t.client_contact_id, clientName: t.client_name, matterId: t.matter_id,
+    kind: t.amount > 0 ? 'withdrawal' : 'refund', amount: -t.amount, reference: `REVERSE ${t.id}`,
+    notes: note || `Reversal of ${t.kind} posted ${t.occurred_at}`, createdBy, reversesId: t.id,
+  });
 }
 
 // Recompute an invoice's amount_paid + amount_writedown + status from the
@@ -1180,9 +1295,8 @@ function handleChargeRefunded(firmId, ch) {
 // truth for invoice math — manual payment, adjustment, and reversal endpoints
 // all funnel through this so the row stays in sync with its ledger.
 //
-// The Stripe webhook handlers above intentionally do not call this — they know
-// the delta (added or refunded amount) and do an inline UPDATE to keep the
-// race window small. Both paths converge on the same columns.
+// The Stripe webhook handlers call it too, so a late payment can't un-void
+// an invoice and write-downs are honored everywhere.
 function recomputeInvoiceTotals(invoiceId, firmId) {
   const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?').get(invoiceId, firmId);
   if (!inv) return null;
@@ -2859,8 +2973,8 @@ function getMatterTrustBalance(firmId, matterId) {
 function hasPendingReplenishment(firmId, matterId) {
   const row = db.prepare(`SELECT 1 AS ok FROM invoices
                           WHERE firm_id = ? AND matter_id = ?
-                            AND status IN ('draft','sent')
-                            AND notes LIKE 'Trust replenishment%'`).get(firmId, matterId);
+                              AND status IN ('draft','sent')
+                            AND kind = 'trust_request'`).get(firmId, matterId);
   return !!row;
 }
 
@@ -2879,7 +2993,7 @@ function advanceNextRunAt(prev, kind, day) {
 // transaction shape of POST /api/invoices (numbering, totals, draft status)
 // but skips time-entry / expense sweep and the manageBilling permission check
 // — callers are the cron job or an admin-gated route.
-function createRecurringInvoice(firmId, matter, amount, description, notes, createdBy = 'system@recurring') {
+function createRecurringInvoice(firmId, matter, amount, description, notes, createdBy = 'system@recurring', kind = 'fees') {
   if (!matter || !amount || amount <= 0) return null;
   const id = uid('inv_');
   const number = nextInvoiceNumber(firmId);
@@ -2888,10 +3002,10 @@ function createRecurringInvoice(firmId, matter, amount, description, notes, crea
   const total = subtotal;
   const lineId = uid('il_');
   const tx = db.transaction(() => {
-    db.prepare(`INSERT INTO invoices (id, firm_id, number, client_contact_id, client_name, matter_id, issued_at, due_at, subtotal, tax, total, status, notes, created_by)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    db.prepare(`INSERT INTO invoices (id, firm_id, number, client_contact_id, client_name, matter_id, issued_at, due_at, subtotal, tax, total, status, notes, created_by, kind)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       id, firmId, number, matter.client_contact_id || null, matter.client_name || null, matter.id,
-      now, null, subtotal, 0, total, 'draft', notes || null, createdBy);
+      now, null, subtotal, 0, total, 'draft', notes || null, createdBy, kind);
     db.prepare(`INSERT INTO invoice_lines (id, invoice_id, kind, description, time_entry_id, quantity, rate, amount, sort_order)
                 VALUES (?,?,?,?,?,?,?,?,?)`).run(
       lineId, id, 'flat', description, null, 1, subtotal, subtotal, 0);
@@ -2929,7 +3043,8 @@ function runRecurringForMatter(firmId, matter, today) {
         replenished = createRecurringInvoice(
           firmId, matter, shortfall,
           `Trust replenishment — ${matter.name}`,
-          `Trust replenishment (balance ${bal.toFixed(2)} below floor ${floor.toFixed(2)})`
+          `Trust replenishment (balance ${bal.toFixed(2)} below floor ${floor.toFixed(2)})`,
+          'system@recurring', 'trust_request'
         );
       }
     }
@@ -3512,11 +3627,27 @@ app.patch('/api/invoices/:id/status', authRequired, verifyFirmMembership, requir
   const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
   if (!inv) return res.status(404).json({ error: 'Not found' });
   if (inv.status === status) return res.json({ ok: true });
+  if (status === 'void') {
+    // Money recorded against the invoice must be reversed/refunded first —
+    // otherwise cash (or trust funds applied to it) is stranded on a void bill.
+    const live = db.prepare(`SELECT COUNT(*) AS n, COALESCE(SUM(amount),0) AS s FROM invoice_payments
+                             WHERE invoice_id = ? AND firm_id = ? AND status IN ('succeeded','processing')`)
+      .get(inv.id, req.user.firmId);
+    if (live.n > 0 && Math.abs(live.s) > 0.005) {
+      return res.status(409).json({ error: `This invoice has ${fmtMoney(live.s)} in recorded payments. Reverse manual payments (or refund Stripe payments) before voiding.` });
+    }
+  }
+  if (status === 'paid' && invoiceBalanceDue(inv) > 0.005) {
+    return res.status(409).json({ error: `Balance due is ${fmtMoney(invoiceBalanceDue(inv))}. Record a payment or a write-down instead of marking paid.` });
+  }
+  if (inv.status === 'void') {
+    return res.status(409).json({ error: 'Void invoices cannot be reopened. Create a new invoice.' });
+  }
   // Status flip and the void-release of time/expenses must be all-or-nothing:
   // a partial failure would leave an invoice voided but its entries still locked.
   db.transaction(() => {
-    db.prepare(`UPDATE invoices SET status = ?, amount_paid = CASE ? WHEN 'paid' THEN total WHEN 'void' THEN 0 ELSE amount_paid END, updated_at = datetime('now') WHERE id = ?`)
-      .run(status, status, req.params.id);
+    db.prepare(`UPDATE invoices SET status = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(status, req.params.id);
     // If voided, release the time entries and expenses
     if (status === 'void') {
       db.prepare(`UPDATE time_entries SET invoice_id = NULL, status = 'draft', updated_at = datetime('now') WHERE invoice_id = ?`).run(req.params.id);
@@ -3524,8 +3655,8 @@ app.patch('/api/invoices/:id/status', authRequired, verifyFirmMembership, requir
     }
   })();
   logAudit(req, 'invoice.status_change', 'invoice', inv.id,
-    { status: inv.status, amount_paid: inv.amount_paid, invoice_number: inv.invoice_number, total: inv.total },
-    { status, invoice_number: inv.invoice_number, total: inv.total });
+    { status: inv.status, amount_paid: inv.amount_paid, invoice_number: inv.number, total: inv.total },
+    { status, invoice_number: inv.number, total: inv.total });
   res.json({ ok: true });
 });
 
@@ -3578,8 +3709,14 @@ app.post('/api/invoices/:id/payments', authRequired, verifyFirmMembership, requi
   if (!inv) return res.status(404).json({ error: 'Not found' });
   if (inv.status === 'void') return res.status(400).json({ error: 'Cannot record payment on a void invoice' });
 
-  const writedown = Number(inv.amount_writedown || 0);
-  const balance = +(Number(inv.total || 0) + writedown - Number(inv.amount_paid || 0)).toFixed(2);
+  const balance = invoiceBalanceDue(inv);
+  const destination = invoiceDestination(inv);
+  if (destination === 'trust' && method === 'trust') {
+    return res.status(400).json({ error: 'This is a trust request — it must be paid with new funds, not from trust.' });
+  }
+  if (destination === 'trust' && !inv.client_contact_id) {
+    return res.status(400).json({ error: 'Trust requests need a client on the invoice' });
+  }
   if (amount > balance + 0.005) {
     return res.status(400).json({ error: `Amount exceeds balance due (${fmtMoney(balance)}). Adjust or void first.` });
   }
@@ -3592,24 +3729,40 @@ app.post('/api/invoices/:id/payments', authRequired, verifyFirmMembership, requi
   try {
     const result = db.transaction(() => {
       let trustLedgerId = null;
+      const firmId = req.user.firmId;
       if (method === 'trust') {
+        // Fees are drawn from this matter's trust funds first, then from the
+        // client's unallocated trust funds — never from another matter's.
         if (!inv.client_contact_id) throw new Error('Trust-applied payments require an invoice with a client');
-        const cur = db.prepare('SELECT COALESCE(SUM(amount),0) AS bal FROM trust_ledger WHERE firm_id = ? AND client_contact_id = ?')
-          .get(req.user.firmId, inv.client_contact_id).bal;
-        if (cur < amount - 0.001) throw new Error(`Insufficient trust balance for client (${fmtMoney(cur)})`);
-        trustLedgerId = uid('tr_');
-        db.prepare(`INSERT INTO trust_ledger (id, firm_id, client_contact_id, client_name, matter_id, kind, amount, reference, occurred_at, notes, created_by)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
-          trustLedgerId, req.user.firmId, inv.client_contact_id, inv.client_name, inv.matter_id,
-          'fee-applied', -amount, inv.number || inv.id, occurredAt,
-          `Applied to invoice ${inv.number || inv.id}`, req.user.email);
+        const matterBal = inv.matter_id ? Math.max(0, trustBucketBalance(firmId, inv.client_contact_id, inv.matter_id)) : 0;
+        const unallocBal = Math.max(0, trustBucketBalance(firmId, inv.client_contact_id, null));
+        if (matterBal + unallocBal < amount - 0.001) {
+          throw new Error(`Insufficient trust funds for this matter (${fmtMoney(matterBal)} on the matter + ${fmtMoney(unallocBal)} unallocated)`);
+        }
+        const fromMatter = inv.matter_id ? Math.min(matterBal, amount) : 0;
+        const fromUnalloc = round2(amount - fromMatter);
+        const base = { firmId, clientId: inv.client_contact_id, clientName: inv.client_name, kind: 'fee-applied',
+                       reference: inv.number || inv.id, occurredAt, notes: `Applied to invoice ${inv.number || inv.id}`,
+                       createdBy: req.user.email, paymentId: id };
+        if (fromMatter > 0.001) trustLedgerId = insertTrustRow({ ...base, matterId: inv.matter_id, amount: -fromMatter });
+        if (fromUnalloc > 0.001) {
+          const t2 = insertTrustRow({ ...base, matterId: null, amount: -fromUnalloc });
+          trustLedgerId = trustLedgerId || t2;
+        }
+      } else if (destination === 'trust') {
+        // Retainer / replenishment received: deposit to the matter's trust bucket.
+        trustLedgerId = insertTrustRow({
+          firmId, clientId: inv.client_contact_id, clientName: inv.client_name, matterId: inv.matter_id,
+          kind: 'deposit', amount, reference: reference || inv.number || inv.id, occurredAt,
+          notes: `Trust request ${inv.number || inv.id} (${method})`, createdBy: req.user.email, paymentId: id,
+        });
       }
 
       db.prepare(`INSERT INTO invoice_payments
                     (id, firm_id, invoice_id, client_contact_id, destination, amount, currency,
                      method, status, occurred_at, reference, notes, trust_ledger_id, created_by)
                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-        id, req.user.firmId, inv.id, inv.client_contact_id, 'operating',
+        id, firmId, inv.id, inv.client_contact_id, destination,
         amount, 'usd', method, 'succeeded', occurredAt, reference, notes, trustLedgerId, req.user.email);
 
       return recomputeInvoiceTotals(inv.id, req.user.firmId);
@@ -3627,28 +3780,26 @@ app.delete('/api/invoices/:id/payments/:pid', authRequired, verifyFirmMembership
   const pay = db.prepare('SELECT * FROM invoice_payments WHERE id = ? AND firm_id = ? AND invoice_id = ?')
     .get(req.params.pid, req.user.firmId, req.params.id);
   if (!pay) return res.status(404).json({ error: 'Payment not found' });
-  if (pay.stripe_payment_intent_id) return res.status(400).json({ error: 'Refund Stripe payments via Stripe — they sync back through the webhook' });
+  if (pay.stripe_payment_intent_id || pay.refund_of) return res.status(400).json({ error: 'Refund Stripe payments via Stripe — they sync back through the webhook' });
   if (pay.status !== 'succeeded') return res.status(400).json({ error: 'Only succeeded payments can be reversed' });
 
   try {
     const result = db.transaction(() => {
       db.prepare(`UPDATE invoice_payments SET status = 'refunded' WHERE id = ?`).run(pay.id);
-      if (pay.method === 'trust' && pay.trust_ledger_id) {
-        const orig = db.prepare('SELECT * FROM trust_ledger WHERE id = ? AND firm_id = ?')
-          .get(pay.trust_ledger_id, req.user.firmId);
-        if (orig) {
-          db.prepare(`INSERT INTO trust_ledger (id, firm_id, client_contact_id, client_name, matter_id, kind, amount, reference, occurred_at, notes, created_by)
-                      VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
-            uid('tr_'), req.user.firmId, orig.client_contact_id, orig.client_name, orig.matter_id,
-            'refund', -orig.amount, `REVERSE ${orig.id}`, new Date().toISOString(),
-            `Reversal of payment ${pay.id}`, req.user.email);
-        }
+      // Reverse every trust row this payment created (fee-applied draws, or the
+      // deposit for a trust request). Legacy rows only have trust_ledger_id.
+      let rows = db.prepare('SELECT * FROM trust_ledger WHERE payment_id = ? AND firm_id = ?').all(pay.id, req.user.firmId);
+      if (!rows.length && pay.trust_ledger_id) {
+        rows = db.prepare('SELECT * FROM trust_ledger WHERE id = ? AND firm_id = ?').all(pay.trust_ledger_id, req.user.firmId);
       }
+      for (const t of rows) reverseTrustRow(req.user.firmId, t, req.user.email, `Reversal of payment ${pay.id}`);
       return recomputeInvoiceTotals(pay.invoice_id, req.user.firmId);
     })();
+    logAudit(req, 'payment.reverse', 'invoice_payment', pay.id,
+      { amount: pay.amount, method: pay.method, destination: pay.destination, invoice_id: pay.invoice_id }, { status: 'refunded' });
     res.json({ ok: true, ...result });
   } catch (e) {
-    res.status(400).json({ error: e.message || 'Could not reverse payment' });
+    res.status(e.status || 400).json({ error: e.message || 'Could not reverse payment' });
   }
 });
 
@@ -3719,8 +3870,9 @@ app.post('/api/invoices/:id/payment-link', authRequired, verifyFirmMembership, r
     return res.status(503).json({ error: 'Stripe is not connected. Configure it in Settings → Payments.' });
   }
 
-  const balanceDue = Math.max(0, Math.round(((inv.total || 0) - (inv.amount_paid || 0)) * 100));
+  const balanceDue = Math.max(0, Math.round(invoiceBalanceDue(inv) * 100));
   if (balanceDue <= 0) return res.status(400).json({ error: 'Nothing left to pay on this invoice' });
+  const destination = invoiceDestination(inv);
 
   const expiresInDays = Math.max(1, Math.min(365, parseInt(req.body?.expiresInDays ?? 30, 10)));
   const token = crypto.randomBytes(32).toString('base64url');
@@ -3728,8 +3880,8 @@ app.post('/api/invoices/:id/payment-link', authRequired, verifyFirmMembership, r
 
   db.prepare(`INSERT INTO payment_links
               (token, firm_id, invoice_id, destination, amount_cents, expires_at, created_by)
-              VALUES (?, ?, ?, 'operating', ?, ?, ?)`)
-    .run(token, req.user.firmId, inv.id, balanceDue, expiresAt, req.user.email);
+              VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(token, req.user.firmId, inv.id, destination, balanceDue, expiresAt, req.user.email);
 
   const base = appBaseUrl(req);
   res.json({ token, url: base + '/pay/' + token, expiresAt, amountCents: balanceDue });
@@ -3916,8 +4068,29 @@ p{line-height:1.55;margin:0;color:#555}</style>
 </head><body><div class="card"><h1>${escHtml(title)}</h1><p>${escHtml(message)}</p></div></body></html>`;
 }
 
+// What a pay link should charge right now: the link's amount capped at the
+// invoice's live balance (payments and write-downs recorded after the link
+// was minted reduce it). 0 means nothing is owed.
+function payLinkAmountCents(link, inv) {
+  const live = Math.max(0, Math.round(invoiceBalanceDue(inv) * 100));
+  return Math.min(link.amount_cents, live);
+}
+// An ACH payment in flight (Stripe 'processing') — a second payment must not start.
+function hasPaymentInFlight(firmId, invoiceId) {
+  return !!db.prepare(`SELECT 1 FROM invoice_payments WHERE firm_id = ? AND invoice_id = ? AND status = 'processing'`)
+    .get(firmId, invoiceId);
+}
+// The pay page loads Stripe.js and its iframes; the global CSP blocks them.
+const PAY_PAGE_CSP =
+  "default-src 'self'; script-src 'self' 'unsafe-inline' https://js.stripe.com; style-src 'self' 'unsafe-inline'; " +
+  "img-src 'self' data: https://*.stripe.com; font-src 'self' data:; " +
+  "connect-src 'self' https://api.stripe.com https://*.stripe.com; " +
+  "frame-src https://js.stripe.com https://hooks.stripe.com https://*.stripe.com; " +
+  "object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
+
 app.get('/pay/:token', payLimiter, (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Content-Security-Policy', PAY_PAGE_CSP);
   const link = db.prepare('SELECT * FROM payment_links WHERE token = ?').get(req.params.token);
   if (!link) return res.status(404).type('html').send(renderSimplePayPage('Link not found', 'This payment link is invalid or has been removed.'));
   if (link.expires_at && new Date(link.expires_at) < new Date()) {
@@ -3928,7 +4101,12 @@ app.get('/pay/:token', payLimiter, (req, res) => {
   if (!inv || inv.status === 'void') {
     return res.status(404).type('html').send(renderSimplePayPage('Invoice unavailable', 'This invoice is no longer available.'));
   }
-  if (inv.status === 'paid' || (inv.total && (inv.amount_paid || 0) >= inv.total - 0.005)) {
+  if (hasPaymentInFlight(link.firm_id, inv.id)) {
+    return res.type('html').send(renderSimplePayPage('Payment processing',
+      'A payment for this invoice is already being processed. Bank (ACH) payments typically settle in 3–5 business days.'));
+  }
+  const amountCents = payLinkAmountCents(link, inv);
+  if (inv.status === 'paid' || amountCents <= 0) {
     return res.type('html').send(renderSimplePayPage('Already paid', 'This invoice has already been paid in full. Thank you!'));
   }
 
@@ -3940,7 +4118,7 @@ app.get('/pay/:token', payLimiter, (req, res) => {
       'This firm has not finished connecting Stripe. Please contact them to arrange payment another way.'));
   }
 
-  const amount = (link.amount_cents / 100).toLocaleString('en-US', { style: 'currency', currency: 'usd' });
+  const amount = (amountCents / 100).toLocaleString('en-US', { style: 'currency', currency: 'usd' });
   res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pay ${escHtml(firm.name)} — Invoice ${escHtml(inv.number || inv.id)}</title>
@@ -3990,6 +4168,11 @@ app.get('/pay/:token', payLimiter, (req, res) => {
   var PUB = ${JSON.stringify(pub)};
   var TOKEN = ${JSON.stringify(req.params.token)};
   var RETURN_URL = window.location.origin + '/pay/' + TOKEN + '/complete';
+  if (typeof Stripe !== 'function') {
+    document.getElementById('payment-element').innerHTML = '';
+    var m0 = document.getElementById('msg'); m0.textContent = 'The payment form could not load. Check your connection or disable content blockers, then reload.'; m0.className = 'err';
+    return;
+  }
   var stripe = Stripe(PUB);
   var elements;
   var msg = document.getElementById('msg');
@@ -4025,6 +4208,10 @@ app.get('/pay/:token', payLimiter, (req, res) => {
           showMsg(result.error.message || 'Payment failed', 'err');
           submitBtn.disabled = false;
         }
+      })
+      .catch(function(){
+        showMsg('Network error — your payment was not submitted. Please try again.', 'err');
+        submitBtn.disabled = false;
       });
   });
 })();
@@ -4264,8 +4451,8 @@ app.post('/portal/invoice/:token/pay', payLimiter, (req, res) => {
     const expiresAt = new Date(Date.now() + 7 * 86400000).toISOString();
     db.prepare(`INSERT INTO payment_links
                 (token, firm_id, invoice_id, destination, amount_cents, expires_at, created_by)
-                VALUES (?, ?, ?, 'operating', ?, ?, ?)`)
-      .run(payToken, link.firm_id, inv.id, balanceCents, expiresAt, 'portal:' + link.token);
+                VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(payToken, link.firm_id, inv.id, invoiceDestination(inv), balanceCents, expiresAt, 'portal:' + link.token);
   }
 
   res.redirect(302, '/pay/' + payToken);
@@ -4282,9 +4469,14 @@ app.post('/api/pay/:token/intent', payLimiter, async (req, res) => {
 
   const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND firm_id = ?').get(link.invoice_id, link.firm_id);
   if (!inv || inv.status === 'void') return res.status(400).json({ error: 'Invoice not available' });
-  if (inv.status === 'paid' || (inv.total && (inv.amount_paid || 0) >= inv.total - 0.005)) {
+  if (hasPaymentInFlight(link.firm_id, inv.id)) {
+    return res.status(409).json({ error: 'A payment for this invoice is already processing.' });
+  }
+  const amountCents = payLinkAmountCents(link, inv);
+  if (inv.status === 'paid' || amountCents <= 0) {
     return res.status(400).json({ error: 'Invoice is already paid' });
   }
+  const destination = invoiceDestination(inv);
 
   let bits;
   try { bits = getStripeClient(link.firm_id); }
@@ -4296,25 +4488,38 @@ app.post('/api/pay/:token/intent', payLimiter, async (req, res) => {
   if (cfg.ach_enabled)  methods.push('us_bank_account');
   if (!methods.length) return res.status(503).json({ error: 'No payment methods are enabled' });
 
-  // If a pending PI already exists for this link, reuse it to avoid creating
-  // orphaned intents when the customer reloads the page.
-  const existing = db.prepare(`SELECT * FROM invoice_payments
+  // Reuse a pending PI for this invoice when it's still awaiting payment and
+  // for the right amount; one Stripe already moved past that point blocks a
+  // second payment; a stale-amount one is cancelled and replaced.
+  const pendings = db.prepare(`SELECT * FROM invoice_payments
                                WHERE firm_id=? AND invoice_id=? AND status='pending'
                                  AND stripe_payment_intent_id IS NOT NULL
-                               ORDER BY created_at DESC LIMIT 1`)
-    .get(link.firm_id, link.invoice_id);
-  if (existing) {
-    try {
-      const pi = await bits.client.paymentIntents.retrieve(existing.stripe_payment_intent_id);
-      if (pi && (pi.status === 'requires_payment_method' || pi.status === 'requires_confirmation' || pi.status === 'requires_action')) {
-        return res.json({ clientSecret: pi.client_secret });
-      }
-    } catch { /* fall through and create a new one */ }
+                               ORDER BY created_at DESC`)
+    .all(link.firm_id, link.invoice_id);
+  for (const p of pendings) {
+    let pi;
+    try { pi = await bits.client.paymentIntents.retrieve(p.stripe_payment_intent_id); }
+    catch { continue; }
+    if (pi.status === 'processing' || pi.status === 'succeeded') {
+      if (pi.status === 'processing') db.prepare(`UPDATE invoice_payments SET status='processing' WHERE id=? AND status='pending'`).run(p.id);
+      return res.status(409).json({ error: pi.status === 'processing'
+        ? 'A payment for this invoice is already processing.'
+        : 'A payment for this invoice was just completed and is being recorded.' });
+    }
+    const awaiting = ['requires_payment_method', 'requires_confirmation', 'requires_action'].includes(pi.status);
+    if (awaiting && pi.amount === amountCents) return res.json({ clientSecret: pi.client_secret });
+    if (awaiting) {
+      try { await bits.client.paymentIntents.cancel(pi.id); } catch (e) { console.warn('[stripe] cancel stale PI failed', pi.id, e.message); }
+    }
+    db.prepare(`UPDATE invoice_payments SET status='failed' WHERE id=? AND status='pending'`).run(p.id);
   }
 
   try {
+    // Idempotency: concurrent first loads of the page get the same PI.
+    const attempt = db.prepare(`SELECT COUNT(*) AS n FROM invoice_payments WHERE firm_id=? AND invoice_id=? AND stripe_payment_intent_id IS NOT NULL`)
+      .get(link.firm_id, link.invoice_id).n;
     const pi = await bits.client.paymentIntents.create({
-      amount:   link.amount_cents,
+      amount:   amountCents,
       currency: 'usd',
       payment_method_types: methods,
       description: `Invoice ${inv.number || inv.id}`,
@@ -4322,15 +4527,17 @@ app.post('/api/pay/:token/intent', payLimiter, async (req, res) => {
         firm_id:            link.firm_id,
         invoice_id:         link.invoice_id,
         payment_link_token: link.token,
-        destination:        link.destination,
+        destination,
       },
-    });
+    }, { idempotencyKey: `crm-pi-${link.firm_id}-${inv.id}-${amountCents}-${attempt}` });
+    const dup = db.prepare('SELECT 1 FROM invoice_payments WHERE stripe_payment_intent_id = ?').get(pi.id);
+    if (dup) return res.json({ clientSecret: pi.client_secret });
     const rowId = '_' + crypto.randomBytes(8).toString('hex');
     db.prepare(`INSERT INTO invoice_payments
                 (id, firm_id, invoice_id, client_contact_id, destination, amount, currency, status, stripe_payment_intent_id)
                 VALUES (?, ?, ?, ?, ?, ?, 'usd', 'pending', ?)`)
       .run(rowId, link.firm_id, link.invoice_id, inv.client_contact_id,
-           link.destination, link.amount_cents / 100, pi.id);
+           destination, amountCents / 100, pi.id);
     res.json({ clientSecret: pi.client_secret });
   } catch (e) {
     console.error('[stripe] paymentIntents.create failed:', e.stack || e.message);
@@ -5222,18 +5429,28 @@ app.post('/api/trust', authRequired, verifyFirmMembership, requireCap('manageBil
   // Verify the client exists within this firm
   const client = db.prepare('SELECT id, full_name FROM contacts WHERE id = ? AND firm_id = ?').get(b.clientContactId, req.user.firmId);
   if (!client) return res.status(400).json({ error: 'Client not found in this firm' });
+  // A matter, if given, must belong to this firm and this client.
+  const matterId = b.matterId || null;
+  if (matterId) {
+    const m = db.prepare('SELECT client_contact_id FROM matters WHERE id = ? AND firm_id = ?').get(matterId, req.user.firmId);
+    if (!m) return res.status(400).json({ error: 'Matter not found in this firm' });
+    if (m.client_contact_id && m.client_contact_id !== client.id) return res.status(400).json({ error: 'That matter belongs to a different client' });
+  }
   // Enforce sign convention
   const amount = b.kind === 'deposit' ? Math.abs(b.amount) : -Math.abs(b.amount);
-  // Prevent overdraw per client
-  {
-    const cur = db.prepare('SELECT COALESCE(SUM(amount),0) AS bal FROM trust_ledger WHERE firm_id = ? AND client_contact_id = ?').get(req.user.firmId, b.clientContactId).bal;
-    if (cur + amount < -0.001) return res.status(400).json({ error: `Insufficient trust balance. Current: ${fmtMoney(cur)}` });
+  // Prevent overdraw of the specific bucket (client + matter, or the client's
+  // unallocated funds when no matter is given) — one matter's retainer can't
+  // fund another matter's disbursement.
+  const cur = trustBucketBalance(req.user.firmId, client.id, matterId);
+  if (cur + amount < -0.001) {
+    return res.status(400).json({ error: `Insufficient trust balance ${matterId ? 'for this matter' : '(unallocated)'}. Current: ${fmtMoney(cur)}` });
   }
-  const id = uid('tr_');
-  db.prepare(`INSERT INTO trust_ledger (id, firm_id, client_contact_id, client_name, matter_id, kind, amount, reference, occurred_at, notes, created_by)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
-    id, req.user.firmId, b.clientContactId || null, b.clientName || null, b.matterId || null,
-    b.kind, amount, b.reference || null, b.occurredAt || new Date().toISOString(), b.notes || null, req.user.email);
+  const id = insertTrustRow({
+    firmId: req.user.firmId, clientId: client.id, clientName: client.full_name, matterId,
+    kind: b.kind, amount, reference: b.reference || null, occurredAt: b.occurredAt || null,
+    notes: b.notes || null, createdBy: req.user.email,
+  });
+  logAudit(req, 'trust.entry', 'trust_ledger', id, null, { kind: b.kind, amount, client_contact_id: client.id, matter_id: matterId });
   res.json(db.prepare('SELECT * FROM trust_ledger WHERE id = ?').get(id));
 });
 
@@ -5241,12 +5458,14 @@ app.delete('/api/trust/:id', authRequired, verifyFirmMembership, requireCap('man
   // IOLTA: never hard-delete. Post a reversing entry instead.
   const t = db.prepare('SELECT * FROM trust_ledger WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
   if (!t) return res.status(404).json({ error: 'Not found' });
-  const id = uid('tr_');
-  db.prepare(`INSERT INTO trust_ledger (id, firm_id, client_contact_id, client_name, matter_id, kind, amount, reference, occurred_at, notes, created_by)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
-    id, req.user.firmId, t.client_contact_id, t.client_name, t.matter_id,
-    'refund', -t.amount, `REVERSE ${t.id}`, new Date().toISOString(),
-    `Reversal of ${t.kind} posted ${t.occurred_at}`, req.user.email);
+  const linkedPay = t.payment_id
+    || db.prepare('SELECT id FROM invoice_payments WHERE trust_ledger_id = ? AND firm_id = ?').get(t.id, req.user.firmId)?.id;
+  if (linkedPay) {
+    return res.status(400).json({ error: 'This entry belongs to an invoice payment. Reverse the payment from the invoice instead.' });
+  }
+  let id;
+  try { id = db.transaction(() => reverseTrustRow(req.user.firmId, t, req.user.email))(); }
+  catch (e) { return res.status(e.status || 400).json({ error: e.message }); }
   logAudit(req, 'trust.reversal', 'trust_ledger', t.id,
     { kind: t.kind, amount: t.amount, client_name: t.client_name, client_contact_id: t.client_contact_id, matter_id: t.matter_id, occurred_at: t.occurred_at, reference: t.reference, notes: t.notes },
     { reversal_id: id, amount: -t.amount });
@@ -5290,6 +5509,7 @@ app.get('/api/reports/cashflow', authRequired, verifyFirmMembership, requireCap(
   const billed = db.prepare(`
     SELECT strftime('${fmt}', issued_at) AS period, COALESCE(SUM(total),0) AS amount, COUNT(*) AS n
     FROM invoices WHERE firm_id = ? AND status != 'void' AND issued_at IS NOT NULL
+      AND COALESCE(kind, 'fees') != 'trust_request'
     ${billedDate.sql}${billedClient.sql}${billedMatter.sql}
     GROUP BY period ORDER BY period
   `).all(req.user.firmId, ...billedDate.params, ...billedClient.params, ...billedMatter.params);
@@ -5321,6 +5541,7 @@ app.get('/api/reports/cashflow', authRequired, verifyFirmMembership, requireCap(
            COALESCE(SUM(amount),0) AS amount, COUNT(*) AS n
     FROM invoice_payments
     WHERE firm_id = ? AND status = 'succeeded' AND occurred_at IS NOT NULL
+      AND COALESCE(destination, 'operating') = 'operating'
     ${payDate.sql}${cashClient.sql}${cashMatter.sql}
     GROUP BY period, method ORDER BY period
   `).all(req.user.firmId, ...payDate.params, ...cashClient.params, ...cashMatter.params);

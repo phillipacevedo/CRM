@@ -6663,7 +6663,10 @@ async function openInvoiceDetail(id) {
         class: inv.status === s ? 'active' : '',
         onclick: async () => {
           if (s === 'void' && !confirm('Void this invoice? This cannot be undone. Billed time entries will be released back to draft.')) return;
-          await api('/api/invoices/' + id + '/status', { method: 'PATCH', body: { status: s } });
+          // Server refuses void with recorded payments and "paid" with a balance due;
+          // api() shows its explanation as a toast.
+          try { await api('/api/invoices/' + id + '/status', { method: 'PATCH', body: { status: s } }); }
+          catch { return; }
           toast('Marked ' + s); closeModal(); navigate('invoices');
         },
       }, s[0].toUpperCase() + s.slice(1)))),
@@ -8046,14 +8049,27 @@ async function renderTrust(mount, v) {
 }
 
 function openTrustForm(clients) {
+  // Trust balances are tracked per matter; "Unallocated" holds client funds
+  // not yet assigned to a matter. Withdrawals can only draw on the chosen bucket.
+  const clientSel = el('select', { name: 'clientContactId', required: '' }, [ el('option', { value: '' }, '— choose —'), ...clients.map(c => el('option', { value: c.id }, c.full_name)) ]);
+  const matterSel = el('select', { name: 'matterId' }, [ el('option', { value: '' }, 'Unallocated (no matter)') ]);
+  clientSel.addEventListener('change', async () => {
+    matterSel.innerHTML = '';
+    matterSel.appendChild(el('option', { value: '' }, 'Unallocated (no matter)'));
+    if (!clientSel.value) return;
+    const ms = await api('/api/matters?clientId=' + encodeURIComponent(clientSel.value)).catch(() => []);
+    ms.forEach(m => matterSel.appendChild(el('option', { value: m.id }, (m.matter_number ? m.matter_number + ' — ' : '') + m.name)));
+  });
   const body = el('div', {}, [
     el('div', { class: 'form-row' }, [
       el('div', { class: 'field' }, [ el('label', {}, 'Kind'),
         el('select', { name: 'kind' }, ['deposit','withdrawal','transfer-to-operating','fee-applied','refund'].map(k => el('option', { value: k }, k))) ]),
       el('div', { class: 'field' }, [ el('label', {}, 'Amount ($)'), el('input', { name: 'amount', type: 'number', step: '0.01' }) ]),
     ]),
-    el('div', { class: 'field' }, [ el('label', {}, 'Client *'),
-      el('select', { name: 'clientContactId', required: '' }, [ el('option', { value: '' }, '— choose —'), ...clients.map(c => el('option', { value: c.id }, c.full_name)) ]) ]),
+    el('div', { class: 'form-row' }, [
+      el('div', { class: 'field' }, [ el('label', {}, 'Client *'), clientSel ]),
+      el('div', { class: 'field' }, [ el('label', {}, 'Matter'), matterSel ]),
+    ]),
     el('div', { class: 'form-row' }, [
       el('div', { class: 'field' }, [ el('label', {}, 'Date'), el('input', { name: 'occurredAt', type: 'date', value: todayDateInput() }) ]),
       el('div', { class: 'field' }, [ el('label', {}, 'Reference (check #, wire)'), el('input', { name: 'reference' }) ]),
@@ -8067,14 +8083,20 @@ function openTrustForm(clients) {
     if (!d.clientContactId) return toast('Client required — every IOLTA entry must be paired with a client', true);
     const c = clients.find(x => x.id === d.clientContactId);
     if (c) d.clientName = c.full_name;
+    if (!d.matterId) d.matterId = null;
     if (d.occurredAt) d.occurredAt = new Date(d.occurredAt).toISOString();
-    await api('/api/trust', { method: 'POST', body: d });
-    toast('Posted'); closeModal(); navigate('trust');
+    postBtn.disabled = true;
+    try {
+      await api('/api/trust', { method: 'POST', body: d });
+      toast('Posted'); closeModal(); navigate('trust');
+    } catch (e) { /* api() already toasted the error */ }
+    finally { postBtn.disabled = false; }
   };
+  const postBtn = el('button', { class: 'btn btn-primary btn-sm', onclick: save }, 'Post');
   openModal('Trust transaction', body, el('div', {}, [
     el('div', { class: 'spacer' }),
     el('button', { class: 'btn btn-ghost btn-sm', onclick: closeModal }, 'Cancel'),
-    el('button', { class: 'btn btn-primary btn-sm', onclick: save }, 'Post'),
+    postBtn,
   ]));
 }
 
