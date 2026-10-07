@@ -885,6 +885,55 @@ table.data tbody tr:hover .row-timer-btn:hover{color:#fff}
   /* Stat tiles read better two-up than one per row on phones. */
   .grid-5,.grid-4{grid-template-columns:repeat(2,1fr)}
 }
+
+/* ── Phone lists: each table row becomes a card ─────────────────────────
+   labelTables() (JS) copies each column header into its cells' data-label
+   and marks the row's main cell, select checkbox and action cells; tables
+   it has processed get .cardable. Below 640px the header row is hidden and
+   every cell renders as "LABEL ........ value". Tables without a header
+   keep the scrolling layout. Add .no-cards to a table to opt out. */
+@media (max-width:640px){
+  table.data.cardable{display:block;border:none;background:transparent;overflow:visible;white-space:normal;box-shadow:none}
+  table.data.cardable thead{display:none}
+  table.data.cardable tbody{display:block}
+  table.data.cardable tbody tr{
+    display:block;position:relative;background:#fff;border:1px solid var(--border);border-radius:var(--radius);
+    padding:10px 14px;margin-bottom:10px;box-shadow:var(--shadow);
+  }
+  table.data.cardable tbody tr:hover{background:#fff}
+  table.data.cardable tbody tr:active{background:var(--gold-bg)}
+  table.data.cardable td{
+    display:flex;justify-content:space-between;align-items:baseline;gap:12px;
+    padding:3px 0;border:none;font-size:14px;text-align:right;min-width:0;overflow-wrap:anywhere;
+  }
+  table.data.cardable td::before{
+    content:attr(data-label);flex-shrink:0;max-width:45%;text-align:left;
+    font-size:11px;font-weight:600;color:var(--text-light);text-transform:uppercase;letter-spacing:.3px;
+  }
+  table.data.cardable td[data-label=""]::before{display:none}
+  table.data.cardable td[data-label=""]{justify-content:flex-start;text-align:left}
+  table.data.cardable td.cell-primary{
+    display:block;text-align:left;font-size:15px;font-weight:600;color:var(--navy);
+    padding:0 32px 6px 0;margin-bottom:4px;border-bottom:1px solid var(--border);
+  }
+  table.data.cardable td.cell-primary::before{display:none}
+  table.data.cardable td.cell-select{position:absolute;top:10px;right:12px;padding:0;display:block}
+  table.data.cardable td.cell-select::before{display:none}
+  table.data.cardable td.cell-empty{display:none}
+  /* Cells sometimes carry inline padding/borders meant for the desktop grid. */
+  table.data.cardable td{padding-left:0 !important;border-left:none !important}
+  table.data.cardable td.cell-select{border:none !important}
+  /* Trust matter buckets: one compact line under their client card. */
+  table.data.cardable tr.trust-bucket{
+    display:flex;justify-content:space-between;align-items:baseline;gap:12px;
+    margin:-6px 0 10px 16px;padding:8px 12px;box-shadow:none;background:var(--cream);
+  }
+  table.data.cardable tr.trust-bucket td{padding:0}
+  table.data.cardable tr.trust-bucket td.cell-primary{border:none;margin:0;padding:0;font-size:13px;font-weight:500;color:var(--text-muted)}
+  table.data.cardable tr.trust-bucket td::before{display:none}
+  table.data.cardable tr.trust-bucket td:not(.cell-primary){white-space:nowrap;flex-shrink:0}
+  table.data.cardable td.cell-primary *{white-space:normal}
+}
 </style>
 <script>
 // Theme presets and applyTheme — declared in <head> so a cached theme can apply
@@ -1261,6 +1310,44 @@ const ICONS = {
   shield:'<svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
   settings:'<svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
 };
+
+// ── Card-per-row support for phone widths (see .cardable CSS) ───────────
+// Copies each column's header text into its cells' data-label and tags the
+// row's primary cell, select checkbox, and empty cells. Runs whenever the DOM
+// changes, so every table built with el() is covered without per-view code.
+function labelTables(root = document) {
+  root.querySelectorAll('table.data:not(.no-cards)').forEach(t => {
+    const ths = [...t.querySelectorAll(':scope > thead th')];
+    if (!ths.length) return;
+    const heads = [];
+    ths.forEach(th => {
+      const label = th.querySelector('input') ? '' : th.textContent.replace(/[▲▼↑↓]/g, '').trim();
+      for (let k = 0; k < (th.colSpan || 1); k++) heads.push(label);
+    });
+    t.classList.add('cardable');
+    t.querySelectorAll(':scope > tbody > tr').forEach(tr => {
+      if (tr.dataset.carded === String(tr.children.length)) return;
+      let i = 0, primary = null;
+      [...tr.children].forEach(td => {
+        const label = heads[i] || '';
+        i += td.colSpan || 1;
+        td.dataset.label = (tr.children.length === 1) ? '' : label;
+        const onlyCheckbox = td.querySelector('input[type=checkbox]') && !td.textContent.trim();
+        td.classList.toggle('cell-select', !!onlyCheckbox);
+        td.classList.toggle('cell-empty', !onlyCheckbox && !td.textContent.trim() && !td.querySelector('button,a,input,select,img,svg'));
+        if (!primary && !onlyCheckbox && label && td.textContent.trim()) primary = td;
+      });
+      if (primary && tr.children.length > 1) primary.classList.add('cell-primary');
+      tr.dataset.carded = String(tr.children.length);
+    });
+  });
+}
+let _labelQueued = false;
+new MutationObserver(() => {
+  if (_labelQueued) return;
+  _labelQueued = true;
+  requestAnimationFrame(() => { _labelQueued = false; labelTables(); });
+}).observe(document.documentElement, { childList: true, subtree: true });
 
 // Mobile drawer. On desktop the sidebar is always visible and this is a no-op visually.
 function toggleNav(force) {
