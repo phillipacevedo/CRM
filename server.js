@@ -6477,8 +6477,19 @@ app.get('/api/expenses', authRequired, verifyFirmMembership, (req, res) => {
   res.json(db.prepare(sql).all(...p));
 });
 
+// markup_pct is a fraction (0.10 = 10%). Reject percents sent by mistake
+// (e.g. 10 → 1000%) and negatives.
+function markupError(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0 || n > 1) return 'markupPct must be a fraction between 0 and 1 (0.10 = 10%)';
+  return null;
+}
+
 app.post('/api/expenses', authRequired, verifyFirmMembership, requireCap('logTime'), (req, res) => {
   const b = req.body || {};
+  const mErr = markupError(b.markupPct);
+  if (mErr) return res.status(400).json({ error: mErr });
   if (!b.matterId || !b.date || typeof b.amount !== 'number') return res.status(400).json({ error: 'matterId, date, and amount required' });
   const m = db.prepare('SELECT id FROM matters WHERE id = ? AND firm_id = ?').get(b.matterId, req.user.firmId);
   if (!m) return res.status(404).json({ error: 'Matter not found' });
@@ -6500,6 +6511,8 @@ app.put('/api/expenses/:id', authRequired, verifyFirmMembership, requireCap('log
   if (existing.status === 'billed' && !req.user.isAdmin) return res.status(400).json({ error: 'Billed expenses cannot be edited' });
   const b = req.body || {};
   if (b.category && !EXPENSE_CATEGORIES.includes(b.category)) return res.status(400).json({ error: 'Invalid category' });
+  const mErr = markupError(b.markupPct);
+  if (mErr) return res.status(400).json({ error: mErr });
   db.prepare(`UPDATE expenses SET
       date = COALESCE(?, date), category = COALESCE(?, category), description = COALESCE(?, description),
       amount = COALESCE(?, amount), billable = COALESCE(?, billable), markup_pct = COALESCE(?, markup_pct),

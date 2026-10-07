@@ -965,11 +965,25 @@ function runViewCleanups() {
 // ── Utilities ────────────────────────────────────────────────────────────
 const $  = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
+// Primary/danger buttons (Save, Post, Delete…) ignore clicks while their
+// handler is still running, so a double-click can't submit twice.
+const BUSY_BUTTON = /\bbtn-(primary|danger)\b/;
+function busyGuard(btn, fn) {
+  return async (ev) => {
+    if (btn.dataset.busy) { ev.preventDefault(); return; }
+    btn.dataset.busy = '1';
+    const wasDisabled = btn.disabled;
+    btn.disabled = true;
+    try { return await fn(ev); }
+    finally { delete btn.dataset.busy; btn.disabled = wasDisabled; }
+  };
+}
 const el = (tag, attrs={}, children=[]) => {
   const e = document.createElement(tag);
   for (const [k,v] of Object.entries(attrs)) {
     if (k === 'class') e.className = v;
     else if (k === 'html') e.innerHTML = v;
+    else if (k === 'onclick' && typeof v === 'function' && tag === 'button' && BUSY_BUTTON.test(attrs.class || '')) e.addEventListener('click', busyGuard(e, v));
     else if (k.startsWith('on') && typeof v === 'function') e.addEventListener(k.slice(2), v);
     else if (v != null) e.setAttribute(k, v);
   }
@@ -5917,8 +5931,9 @@ function openExpenseForm(existing, matters) {
         el('input', { type: 'checkbox', name: 'billable', id: 'exp-billable', ...(e.billable !== 0 ? { checked: 'checked' } : {}) }),
         el('label', { for: 'exp-billable' }, 'Billable to client'),
       ]),
-      el('div', { class: 'field' }, [ el('label', {}, 'Markup (e.g. 0.10 for 10%)'),
-        el('input', { name: 'markupPct', type: 'number', step: '0.01', value: e.markup_pct || 0 }) ]),
+      el('div', { class: 'field' }, [ el('label', {}, 'Markup %'),
+        el('input', { name: 'markupPct', type: 'number', step: '0.1', min: '0', max: '100', placeholder: 'e.g. 10',
+                      value: e.markup_pct ? +(Number(e.markup_pct) * 100).toFixed(2) : 0 }) ]),
     ]),
     attachmentSection,
   ]);
@@ -5947,7 +5962,10 @@ function openExpenseForm(existing, matters) {
       .forEach(i => { d[i.name] = i.type === 'checkbox' ? i.checked : i.value; });
     d.matterId = picker.getValues().matterId;
     d.amount = parseFloat(d.amount) || 0;
-    d.markupPct = parseFloat(d.markupPct) || 0;
+    // UI takes a percent (10 = 10%); the API stores a fraction (0.10).
+    const markupPercent = parseFloat(d.markupPct) || 0;
+    if (markupPercent < 0 || markupPercent > 100) return toast('Markup must be between 0% and 100%', true);
+    d.markupPct = +(markupPercent / 100).toFixed(4);
     if (!d.matterId || !d.amount) return toast('Matter and amount required', true);
     let saved;
     if (isNew) saved = await api('/api/expenses', { method: 'POST', body: d });
@@ -6762,6 +6780,7 @@ function openRecordPaymentForm(inv, onSaved) {
     const get = (n) => body.querySelector('[name=' + n + ']');
     const amount = parseFloat(get('amount').value);
     if (!Number.isFinite(amount) || amount <= 0) return toast('Enter an amount', true);
+    if (amount > balance + 0.005) return toast('Amount exceeds the balance due (' + fmt.money(balance) + ')', true);
     try {
       await api('/api/invoices/' + inv.id + '/payments', { method: 'POST', body: {
         amount,
