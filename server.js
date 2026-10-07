@@ -152,6 +152,22 @@ const authLimiter = rateLimit({
   windowMs: 15*60*1000, max: 15, standardHeaders: true, legacyHeaders: false,
   message: { error: 'Too many attempts. Try again in 15 minutes.' },
 });
+// Per-account limiter for password and 2FA attempts, so a distributed attacker
+// can't brute-force one account and one noisy IP can't lock out the firm.
+function accountKey(req) {
+  const b = req.body || {};
+  let email = typeof b.email === 'string' ? b.email : '';
+  if (!email && typeof b.challengeToken === 'string') {
+    try { email = jwt.decode(b.challengeToken)?.email || ''; } catch (e) {}
+  }
+  return 'acct:' + String(email).toLowerCase().trim();
+}
+const accountLimiter = rateLimit({
+  windowMs: 15*60*1000, max: 10, standardHeaders: true, legacyHeaders: false,
+  keyGenerator: accountKey,
+  skip: req => accountKey(req) === 'acct:',
+  message: { error: 'Too many attempts for this account. Try again in 15 minutes.' },
+});
 const forgotPasswordLimiter = rateLimit({
   windowMs: 60*60*1000, max: 5, standardHeaders: true, legacyHeaders: false,
   message: { error: 'Too many reset requests. Try again later.' },
@@ -709,6 +725,10 @@ const migrations = [
   // present a 6-digit code at login."
   `ALTER TABLE users ADD COLUMN totp_secret TEXT`,
   `ALTER TABLE users ADD COLUMN totp_enabled INTEGER DEFAULT 0`,
+  // Session generation counter. Every JWT carries the value at issue time
+  // (`tv`); bumping it (password change/reset, deactivation, 2FA reset)
+  // invalidates every outstanding session for that user.
+  `ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 0`,
 ];
 // Only swallow "duplicate column" errors (idempotency). Anything else — syntax
 // typos, missing table, permission issues — is a real problem and should fail
@@ -946,7 +966,25 @@ function makeToken(user, firm) {
     email: user.email, name: user.name, role: user.role,
     isAdmin: !!user.is_admin, firmId: user.firm_id,
     firmName: firm?.name || '',
+    tv: user.token_version || 0,
   }, JWT_SECRET, { algorithm: 'HS256', expiresIn: JWT_EXPIRY, issuer: 'crm', audience: 'crm' });
+}
+
+// Invalidate every outstanding session for a user (see users.token_version).
+function revokeUserSessions(email) {
+  db.prepare('UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE email = ?').run(email);
+}
+
+// Absolute base URL for links that go out by email. Never derived from the
+// request's Origin/Host headers — those are attacker-controlled, and a reset
+// link pointing at an attacker's domain hands them the reset token.
+function appBaseUrl(req) {
+  if (process.env.APP_URL) return process.env.APP_URL.replace(/\/$/, '');
+  if (ALLOWED_ORIGIN && ALLOWED_ORIGIN !== '*') return ALLOWED_ORIGIN.replace(/\/$/, '');
+  if (process.env.NODE_ENV === 'production') {
+    console.warn('[links] APP_URL not set; falling back to request Host header. Set APP_URL in production.');
+  }
+  return `${req.protocol}://${req.get('host')}`;
 }
 
 function parseJSON(s, fallback) { try { return JSON.parse(s); } catch(e) { return fallback; } }
@@ -955,6 +993,12 @@ function fullName(first, last) { return [first, last].map(s => (s || '').trim())
 
 // ── EXPRESS APP ─────────────────────────────────────────────────────────
 const app = express();
+// Render (and most PaaS) terminate TLS at one proxy hop. Without this, every
+// request appears to come from the proxy's IP, so rate limits become a single
+// global bucket and req.protocol is always 'http'.
+if (process.env.RENDER || process.env.TRUST_PROXY) {
+  app.set('trust proxy', Number(process.env.TRUST_PROXY) || 1);
+}
 
 // Security headers
 app.use((req, res, next) => {
@@ -1262,13 +1306,23 @@ function authRequired(req, res, next) {
   if (!token) return res.status(401).json({ error: 'Authentication required' });
   try {
     const payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'], issuer: 'crm', audience: 'crm' });
-    if (payload.jti) {
-      const denied = db.prepare('SELECT 1 FROM token_denylist WHERE jti = ?').get(payload.jti);
-      if (denied) return res.status(401).json({ error: 'Session revoked. Sign in again.' });
+    // Only full session tokens are accepted here. Purpose-scoped tokens
+    // (e.g. a 2FA challenge) and anything missing session claims are refused.
+    if (payload.purpose || !payload.jti || !payload.firmId || typeof payload.email !== 'string') {
+      return res.status(401).json({ error: 'Invalid session. Sign in again.' });
     }
-    if (payload && typeof payload.email === 'string') {
-      payload.email = payload.email.toLowerCase().trim();
+    const denied = db.prepare('SELECT 1 FROM token_denylist WHERE jti = ?').get(payload.jti);
+    if (denied) return res.status(401).json({ error: 'Session revoked. Sign in again.' });
+    payload.email = payload.email.toLowerCase().trim();
+    // Role, admin flag, firm and active status come from the DB on every
+    // request, not from the (up to 7-day-old) token, so demotion and
+    // deactivation take effect immediately.
+    const u = db.prepare('SELECT role, is_admin, firm_id, active, token_version FROM users WHERE email = ?').get(payload.email);
+    if (!u || !u.active || u.firm_id !== payload.firmId || (u.token_version || 0) !== (payload.tv || 0)) {
+      return res.status(401).json({ error: 'Session no longer valid. Sign in again.' });
     }
+    payload.role = u.role;
+    payload.isAdmin = !!u.is_admin;
     req.user = payload;
     next();
   } catch(e) {
@@ -1309,10 +1363,10 @@ app.post('/api/auth/logout', authRequired, (req, res) => {
 // Short-lived JWT issued after password success when the user has 2FA on.
 // Carries no firm/role claims — its only valid use is /api/auth/2fa-verify.
 function make2faChallenge(email) {
-  return jwt.sign({ email, purpose: '2fa_challenge' }, JWT_SECRET, { algorithm: 'HS256', expiresIn: '5m', issuer: 'crm', audience: 'crm' });
+  return jwt.sign({ email, purpose: '2fa_challenge' }, JWT_SECRET, { algorithm: 'HS256', expiresIn: '5m', issuer: 'crm', audience: 'crm-2fa' });
 }
 
-app.post('/api/auth/login', authLimiter, async (req, res) => {
+app.post('/api/auth/login', authLimiter, accountLimiter, async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
   const emailLower = email.toLowerCase().trim();
@@ -1340,11 +1394,11 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   });
 });
 
-app.post('/api/auth/2fa-verify', authLimiter, (req, res) => {
+app.post('/api/auth/2fa-verify', authLimiter, accountLimiter, (req, res) => {
   const { challengeToken, code } = req.body || {};
   if (!challengeToken || !code) return res.status(400).json({ error: 'challengeToken and code required' });
   let payload;
-  try { payload = jwt.verify(challengeToken, JWT_SECRET, { algorithms: ['HS256'], issuer: 'crm', audience: 'crm' }); }
+  try { payload = jwt.verify(challengeToken, JWT_SECRET, { algorithms: ['HS256'], issuer: 'crm', audience: 'crm-2fa' }); }
   catch (e) { return res.status(401).json({ error: 'Challenge expired or invalid. Sign in again.' }); }
   if (payload.purpose !== '2fa_challenge') return res.status(401).json({ error: 'Bad challenge token' });
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(payload.email);
@@ -1390,6 +1444,11 @@ app.post('/api/auth/change-password', authRequired, async (req, res) => {
   if (!ok) return res.status(401).json({ error: 'Current password is incorrect' });
   const h = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
   db.prepare('UPDATE users SET password_hash = ? WHERE email = ?').run(h, req.user.email);
+  // Sign out every other session, then re-issue this one.
+  revokeUserSessions(req.user.email);
+  const fresh = db.prepare('SELECT * FROM users WHERE email = ?').get(req.user.email);
+  const f = db.prepare('SELECT * FROM firms WHERE id = ?').get(fresh.firm_id);
+  setAuthCookie(res, makeToken(fresh, f));
   res.json({ ok: true });
 });
 
@@ -1466,6 +1525,7 @@ app.post('/api/seats/:email/2fa/reset', authRequired, adminRequired, (req, res) 
   if (!u) return res.status(404).json({ error: 'User not found' });
   if (!u.totp_enabled) return res.json({ ok: true });
   db.prepare('UPDATE users SET totp_secret = NULL, totp_enabled = 0 WHERE email = ?').run(emailLower);
+  revokeUserSessions(emailLower);
   logAudit(req, '2fa.admin_reset', 'user', emailLower, { totp_enabled: 1 }, { totp_enabled: 0 });
   res.json({ ok: true });
 });
@@ -1480,8 +1540,7 @@ app.post('/api/auth/forgot-password', forgotPasswordLimiter, async (req, res) =>
   const t = crypto.randomBytes(32).toString('hex');
   const exp = new Date(Date.now() + 3600*1000).toISOString();
   db.prepare('INSERT INTO password_resets (token, email, expires_at) VALUES (?,?,?)').run(hashToken(t), emailLower, exp);
-  const base = req.headers.origin || `${req.protocol}://${req.get('host')}`;
-  await sendResetEmail(emailLower, `${base}/reset-password?token=${t}`);
+  await sendResetEmail(emailLower, `${appBaseUrl(req)}/reset-password?token=${t}`);
   res.json({ ok: true });
 });
 
@@ -1496,11 +1555,11 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   const h = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
   db.prepare('UPDATE users SET password_hash = ? WHERE email = ?').run(h, r.email);
   db.prepare('UPDATE password_resets SET used = 1 WHERE token = ?').run(tokenHash);
-  const u = db.prepare('SELECT * FROM users WHERE email = ?').get(r.email);
-  const f = db.prepare('SELECT * FROM firms WHERE id = ?').get(u.firm_id);
-  const at = makeToken(u, f);
-  setAuthCookie(res, at);
-  res.json({ ok: true, token: at });
+  // A reset proves control of the mailbox only — not the second factor — so it
+  // never signs the user in. They log in normally (password + TOTP if enabled).
+  // Any sessions open before the reset are revoked.
+  revokeUserSessions(r.email);
+  res.json({ ok: true });
 });
 
 app.post('/api/auth/refresh', authRequired, (req, res) => {
@@ -1525,6 +1584,11 @@ async function exchangeFrom(url, token, res) {
   if (!email) return res.status(401).json({ error: 'No email from source' });
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
   if (!user || !user.active) return res.status(403).json({ error: 'No active CRM account for this email' });
+  // The sibling app vouches for the password step only; CRM's own second
+  // factor still applies.
+  if (user.totp_enabled) {
+    return res.json({ totpRequired: true, challengeToken: make2faChallenge(user.email) });
+  }
   const firm = db.prepare('SELECT * FROM firms WHERE id = ?').get(user.firm_id);
   const crmToken = makeToken(user, firm);
   setAuthCookie(res, crmToken);
@@ -1631,7 +1695,7 @@ app.post('/api/seats/invite', authRequired, adminRequired, async (req, res) => {
   db.prepare('INSERT INTO invites (token, email, firm_id, role, is_admin, expires_at) VALUES (?,?,?,?,?,?)')
     .run(hashToken(token), emailLower, req.user.firmId, role || 'associate', isAdmin ? 1 : 0, exp);
   const firm = db.prepare('SELECT * FROM firms WHERE id = ?').get(req.user.firmId);
-  const base = req.headers.origin || `${req.protocol}://${req.get('host')}`;
+  const base = appBaseUrl(req);
   await sendInviteEmail(emailLower, `${base}/accept-invite?token=${token}`, firm.name, req.user.name);
   res.json({ ok: true });
 });
@@ -1678,6 +1742,9 @@ app.put('/api/seats/:email', authRequired, adminRequired, (req, res) => {
   if (!u) return res.status(404).json({ error: 'User not found' });
   const { firstName, lastName, role, defaultRate, discountRate, active, dtSubscriber } = req.body;
   if (role && !VALID_ROLES.includes(role)) return res.status(400).json({ error: 'Invalid role' });
+  if (emailLower === req.user.email && ((role && role !== u.role) || (typeof active === 'boolean' && (active ? 1 : 0) !== u.active))) {
+    return res.status(400).json({ error: "You can't change your own role or active status" });
+  }
   const newFirst  = (firstName ?? u.first_name ?? '').trim();
   const newLast   = (lastName  ?? u.last_name  ?? '').trim();
   const newRole   = role || u.role;
@@ -1690,6 +1757,7 @@ app.put('/api/seats/:email', authRequired, adminRequired, (req, res) => {
   const newDtSub  = typeof dtSubscriber  === 'boolean' ? (dtSubscriber  ? 1 : 0) : u.dt_subscriber;
   db.prepare('UPDATE users SET first_name=?, last_name=?, name=?, role=?, default_rate=?, discount_rate=?, active=?, dt_subscriber=? WHERE email=?')
     .run(newFirst, newLast, newName, newRole, newRate, newDisc, newActive, newDtSub, emailLower);
+  if (u.active && !newActive) revokeUserSessions(emailLower);
   logAudit(req, 'seat.update', 'user', emailLower,
     { role: u.role, default_rate: u.default_rate, discount_rate: u.discount_rate, active: u.active, dt_subscriber: u.dt_subscriber, name: u.name },
     { role: newRole, default_rate: newRate, discount_rate: newDisc, active: newActive, dt_subscriber: newDtSub, name: newName });
@@ -1714,6 +1782,7 @@ app.delete('/api/seats/:email', authRequired, adminRequired, (req, res) => {
   if (!u) return res.status(404).json({ error: 'User not found' });
   // Soft-delete: mark inactive so historical time entries / invoices remain readable.
   db.prepare('UPDATE users SET active = 0 WHERE email = ?').run(emailLower);
+  revokeUserSessions(emailLower);
   logAudit(req, 'seat.deactivate', 'user', emailLower, { active: u.active, role: u.role }, { active: 0 });
   res.json({ ok: true });
 });
@@ -1726,8 +1795,7 @@ app.post('/api/seats/:email/reset-password', authRequired, adminRequired, async 
   const t = crypto.randomBytes(32).toString('hex');
   const exp = new Date(Date.now() + 3600*1000).toISOString();
   db.prepare('INSERT INTO password_resets (token, email, expires_at) VALUES (?,?,?)').run(hashToken(t), emailLower, exp);
-  const base = req.headers.origin || `${req.protocol}://${req.get('host')}`;
-  await sendResetEmail(emailLower, `${base}/reset-password?token=${t}`);
+  await sendResetEmail(emailLower, `${appBaseUrl(req)}/reset-password?token=${t}`);
   res.json({ ok: true });
 });
 
@@ -3625,7 +3693,7 @@ app.post('/api/invoices/:id/payment-link', authRequired, verifyFirmMembership, r
               VALUES (?, ?, ?, 'operating', ?, ?, ?)`)
     .run(token, req.user.firmId, inv.id, balanceDue, expiresAt, req.user.email);
 
-  const base = (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host');
+  const base = appBaseUrl(req);
   res.json({ token, url: base + '/pay/' + token, expiresAt, amountCents: balanceDue });
 });
 
@@ -3637,7 +3705,7 @@ app.get('/api/invoices/:id/payment-links', authRequired, verifyFirmMembership, r
   const rows = db.prepare(`SELECT token, destination, amount_cents, expires_at, used_at, created_by, created_at
                            FROM payment_links WHERE invoice_id = ? AND firm_id = ?
                            ORDER BY created_at DESC LIMIT 20`).all(req.params.id, req.user.firmId);
-  const base = (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host');
+  const base = appBaseUrl(req);
   res.json(rows.map(r => ({
     ...r,
     url: base + '/pay/' + r.token,
@@ -3664,7 +3732,7 @@ app.post('/api/invoices/:id/share-link', authRequired, verifyFirmMembership, req
                                  AND (expires_at IS NULL OR expires_at > datetime('now'))
                                ORDER BY created_at DESC LIMIT 1`).get(inv.id, req.user.firmId);
   if (existing) {
-    const base = (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host');
+    const base = appBaseUrl(req);
     return res.json({
       token: existing.token,
       url: base + '/portal/invoice/' + existing.token,
@@ -3681,7 +3749,7 @@ app.post('/api/invoices/:id/share-link', authRequired, verifyFirmMembership, req
 
   logAudit(req, 'invoice.share_link_create', 'invoice', inv.id, null, { token, expires_at: expiresAt });
 
-  const base = (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host');
+  const base = appBaseUrl(req);
   res.json({ token, url: base + '/portal/invoice/' + token, expiresAt, reused: false });
 });
 
@@ -3692,7 +3760,7 @@ app.get('/api/invoices/:id/share-links', authRequired, verifyFirmMembership, req
                            FROM invoice_share_tokens
                            WHERE invoice_id = ? AND firm_id = ?
                            ORDER BY created_at DESC LIMIT 20`).all(inv.id, req.user.firmId);
-  const base = (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host');
+  const base = appBaseUrl(req);
   res.json(rows.map(r => ({
     ...r,
     url: base + '/portal/invoice/' + r.token,

@@ -82,20 +82,26 @@ function hideErr() { err.classList.remove('show'); }
 // If already logged in, jump straight to /app
 fetch('/api/auth/me', { credentials: 'include' }).then(r => { if (r.ok) window.location.href = '/app'; });
 
+let _challengeToken = null;
+
 // Accept inbound SSO token from DT/SPVT
 (async function ssoIfQuerystring() {
   const p = new URLSearchParams(location.search);
   const tok = p.get('ssoToken'); const src = p.get('src');
   if (!tok || !src) return;
   const endpoint = { dt: '/api/auth/dt-exchange', spv: '/api/auth/spv-exchange' }[src];
+  // Strip the SSO token from the address bar and history right away.
+  history.replaceState(null, '', location.pathname);
   if (!endpoint) return;
   try {
     const r = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify({ token: tok }) });
-    if (r.ok) window.location.href = '/app';
-  } catch(e) {}
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { showErr(d.error || 'Single sign-on failed. Sign in below.'); return; }
+    if (d.totpRequired) { _challengeToken = d.challengeToken; showTotp(); return; }
+    window.location.href = '/app';
+  } catch(e) { showErr('Single sign-on failed. Sign in below.'); }
 })();
 
-let _challengeToken = null;
 function showTotp() {
   $('#login-form').style.display = 'none';
   $('#totp-form').style.display = '';
