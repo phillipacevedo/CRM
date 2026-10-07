@@ -23,6 +23,8 @@ services:
         sync: false   # set in Render dashboard on first deploy
       - key: ALLOWED_ORIGIN
         sync: false   # set to https://crm.phillipacevedo.com after DNS setup
+      - key: APP_URL
+        value: https://crm.phillipacevedo.com
       - key: DT_URL
         value: https://dt.phillipacevedo.com
       - key: SPV_URL
