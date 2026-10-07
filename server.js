@@ -54,6 +54,19 @@ const LB_URL  = (process.env.LB_URL  || 'https://lb.phillipacevedo.com').replace
 // to read the public export endpoints. Unset → endpoints stay open (back-compat)
 // with a startup warning, so this can deploy before LB is updated.
 const LB_EXPORT_TOKEN = process.env.LB_EXPORT_TOKEN || '';
+// Which firm the Leaderboard exports describe. Optional while the DB holds a
+// single firm; required once there are several.
+const LB_EXPORT_FIRM_ID = process.env.LB_EXPORT_FIRM_ID || '';
+const IS_PROD = process.env.NODE_ENV === 'production' || !!process.env.RENDER;
+// Comma-separated emails allowed to download/delete whole-database backups
+// when the DB holds more than one firm (a backup contains every firm's data).
+const OPS_ADMIN_EMAILS = (process.env.OPS_ADMIN_EMAILS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
+// Constant-time string compare for shared secrets.
+function safeEqual(a, b) {
+  const x = Buffer.from(String(a || '')), y = Buffer.from(String(b || ''));
+  return x.length === y.length && x.length > 0 && crypto.timingSafeEqual(x, y);
+}
 
 // ── ROLES ───────────────────────────────────────────────────────────────
 // Rank determines permission level. Higher rank = more access.
@@ -740,6 +753,8 @@ const migrations = [
   // entry it undoes (one reversal per entry — unique index below).
   `ALTER TABLE trust_ledger ADD COLUMN payment_id TEXT`,
   `ALTER TABLE trust_ledger ADD COLUMN reverses_id TEXT`,
+  // Last accepted TOTP time-step; a code at or before it is a replay.
+  `ALTER TABLE users ADD COLUMN totp_last_step INTEGER DEFAULT 0`,
 ];
 // Only swallow "duplicate column" errors (idempotency). Anything else — syntax
 // typos, missing table, permission issues — is a real problem and should fail
@@ -1044,9 +1059,35 @@ if (ALLOWED_ORIGIN === '*' && process.env.NODE_ENV === 'production') {
   console.warn('WARNING: ALLOWED_ORIGIN is "*" in production. Set it to your domain.');
 }
 if (!LB_EXPORT_TOKEN) {
-  console.warn('WARNING: LB_EXPORT_TOKEN is not set — /api/contacts/export and /api/staff/export are publicly readable. Set it and update Leaderboard to send the X-Export-Token header.');
+  console.warn(IS_PROD
+    ? 'WARNING: LB_EXPORT_TOKEN is not set — /api/contacts/export and /api/staff/export are DISABLED (503) in production. Set it and have Leaderboard send the X-Export-Token header.'
+    : 'WARNING: LB_EXPORT_TOKEN is not set — /api/contacts/export and /api/staff/export are publicly readable (development only).');
 }
 app.use(cors(ALLOWED_ORIGIN === '*' ? {} : { origin: ALLOWED_ORIGIN, credentials: true }));
+
+// ── CSRF: Origin check for cookie-authenticated writes ──────────────────
+// The session cookie is SameSite=Lax, which still lets same-site pages
+// (dt./spv./lb. subdomains) POST with it. Any state-changing /api request
+// that carries the cookie must come from this app's own origin. Bearer-token
+// and unauthenticated calls (webhooks, login) carry no cookie and aren't
+// CSRF-able, so they pass.
+function trustedOrigins(req) {
+  const set = new Set([`${req.protocol}://${req.get('host')}`]);
+  for (const u of [process.env.APP_URL, ALLOWED_ORIGIN]) {
+    if (u && u !== '*') { try { set.add(new URL(u).origin); } catch {} }
+  }
+  return set;
+}
+app.use('/api', (req, res, next) => {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
+  if (!/(?:^|;\s*)auth_token=/.test(req.headers.cookie || '')) return next();
+  let origin = req.headers.origin;
+  if (!origin && req.headers.referer) { try { origin = new URL(req.headers.referer).origin; } catch {} }
+  if (!origin || !trustedOrigins(req).has(origin)) {
+    return res.status(403).json({ error: 'Cross-origin request blocked' });
+  }
+  next();
+});
 
 // ── STRIPE WEBHOOK (raw body; MUST be mounted before express.json) ──────
 // Stripe's signature verification hashes the raw request bytes, so this
@@ -1382,8 +1423,29 @@ function scheduleBackups() {
   setInterval(tick, 60 * 60 * 1000);
 }
 
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+// Body size: small by default; only routes that accept base64 files or bulk
+// imports get the large limit, so one request can't tie up 20 MB of memory
+// anywhere in the API.
+const LARGE_BODY_ROUTES = [
+  /^\/api\/firm\/logo$/,
+  /^\/api\/matters\/[^/]+\/documents$/,
+  /^\/api\/invoices\/preview$/,
+  /^\/api\/expenses\/[^/]+\/attachments$/,
+  /^\/api\/expenses\/extract$/,
+  /^\/api\/(time|bank|contacts)\/import$/,
+];
+const jsonSmall = express.json({ limit: '2mb' });
+const jsonLarge = express.json({ limit: '20mb' });
+const formSmall = express.urlencoded({ extended: true, limit: '100kb' });
+const formLarge = express.urlencoded({ extended: true, limit: '10mb' });
+app.use((req, res, next) => {
+  const large = LARGE_BODY_ROUTES.some(r => r.test(req.path));
+  (large ? jsonLarge : jsonSmall)(req, res, (err) => {
+    if (err) return next(err);
+    const formBig = req.path === '/api/webhooks/inbound-email';
+    (formBig ? formLarge : formSmall)(req, res, next);
+  });
+});
 app.use(express.static(path.join(__dirname, 'public'), {
   etag: false,
   lastModified: false,
@@ -1474,6 +1536,22 @@ app.post('/api/auth/logout', authRequired, (req, res) => {
   res.json({ ok: true });
 });
 
+// Verify a TOTP code for a user and burn its time-step, so the same code
+// (or an older one still inside the ±1 step window) can't be replayed.
+// Returns true/false; throws if the stored secret can't be decrypted.
+function consumeTotp(email, code) {
+  const u = db.prepare('SELECT totp_secret, totp_last_step FROM users WHERE email = ?').get(email);
+  if (!u?.totp_secret) return false;
+  const secret = decryptSecret(u.totp_secret);
+  const delta = authenticator.checkDelta(String(code).replace(/\s+/g, ''), secret);
+  if (delta == null) return false;
+  const step = Math.floor(Date.now() / 1000 / 30) + delta;
+  if (step <= (u.totp_last_step || 0)) return false;
+  // Conditional update closes the race between two concurrent submissions.
+  const r = db.prepare('UPDATE users SET totp_last_step = ? WHERE email = ? AND COALESCE(totp_last_step, 0) < ?').run(step, email, step);
+  return r.changes === 1;
+}
+
 // Short-lived JWT issued after password success when the user has 2FA on.
 // Carries no firm/role claims — its only valid use is /api/auth/2fa-verify.
 function make2faChallenge(email) {
@@ -1520,11 +1598,9 @@ app.post('/api/auth/2fa-verify', authLimiter, accountLimiter, (req, res) => {
     return res.status(401).json({ error: '2FA no longer active for this account' });
   }
   let ok = false;
-  try {
-    const secret = decryptSecret(user.totp_secret);
-    ok = authenticator.check(String(code).replace(/\s+/g, ''), secret);
-  } catch (e) { return res.status(500).json({ error: 'Stored secret could not be read' }); }
-  if (!ok) return res.status(401).json({ error: 'Invalid 6-digit code' });
+  try { ok = consumeTotp(user.email, code); }
+  catch (e) { return res.status(500).json({ error: 'Stored secret could not be read' }); }
+  if (!ok) return res.status(401).json({ error: 'Invalid or already-used 6-digit code' });
 
   const firm = db.prepare('SELECT * FROM firms WHERE id = ?').get(user.firm_id);
   const token = makeToken(user, firm);
@@ -1609,8 +1685,9 @@ app.post('/api/me/2fa/enable', authRequired, (req, res) => {
   catch (e) { return res.status(400).json({ error: 'Invalid secret format' }); }
   if (!ok) return res.status(401).json({ error: 'Code did not verify. Make sure your authenticator clock is correct and try again.' });
   const u = db.prepare('SELECT totp_enabled FROM users WHERE email = ?').get(req.user.email);
-  db.prepare('UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE email = ?')
-    .run(encryptSecret(secret), req.user.email);
+  const enrollStep = Math.floor(Date.now() / 1000 / 30) + (authenticator.checkDelta(String(code).replace(/\s+/g, ''), String(secret)) || 0);
+  db.prepare('UPDATE users SET totp_secret = ?, totp_enabled = 1, totp_last_step = ? WHERE email = ?')
+    .run(encryptSecret(secret), enrollStep, req.user.email);
   logAudit(req, '2fa.enable', 'user', req.user.email, { totp_enabled: u?.totp_enabled || 0 }, { totp_enabled: 1 });
   res.json({ ok: true });
 });
@@ -1621,11 +1698,9 @@ app.post('/api/me/2fa/disable', authRequired, (req, res) => {
   const { code } = req.body || {};
   if (!code) return res.status(400).json({ error: '6-digit code required to disable 2FA' });
   let ok = false;
-  try {
-    const secret = decryptSecret(u.totp_secret);
-    ok = authenticator.check(String(code).replace(/\s+/g, ''), secret);
-  } catch (e) { return res.status(500).json({ error: 'Stored secret could not be read' }); }
-  if (!ok) return res.status(401).json({ error: 'Code did not verify' });
+  try { ok = consumeTotp(req.user.email, code); }
+  catch (e) { return res.status(500).json({ error: 'Stored secret could not be read' }); }
+  if (!ok) return res.status(401).json({ error: 'Code did not verify (or was already used)' });
   db.prepare('UPDATE users SET totp_secret = NULL, totp_enabled = 0 WHERE email = ?').run(req.user.email);
   logAudit(req, '2fa.disable', 'user', req.user.email, { totp_enabled: 1 }, { totp_enabled: 0 });
   res.json({ ok: true });
@@ -1973,6 +2048,16 @@ app.delete('/api/firm/logo', authRequired, requireCap('manageFirm'), (req, res) 
 });
 
 // ── BACKUP ROUTES ───────────────────────────────────────────────────────
+// A backup file is the whole SQLite DB — every firm's data and every password
+// hash. With one firm, that firm's admins may handle it. With several, only
+// OPS_ADMIN_EMAILS may download or delete files (listing and running stay
+// with firm admins, which expose no data).
+function requireBackupAccess(req, res, next) {
+  const firmCount = db.prepare('SELECT COUNT(*) AS n FROM firms').get().n;
+  if (firmCount <= 1 || OPS_ADMIN_EMAILS.includes(req.user.email)) return next();
+  return res.status(403).json({ error: 'Backups contain every firm on this server; only operators (OPS_ADMIN_EMAILS) can download or delete them.' });
+}
+
 app.get('/api/admin/backups', authRequired, requireCap('manageFirm'), (req, res) => {
   res.json({
     backups: listBackupFiles(),
@@ -1993,20 +2078,22 @@ app.post('/api/admin/backups/run', authRequired, requireCap('manageFirm'), async
   }
 });
 
-app.get('/api/admin/backups/:filename/download', authRequired, requireCap('manageFirm'), (req, res) => {
+app.get('/api/admin/backups/:filename/download', authRequired, requireCap('manageFirm'), requireBackupAccess, (req, res) => {
   const name = req.params.filename;
   if (!/^crm-\d{4}-\d{2}-\d{2}(?:T\d{6})?\.db$/.test(name)) return res.status(400).json({ error: 'Invalid filename' });
   const full = path.join(BACKUP_DIR, name);
   if (!fs.existsSync(full)) return res.status(404).json({ error: 'Not found' });
+  logAudit(req, 'backup.download', 'backup', name, null, null);
   res.download(full, name);
 });
 
-app.delete('/api/admin/backups/:filename', authRequired, requireCap('manageFirm'), (req, res) => {
+app.delete('/api/admin/backups/:filename', authRequired, requireCap('manageFirm'), requireBackupAccess, (req, res) => {
   const name = req.params.filename;
   if (!/^crm-\d{4}-\d{2}-\d{2}(?:T\d{6})?\.db$/.test(name)) return res.status(400).json({ error: 'Invalid filename' });
   const full = path.join(BACKUP_DIR, name);
   if (!fs.existsSync(full)) return res.status(404).json({ error: 'Not found' });
   fs.unlinkSync(full);
+  logAudit(req, 'backup.delete', 'backup', name, null, null);
   res.json({ ok: true });
 });
 
@@ -2832,8 +2919,24 @@ function extractEmailAddresses(headerStr) {
 app.post('/api/webhooks/inbound-email', (req, res) => {
   if (!INBOUND_EMAIL_SECRET) return res.status(503).json({ error: 'Inbound email not configured' });
 
-  const provided = req.headers['x-webhook-secret'] || req.query.secret || '';
-  if (!provided || provided !== INBOUND_EMAIL_SECRET) {
+  // Preferred: X-Webhook-Secret header, or HTTP Basic auth password (for
+  // providers that only take a URL: https://inbound:<secret>@host/...).
+  // ?secret= still works for existing provider configs but ends up in access
+  // logs — migrate off it.
+  let provided = req.headers['x-webhook-secret'] || '';
+  const auth = req.headers.authorization || '';
+  if (!provided && auth.startsWith('Basic ')) {
+    const decoded = Buffer.from(auth.slice(6), 'base64').toString('utf8');
+    provided = decoded.slice(decoded.indexOf(':') + 1);
+  }
+  if (!provided && req.query.secret) {
+    provided = String(req.query.secret);
+    if (!app.locals._warnedInboundQuery) {
+      app.locals._warnedInboundQuery = true;
+      console.warn('[inbound-email] secret received via ?secret= query string — switch the provider to the X-Webhook-Secret header or Basic auth.');
+    }
+  }
+  if (!safeEqual(provided, INBOUND_EMAIL_SECRET)) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
@@ -3155,11 +3258,17 @@ app.delete('/api/matters/:id', authRequired, verifyFirmMembership, requireCap('m
 
 // Per-matter rate overrides (Admin/Partner only)
 app.get('/api/matters/:id/rates', authRequired, verifyFirmMembership, requireCap('viewRates'), (req, res) => {
+  if (!db.prepare('SELECT 1 FROM matters WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId)) {
+    return res.status(404).json({ error: 'Matter not found' });
+  }
   const rows = db.prepare('SELECT matter_id, user_email, rate FROM matter_rates WHERE matter_id = ?').all(req.params.id);
   res.json(rows);
 });
 
 app.put('/api/matters/:id/rates', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
+  if (!db.prepare('SELECT 1 FROM matters WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId)) {
+    return res.status(404).json({ error: 'Matter not found' });
+  }
   // body: [{ userEmail, rate }]
   // Drop rows without a positive rate so we never persist bogus 0 overrides
   // (those would short-circuit the user's default rate at lookup time).
@@ -6289,25 +6398,39 @@ app.get('/api/reports/unbilled-wip', authRequired, verifyFirmMembership, require
 
 // Gate the public exports behind the shared LB token when one is configured.
 // Constant-time compare avoids leaking the token via response timing.
+// Fails closed in production when no token is configured; open only in dev.
 function requireExportToken(req, res, next) {
-  if (!LB_EXPORT_TOKEN) return next();  // open until a token is configured
+  if (!LB_EXPORT_TOKEN) {
+    if (IS_PROD) return res.status(503).json({ error: 'Export disabled: LB_EXPORT_TOKEN is not configured' });
+    return next();
+  }
+  // Header preferred; ?token= kept for older Leaderboard builds (it lands in logs).
   const presented = req.get('X-Export-Token') || (req.query.token ? String(req.query.token) : '');
-  const a = Buffer.from(presented);
-  const b = Buffer.from(LB_EXPORT_TOKEN);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+  if (!safeEqual(presented, LB_EXPORT_TOKEN)) {
     return res.status(401).json({ error: 'Invalid or missing export token' });
   }
   next();
 }
 
+// Exports describe one firm: LB_EXPORT_FIRM_ID, or the only firm in the DB.
+function exportFirmId(res) {
+  if (LB_EXPORT_FIRM_ID) return LB_EXPORT_FIRM_ID;
+  const firms = db.prepare('SELECT id FROM firms LIMIT 2').all();
+  if (firms.length === 1) return firms[0].id;
+  res.status(503).json({ error: 'Export disabled: set LB_EXPORT_FIRM_ID (more than one firm in this database)' });
+  return null;
+}
+
 app.get('/api/contacts/export', exportLimiter, requireExportToken, (req, res) => {
+  const firmId = exportFirmId(res); if (!firmId) return;
   // Simple list of client/prospect names. No PII beyond name + company.
-  const rows = db.prepare(`SELECT full_name, company_name, type FROM contacts WHERE type IN ('client','prospect') ORDER BY full_name`).all();
+  const rows = db.prepare(`SELECT full_name, company_name, type FROM contacts WHERE firm_id = ? AND type IN ('client','prospect') ORDER BY full_name`).all(firmId);
   res.json(rows.map(r => ({ name: r.full_name, company: r.company_name || '', type: r.type })));
 });
 
 app.get('/api/staff/export', exportLimiter, requireExportToken, (req, res) => {
-  const users = db.prepare(`SELECT name, email FROM users WHERE active = 1 ORDER BY name`).all();
+  const firmId = exportFirmId(res); if (!firmId) return;
+  const users = db.prepare(`SELECT name, email FROM users WHERE firm_id = ? AND active = 1 ORDER BY name`).all(firmId);
   res.json(users.map(u => ({ name: u.name, email: u.email })));
 });
 
@@ -6688,6 +6811,8 @@ app.get('*', (req, res) => {
 });
 
 app.use((err, req, res, next) => {
+  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'Request body too large' });
+  if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Malformed JSON body' });
   console.error('[ERROR]', new Date().toISOString(), err.stack || err.message || err);
   res.status(err.status || 500).json({ error: 'Internal server error' });
 });
