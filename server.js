@@ -2954,9 +2954,14 @@ app.put('/api/matters/:id', authRequired, verifyFirmMembership, requireCap('edit
       closed_at = CASE WHEN ? = 'closed' AND status != 'closed' THEN datetime('now') ELSE closed_at END,
       updated_at = datetime('now')
     WHERE id = ? AND firm_id = ?`).run(
-    b.name?.trim() || null, b.description ?? null, b.billingType || null,
+    // Partial updates (e.g. the recurring-billing panel) omit description and
+    // dtMatterId — keep the stored values unless the field is actually sent.
+    b.name?.trim() || null,
+    'description' in b ? (b.description ?? null) : existing.description,
+    b.billingType || null,
     typeof b.flatFee === 'number' ? b.flatFee : null, b.status || null,
-    newClientId, b.clientName ?? existing.client_name, b.dtMatterId ?? null,
+    newClientId, b.clientName ?? existing.client_name,
+    'dtMatterId' in b ? (b.dtMatterId || null) : existing.dt_matter_id,
     inc,
     matterNumber,
     nextBillingSchedule, nextTrustMin, nextTrustTo,
