@@ -981,10 +981,28 @@ const el = (tag, attrs={}, children=[]) => {
   append(children);
   return e;
 };
+// ── Local-time date helpers ───────────────────────────────────────────────
+// "Today" and date-only values are calendar dates in the user's timezone.
+// toISOString() is UTC, which in US timezones rolls to tomorrow after ~5–8pm,
+// and new Date('YYYY-MM-DD') is UTC midnight, which displays as the day before.
+const pad2 = n => String(n).padStart(2, '0');
+function localYmd(d = new Date()) { return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; }
+// Value for <input type="datetime-local"> in local time.
+function localDateTimeInput(d = new Date()) { return `${localYmd(d)}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`; }
+// Parse an API date for display. Date-only strings (and the UTC-midnight
+// timestamps produced by saving a date-only input) are treated as calendar
+// dates, not instants, so they never shift a day.
+function parseDateish(v) {
+  const s = String(v);
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:T00:00(?::00(?:\.0+)?)?Z)?$/);
+  if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
+  return new Date(s);
+}
+
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt = { money: n => '$' + (Number(n)||0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
               hours: m => ((Number(m)||0)/60).toFixed(2) + ' hr',
-              date: d => d ? new Date(d).toLocaleDateString() : '',
+              date: d => { if (!d) return ''; const dt = parseDateish(d); return isNaN(dt) ? String(d) : dt.toLocaleDateString(); },
               mdy: d => { if (!d) return ''; const m = String(d).match(/^(\d{4})-(\d{2})-(\d{2})/); if (m) return `${m[2]}/${m[3]}/${m[1]}`; const dt = new Date(d); return isNaN(dt) ? String(d) : dt.toLocaleDateString('en-US'); },
               datetime: d => d ? new Date(d).toLocaleString() : '' };
 
@@ -1011,9 +1029,9 @@ const toDateInput = d => {
   const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
   if (m) return m[1];
   const dt = new Date(s);
-  return isNaN(dt) ? '' : dt.toISOString().slice(0, 10);
+  return isNaN(dt) ? '' : localYmd(dt);
 };
-const todayDateInput = () => new Date().toISOString().slice(0, 10);
+const todayDateInput = () => localYmd();
 
 async function api(path, opts={}) {
   const res = await fetch(path, {
@@ -2418,8 +2436,8 @@ async function buildClientFinancialSummary(clientId) {
 async function openInteractionForm(contactId, existing) {
   const isNew = !existing?.id;
   const occurredDefault = existing?.occurred_at
-    ? new Date(existing.occurred_at).toISOString().slice(0, 16)
-    : new Date().toISOString().slice(0, 16);
+    ? localDateTimeInput(new Date(existing.occurred_at))
+    : localDateTimeInput();
   const body = el('div', {}, [
     el('div', { class: 'form-row' }, [
       el('div', { class: 'field' }, [ el('label', {}, 'Type'),
@@ -3585,7 +3603,7 @@ async function openMatterForm(existing) {
     !isNew && can('manageBilling') ? el('button', { class: 'btn btn-ghost btn-sm', onclick: async () => {
       if (!confirm('Generate an invoice for "' + (m.name || 'this matter') + '"?\n\nAll draft billable time and expenses on this matter will be included.')) return;
       try {
-        const r = await api('/api/invoices', { method: 'POST', body: { matterId: m.id, issuedAt: new Date().toISOString().slice(0, 10) } });
+        const r = await api('/api/invoices', { method: 'POST', body: { matterId: m.id, issuedAt: todayYmd() } });
         toast('Invoice ' + (r.number || '') + ' created');
         closeModal();
         navigate('invoices');
@@ -3696,7 +3714,7 @@ function renderMatterRecurring(wrap, matter) {
   let sched = {};
   try { sched = matter.billing_schedule ? JSON.parse(matter.billing_schedule) : {}; } catch { sched = {}; }
   const isActive = !!sched.active;
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayYmd();
   const defaultDesc = `Recurring fee — ${matter.name || 'this matter'}`;
   const trustMin = Number(matter.trust_min_balance || 0);
   const trustTo  = matter.trust_replenish_to != null ? Number(matter.trust_replenish_to) : '';
@@ -3983,8 +4001,8 @@ function weekStartSunday(yyyymmdd) {
   return d.toISOString().slice(0, 10);
 }
 function userShortName(email) { return email.split('@')[0]; }
-const todayYmd = () => new Date().toISOString().slice(0, 10);
-const todayYmm = () => new Date().toISOString().slice(0, 7);
+const todayYmd = () => localYmd();
+const todayYmm = () => localYmd().slice(0, 7);
 
 async function renderTime(mount, v) {
   state.viewState.time ||= { mode: 'entries', month: todayYmm(), day: todayYmd(), userFilter: '' };
@@ -4177,7 +4195,7 @@ function renderTimeEntries(mount, entries, matters) {
           const mName = matter?.name || 'this matter';
           if (!confirm('Generate an invoice for "' + mName + '"?\n\nAll draft billable time and expenses on this matter will be included.')) return;
           try {
-            const r = await api('/api/invoices', { method: 'POST', body: { matterId: matterIds[0], issuedAt: new Date().toISOString().slice(0, 10) } });
+            const r = await api('/api/invoices', { method: 'POST', body: { matterId: matterIds[0], issuedAt: todayYmd() } });
             toast('Invoice ' + (r.number || '') + ' created');
             tv.entriesSelection.clear();
             navigate('invoices');
@@ -4745,7 +4763,7 @@ function renderMonthCalendarGrid(mount, entries, matters, month, tv) {
     cells.push({ date: ds, inMonth });
   }
 
-  const todayStr = ymd(new Date());
+  const todayStr = todayYmd();
   const inMonthMins = Object.entries(byDate)
     .filter(([d]) => d >= ymd(first) && d <= ymd(last))
     .map(([, v]) => v.minutes);
@@ -6392,7 +6410,7 @@ async function renderUnbilledWipPanel(mount, matters, view, persist, onInvoiceGe
   const generateInvoice = async (matterId, matterName) => {
     if (!confirm('Generate an invoice for "' + matterName + '"?\n\nAll draft billable time and expenses on this matter will be added.')) return;
     try {
-      const r = await api('/api/invoices', { method: 'POST', body: { matterId, issuedAt: new Date().toISOString().slice(0, 10) } });
+      const r = await api('/api/invoices', { method: 'POST', body: { matterId, issuedAt: todayYmd() } });
       toast('Invoice ' + (r.number || '') + ' created');
       if (typeof onInvoiceGenerated === 'function') onInvoiceGenerated();
       mount.innerHTML = '';
@@ -7101,8 +7119,8 @@ function makeCombobox(initOptions, selectedValue, onChange, placeholder) {
 async function renderCashflow(mount, v) {
   const view = (state._profile && state._profile.cashflowView) || {};
   const today = new Date();
-  const defaultFrom = new Date(today.getFullYear(), today.getMonth() - 11, 1).toISOString().slice(0, 10);
-  const defaultTo   = today.toISOString().slice(0, 10);
+  const defaultFrom = localYmd(new Date(today.getFullYear(), today.getMonth() - 11, 1));
+  const defaultTo   = localYmd(today);
   const params = {
     from:          view.from          || defaultFrom,
     to:            view.to            || defaultTo,
