@@ -2511,14 +2511,37 @@ app.put('/api/contacts/:id', authRequired, verifyFirmMembership, requireCap('edi
 });
 
 app.delete('/api/contacts/:id', authRequired, verifyFirmMembership, requireCap('editContacts'), (req, res) => {
-  const existing = db.prepare('SELECT owner_email FROM contacts WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  const existing = db.prepare('SELECT id, owner_email, full_name, email, type FROM contacts WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
   if (!existing) return res.status(404).json({ error: 'Contact not found' });
   if (!CAPS.viewAllContacts(req.user) && existing.owner_email !== req.user.email) {
     return res.status(403).json({ error: 'Not your contact' });
   }
+  // Contacts with matters, invoices, payments or trust activity are part of
+  // the billing/IOLTA record and the conflict-check universe — never deleted.
+  const hist = contactFinancialHistory(req.user.firmId, existing.id);
+  if (hist.length) {
+    return res.status(409).json({ error: `Can't delete: this contact has ${hist.join(', ')}. Keep the record (e.g. mark the client as former in notes/tags) so billing, trust and conflict history stay intact.` });
+  }
+  const interactions = db.prepare('SELECT COUNT(*) AS n FROM interactions WHERE contact_id = ? AND firm_id = ?').get(existing.id, req.user.firmId).n;
   db.prepare('DELETE FROM contacts WHERE id = ? AND firm_id = ?').run(req.params.id, req.user.firmId);
+  logAudit(req, 'contact.delete', 'contact', existing.id,
+    { full_name: existing.full_name, email: existing.email, type: existing.type, owner_email: existing.owner_email, interactions_deleted: interactions }, null);
   res.json({ ok: true });
 });
+
+function contactFinancialHistory(firmId, contactId) {
+  const n = (sql) => db.prepare(sql).get(contactId, firmId).n;
+  const out = [];
+  const m = n('SELECT COUNT(*) AS n FROM matters WHERE client_contact_id = ? AND firm_id = ?');
+  const i = n('SELECT COUNT(*) AS n FROM invoices WHERE client_contact_id = ? AND firm_id = ?');
+  const p = n('SELECT COUNT(*) AS n FROM invoice_payments WHERE client_contact_id = ? AND firm_id = ?');
+  const t = n('SELECT COUNT(*) AS n FROM trust_ledger WHERE client_contact_id = ? AND firm_id = ?');
+  if (m) out.push(`${m} matter${m === 1 ? '' : 's'}`);
+  if (i) out.push(`${i} invoice${i === 1 ? '' : 's'}`);
+  if (p) out.push(`${p} payment${p === 1 ? '' : 's'}`);
+  if (t) out.push(`${t} trust entr${t === 1 ? 'y' : 'ies'}`);
+  return out;
+}
 
 // Dedup check — warn before saving a contact with a matching email
 app.get('/api/contacts/dedup-check', authRequired, verifyFirmMembership, (req, res) => {
@@ -3104,8 +3127,29 @@ app.post('/api/matters/:id/billing-schedule/run-now', authRequired, verifyFirmMe
 });
 
 app.delete('/api/matters/:id', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
-  const r = db.prepare('DELETE FROM matters WHERE id = ? AND firm_id = ?').run(req.params.id, req.user.firmId);
-  if (r.changes === 0) return res.status(404).json({ error: 'Not found' });
+  const m = db.prepare('SELECT * FROM matters WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
+  if (!m) return res.status(404).json({ error: 'Not found' });
+  // Deleting cascades to time entries and expenses. Only allow it while
+  // nothing on the matter has been billed or touched trust; otherwise close it.
+  const n = (sql) => db.prepare(sql).get(m.id, req.user.firmId).n;
+  const billedTime = n(`SELECT COUNT(*) AS n FROM time_entries WHERE matter_id = ? AND firm_id = ? AND status != 'draft'`);
+  const billedExp  = n(`SELECT COUNT(*) AS n FROM expenses     WHERE matter_id = ? AND firm_id = ? AND status != 'draft'`);
+  const invoices   = n(`SELECT COUNT(*) AS n FROM invoices     WHERE matter_id = ? AND firm_id = ?`);
+  const trust      = n(`SELECT COUNT(*) AS n FROM trust_ledger WHERE matter_id = ? AND firm_id = ?`);
+  if (billedTime || billedExp || invoices || trust) {
+    const parts = [];
+    if (billedTime) parts.push(`${billedTime} billed time entr${billedTime === 1 ? 'y' : 'ies'}`);
+    if (billedExp)  parts.push(`${billedExp} billed expense${billedExp === 1 ? '' : 's'}`);
+    if (invoices)   parts.push(`${invoices} invoice${invoices === 1 ? '' : 's'}`);
+    if (trust)      parts.push(`${trust} trust entr${trust === 1 ? 'y' : 'ies'}`);
+    return res.status(409).json({ error: `Can't delete: this matter has ${parts.join(', ')}. Set its status to closed instead.` });
+  }
+  const draftTime = n(`SELECT COUNT(*) AS n FROM time_entries WHERE matter_id = ? AND firm_id = ?`);
+  const draftExp  = n(`SELECT COUNT(*) AS n FROM expenses     WHERE matter_id = ? AND firm_id = ?`);
+  db.prepare('DELETE FROM matters WHERE id = ? AND firm_id = ?').run(m.id, req.user.firmId);
+  logAudit(req, 'matter.delete', 'matter', m.id,
+    { name: m.name, matter_number: m.matter_number, client_contact_id: m.client_contact_id, client_name: m.client_name,
+      status: m.status, draft_time_entries_deleted: draftTime, draft_expenses_deleted: draftExp }, null);
   res.json({ ok: true });
 });
 

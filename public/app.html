@@ -1823,7 +1823,7 @@ function applyClientFilters() {
       },
       onDelete: can('editContacts') ? async () => {
         const n = cv.selection.size;
-        if (!confirm('Delete ' + n + ' client' + (n === 1 ? '' : 's') + '? This cannot be undone.')) return;
+        if (!confirm('Delete ' + n + ' client' + (n === 1 ? '' : 's') + '? This cannot be undone. Clients with matters, invoices, payments or trust activity will be skipped.')) return;
         const ids = [...cv.selection];
         const r = await bulkApiDelete('/api/contacts', ids);
         cv.selection.clear();
@@ -2170,7 +2170,7 @@ async function openContactForm(existing) {
     }
   };
   const footer = el('div', {}, [
-    !isNew && can('editContacts') ? el('button', { class: 'btn btn-danger btn-sm', onclick: async () => { if (!confirm('Delete this contact?')) return; await api('/api/contacts/' + c.id, { method: 'DELETE' }); toast('Deleted'); closeModal(); navigate(state.currentView); } }, 'Delete') : null,
+    !isNew && can('editContacts') ? el('button', { class: 'btn btn-danger btn-sm', onclick: async () => { if (!confirm('Delete this contact? This cannot be undone.')) return; try { await api('/api/contacts/' + c.id, { method: 'DELETE' }); } catch { return; } toast('Deleted'); closeModal(); navigate(state.currentView); } }, 'Delete') : null,
     el('div', { class: 'spacer' }),
     el('button', { class: 'btn btn-ghost btn-sm', onclick: closeModal }, 'Cancel'),
     el('button', { class: 'btn btn-primary btn-sm', onclick: save }, isNew ? 'Create contact' : 'Save'),
@@ -3375,7 +3375,7 @@ async function renderMatters(mount, v) {
       },
       onDelete: can('manageBilling') ? async () => {
         const n = mv.selection.size;
-        if (!confirm('Delete ' + n + ' matter' + (n === 1 ? '' : 's') + ' and their time entries? This cannot be undone.')) return;
+        if (!confirm('Delete ' + n + ' matter' + (n === 1 ? '' : 's') + ' and their unbilled time/expenses? This cannot be undone. Matters with invoices, billed work or trust activity will be skipped — close those instead.')) return;
         const ids = [...mv.selection];
         const r = await bulkApiDelete('/api/matters', ids);
         mv.selection.clear();
@@ -3577,7 +3577,10 @@ async function openMatterForm(existing) {
   };
 
   openModal(isNew ? 'New matter' : 'Edit matter', body, el('div', {}, [
-    !isNew && can('manageBilling') ? el('button', { class: 'btn btn-danger btn-sm', onclick: async () => { if (!confirm('Delete matter and all its time entries?')) return; await api('/api/matters/' + m.id, { method: 'DELETE' }); toast('Deleted'); closeModal(); navigate('matters'); } }, 'Delete') : null,
+    !isNew && can('manageBilling') ? el('button', { class: 'btn btn-danger btn-sm', onclick: async () => {
+      if (prompt('Delete this matter and its unbilled time/expenses? This cannot be undone.\nMatters with invoices, billed work or trust activity can only be closed.\n\nType the matter name to confirm:') !== m.name) return;
+      try { await api('/api/matters/' + m.id, { method: 'DELETE' }); } catch { return; }
+      toast('Deleted'); closeModal(); navigate('matters'); } }, 'Delete') : null,
     el('div', { class: 'spacer' }),
     !isNew && can('manageBilling') ? el('button', { class: 'btn btn-ghost btn-sm', onclick: async () => {
       if (!confirm('Generate an invoice for "' + (m.name || 'this matter') + '"?\n\nAll draft billable time and expenses on this matter will be included.')) return;
