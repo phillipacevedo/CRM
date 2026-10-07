@@ -2158,6 +2158,33 @@ function visibleContactWhere(user) {
   return { sql: 'firm_id = ? AND owner_email = ?', params: [user.firmId, user.email] };
 }
 
+// Extra predicate for rows that hang off a contact (interactions, matters).
+// Returns '' for roles that see every contact. For Staff, a row is visible
+// only when its contact is one they own, or — for rows with no contact —
+// when they created it. `alias` is the table alias/prefix ('' or 'm.').
+function contactScopedFilter(user, alias, contactCol) {
+  if (CAPS.viewAllContacts(user)) return { sql: '', params: [] };
+  return {
+    sql: ` AND (${alias}${contactCol} IN (SELECT id FROM contacts WHERE firm_id = ? AND owner_email = ?)
+              OR (${alias}${contactCol} IS NULL AND ${alias}created_by = ?))`,
+    params: [user.firmId, user.email, user.email],
+  };
+}
+
+// Conflict-check results are firm-wide by design (a conflict must surface
+// whoever owns the contact), but Staff only get enough to know a hit exists —
+// never notes, email, owner or matter descriptions for records they can't see.
+function redactConflictResults(user, results) {
+  if (CAPS.viewAllContacts(user)) return results;
+  return results.map(r => ({
+    ...r,
+    contacts: r.contacts.map(c => c.owner_email === user.email ? c : {
+      id: null, full_name: c.full_name, type: c.type, company_name: c.company_name, restricted: true,
+    }),
+    matters: r.matters.map(m => ({ id: null, name: m.name, client_name: m.client_name, status: m.status, restricted: true })),
+  }));
+}
+
 app.get('/api/contacts', authRequired, verifyFirmMembership, (req, res) => {
   const w = visibleContactWhere(req.user);
   const { q, type, tag, owner, stage } = req.query;
@@ -2383,10 +2410,15 @@ app.delete('/api/contacts/:id', authRequired, verifyFirmMembership, requireCap('
 app.get('/api/contacts/dedup-check', authRequired, verifyFirmMembership, (req, res) => {
   const { email, excludeId } = req.query;
   if (!email) return res.json([]);
-  let sql = 'SELECT id, full_name, type, email FROM contacts WHERE firm_id = ? AND LOWER(email) = ?';
+  let sql = 'SELECT id, full_name, type, email, owner_email FROM contacts WHERE firm_id = ? AND LOWER(email) = ?';
   const params = [req.user.firmId, String(email).trim().toLowerCase()];
   if (excludeId) { sql += ' AND id != ?'; params.push(excludeId); }
-  res.json(db.prepare(sql).all(...params));
+  const rows = db.prepare(sql).all(...params);
+  const all = CAPS.viewAllContacts(req.user);
+  // Staff still learn a duplicate exists (so they don't create one), but not whose.
+  res.json(rows.map(r => (all || r.owner_email === req.user.email)
+    ? { id: r.id, full_name: r.full_name, type: r.type, email: r.email }
+    : { id: null, full_name: "another user's contact", type: r.type, email: r.email }));
 });
 
 // Find all email-duplicate groups for the Find Duplicates tool in Settings
@@ -2463,7 +2495,7 @@ app.get('/api/conflict-check', authRequired, verifyFirmMembership, (req, res) =>
       req.query.acknowledged === '1' ? 1 : 0,
       null);
   }
-  res.json({ results, logId });
+  res.json({ results: redactConflictResults(req.user, results), logId });
 });
 
 // List past conflict checks. Everyone in the firm can view; admins additionally see notes edits.
@@ -2483,7 +2515,9 @@ app.get('/api/conflict-checks', authRequired, verifyFirmMembership, (req, res) =
 app.get('/api/conflict-checks/:id', authRequired, verifyFirmMembership, (req, res) => {
   const r = db.prepare('SELECT * FROM conflict_checks WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
   if (!r) return res.status(404).json({ error: 'Not found' });
-  res.json({ ...r, terms: parseJSON(r.terms, []), results_snapshot: parseJSON(r.results_snapshot, { results: [] }) });
+  const snap = parseJSON(r.results_snapshot, { results: [] });
+  snap.results = redactConflictResults(req.user, snap.results || []);
+  res.json({ ...r, terms: parseJSON(r.terms, []), results_snapshot: snap });
 });
 
 // Annotate a past check (add notes, or update acknowledgement). Immutable core fields are not editable.
@@ -2549,6 +2583,8 @@ app.get('/api/interactions', authRequired, verifyFirmMembership, (req, res) => {
   if (contactId) { sql += ' AND contact_id = ?'; params.push(contactId); }
   if (companyId) { sql += ' AND company_id = ?'; params.push(companyId); }
   if (matterId)  { sql += ' AND matter_id = ?';  params.push(matterId); }
+  const vis = contactScopedFilter(req.user, '', 'contact_id');
+  sql += vis.sql; params.push(...vis.params);
   sql += ' ORDER BY occurred_at DESC LIMIT ?';
   params.push(Math.min(parseInt(limit) || 200, 1000));
   res.json(db.prepare(sql).all(...params));
@@ -2736,6 +2772,8 @@ app.get('/api/matters', authRequired, verifyFirmMembership, (req, res) => {
   const params = [req.user.firmId];
   if (status)   { sql += ' AND m.status = ?';            params.push(status); }
   if (clientId) { sql += ' AND m.client_contact_id = ?'; params.push(clientId); }
+  const vis = contactScopedFilter(req.user, 'm.', 'client_contact_id');
+  sql += vis.sql; params.push(...vis.params);
   sql += ' ORDER BY m.opened_at DESC';
   res.json(db.prepare(sql).all(...params));
 });
@@ -5789,7 +5827,8 @@ app.get('/api/dashboard', authRequired, verifyFirmMembership, (req, res) => {
   const thisWeek = db.prepare(`SELECT id, full_name, next_action, next_action_at FROM contacts
                               WHERE ${w.sql} AND next_action_at BETWEEN date('now') AND date('now','+7 day')
                               ORDER BY next_action_at LIMIT 20`).all(...w.params);
-  const recent = db.prepare(`SELECT * FROM interactions WHERE firm_id = ? ORDER BY occurred_at DESC LIMIT 10`).all(firmId);
+  const recentVis = contactScopedFilter(req.user, '', 'contact_id');
+  const recent = db.prepare(`SELECT * FROM interactions WHERE firm_id = ?${recentVis.sql} ORDER BY occurred_at DESC LIMIT 10`).all(firmId, ...recentVis.params);
 
   // Billing snapshot (partner/admin only)
   let billing = null;

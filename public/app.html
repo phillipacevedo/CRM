@@ -2533,8 +2533,10 @@ function buildConflictResults(data, { onOpenContact } = {}) {
     }
     r.contacts.forEach(c => section.appendChild(el('div', {
       class: 'cc-result',
-      style: 'cursor:pointer',
-      onclick: () => onOpenContact ? onOpenContact(c.id) : openContact(c.id),
+      ...(c.id ? {
+        style: 'cursor:pointer',
+        onclick: () => onOpenContact ? onOpenContact(c.id) : openContact(c.id),
+      } : { title: 'Restricted — ask a Secretary or above for details' }),
     }, [
       el('strong', {}, c.full_name || '—'),
       document.createTextNode(' · '),
