@@ -2562,9 +2562,14 @@ app.post('/api/contacts/:id/merge/:otherId', authRequired, verifyFirmMembership,
     db.prepare(`UPDATE interactions SET contact_id        = ? WHERE contact_id        = ? AND firm_id = ?`).run(primary.id, other.id, req.user.firmId);
     db.prepare(`UPDATE matters       SET client_contact_id = ? WHERE client_contact_id = ? AND firm_id = ?`).run(primary.id, other.id, req.user.firmId);
     db.prepare(`UPDATE invoices      SET client_contact_id = ? WHERE client_contact_id = ? AND firm_id = ?`).run(primary.id, other.id, req.user.firmId);
-    db.prepare(`UPDATE trust_ledger  SET contact_id        = ? WHERE contact_id        = ? AND firm_id = ?`).run(primary.id, other.id, req.user.firmId);
+    db.prepare(`UPDATE trust_ledger  SET client_contact_id = ? WHERE client_contact_id = ? AND firm_id = ?`).run(primary.id, other.id, req.user.firmId);
+    db.prepare(`UPDATE invoice_payments SET client_contact_id = ? WHERE client_contact_id = ? AND firm_id = ?`).run(primary.id, other.id, req.user.firmId);
+    db.prepare(`UPDATE conflict_checks SET related_contact_id = ? WHERE related_contact_id = ? AND firm_id = ?`).run(primary.id, other.id, req.user.firmId);
+    db.prepare(`UPDATE contacts      SET referred_by_id    = ? WHERE referred_by_id    = ? AND firm_id = ?`).run(primary.id, other.id, req.user.firmId);
     db.prepare('DELETE FROM contacts WHERE id = ? AND firm_id = ?').run(other.id, req.user.firmId);
   })();
+  logAudit(req, 'contact.merge', 'contact', primary.id,
+    { merged_id: other.id, merged_name: other.full_name, merged_email: other.email }, { primary_id: primary.id });
   res.json({ ok: true, primaryId: primary.id });
 });
 
