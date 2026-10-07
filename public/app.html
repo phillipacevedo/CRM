@@ -4404,7 +4404,7 @@ function renderTimeEntries(mount, entries, matters) {
           openTimeForm(t, matters);
         } : null }, [
           rowSelectCell(t.id, tv.entriesSelection, refresh),
-          el('td', {}, t.date),
+          el('td', { style: 'white-space:nowrap' }, fmt.date(t.date)),
           el('td', {}, matter?.client_name || '—'),
           el('td', {}, matter?.name || '—'),
           el('td', { class: 'num' }, (t.minutes/60).toFixed(2)),
