@@ -6861,7 +6861,7 @@ async function copyPayLinkForInvoice(id) {
   let url = null;
   try {
     const existing = await api('/api/invoices/' + id + '/payment-links').catch(() => []);
-    const live = (existing || []).find(l => !l.used_at && !l.expired);
+    const live = (existing || []).find(l => !l.used_at && !l.expired && l.url);
     if (live) {
       url = live.url;
     } else {

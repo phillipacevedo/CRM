@@ -239,6 +239,20 @@ function hashToken(t) {
   return crypto.createHash('sha256').update(String(t)).digest('hex');
 }
 
+// Public link tokens (pay links, invoice share links): mint a raw token for
+// the URL, store only its hash plus (when PAYMENTS_KEK is set) an encrypted
+// copy so the firm can re-copy the link later.
+function mintLinkToken() {
+  const raw = crypto.randomBytes(32).toString('base64url');
+  let enc = null;
+  if (paymentsEnabled) { try { enc = encryptSecret(raw); } catch { enc = null; } }
+  return { raw, hash: hashToken(raw), enc };
+}
+function revealLinkToken(row) {
+  if (!row?.token_enc) return null;
+  try { return decryptSecret(row.token_enc) || null; } catch { return null; }
+}
+
 // Masks secret keys for read endpoints — show only the last 4 chars.
 function maskSecret(s) {
   if (!s) return null;
@@ -755,6 +769,11 @@ const migrations = [
   `ALTER TABLE trust_ledger ADD COLUMN reverses_id TEXT`,
   // Last accepted TOTP time-step; a code at or before it is a replay.
   `ALTER TABLE users ADD COLUMN totp_last_step INTEGER DEFAULT 0`,
+  // Pay/share link tokens: the PK column now holds sha256(token) (like reset
+  // and invite tokens); token_enc keeps the raw token encrypted with
+  // PAYMENTS_KEK so an existing link's URL can be shown again.
+  `ALTER TABLE payment_links ADD COLUMN token_enc TEXT`,
+  `ALTER TABLE invoice_share_tokens ADD COLUMN token_enc TEXT`,
 ];
 // Only swallow "duplicate column" errors (idempotency). Anything else — syntax
 // typos, missing table, permission issues — is a real problem and should fail
@@ -786,6 +805,26 @@ db.exec(`UPDATE trust_ledger SET reverses_id = substr(reference, 9)
          WHERE reverses_id IS NULL AND reference LIKE 'REVERSE tr_%'
            AND NOT EXISTS (SELECT 1 FROM trust_ledger t2 WHERE t2.reverses_id = substr(trust_ledger.reference, 9))
            AND id = (SELECT MIN(t3.id) FROM trust_ledger t3 WHERE t3.reference = trust_ledger.reference)`);
+// Hash any pay/share tokens still stored in plaintext (hashed = 64 hex chars).
+{
+  const isHash = t => /^[0-9a-f]{64}$/.test(t);
+  const enc = raw => { try { return paymentsEnabled ? encryptSecret(raw) : null; } catch { return null; } };
+  db.transaction(() => {
+    for (const r of db.prepare('SELECT token FROM invoice_share_tokens').all()) {
+      if (isHash(r.token)) continue;
+      const h = hashToken(r.token);
+      db.prepare('UPDATE invoice_share_tokens SET token = ?, token_enc = ? WHERE token = ?').run(h, enc(r.token), r.token);
+      db.prepare('UPDATE payment_links SET created_by = ? WHERE created_by = ?').run('portal:' + h, 'portal:' + r.token);
+      // Earlier audit rows recorded the raw token; keep the event, drop the secret.
+      db.prepare(`UPDATE audit_log SET after_json = replace(after_json, ?, ?), before_json = replace(before_json, ?, ?)
+                  WHERE action LIKE 'invoice.share_link%'`).run(r.token, 'sha256:' + h, r.token, 'sha256:' + h);
+    }
+    for (const r of db.prepare('SELECT token FROM payment_links').all()) {
+      if (isHash(r.token)) continue;
+      db.prepare('UPDATE payment_links SET token = ?, token_enc = ? WHERE token = ?').run(hashToken(r.token), enc(r.token), r.token);
+    }
+  })();
+}
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_trust_reverses ON trust_ledger(reverses_id) WHERE reverses_id IS NOT NULL`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_trust_payment ON trust_ledger(payment_id) WHERE payment_id IS NOT NULL`);
 
@@ -4038,16 +4077,16 @@ app.post('/api/invoices/:id/payment-link', authRequired, verifyFirmMembership, r
   const destination = invoiceDestination(inv);
 
   const expiresInDays = Math.max(1, Math.min(365, parseInt(req.body?.expiresInDays ?? 30, 10)));
-  const token = crypto.randomBytes(32).toString('base64url');
+  const t = mintLinkToken();
   const expiresAt = new Date(Date.now() + expiresInDays * 86400000).toISOString();
 
   db.prepare(`INSERT INTO payment_links
-              (token, firm_id, invoice_id, destination, amount_cents, expires_at, created_by)
-              VALUES (?, ?, ?, ?, ?, ?, ?)`)
-    .run(token, req.user.firmId, inv.id, destination, balanceDue, expiresAt, req.user.email);
+              (token, token_enc, firm_id, invoice_id, destination, amount_cents, expires_at, created_by)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(t.hash, t.enc, req.user.firmId, inv.id, destination, balanceDue, expiresAt, req.user.email);
 
   const base = appBaseUrl(req);
-  res.json({ token, url: base + '/pay/' + token, expiresAt, amountCents: balanceDue });
+  res.json({ token: t.raw, url: base + '/pay/' + t.raw, expiresAt, amountCents: balanceDue });
 });
 
 // Lists prior pay links for an invoice so the UI can surface existing links
@@ -4055,13 +4094,15 @@ app.post('/api/invoices/:id/payment-link', authRequired, verifyFirmMembership, r
 app.get('/api/invoices/:id/payment-links', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
   const inv = db.prepare('SELECT id FROM invoices WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
   if (!inv) return res.status(404).json({ error: 'Invoice not found' });
-  const rows = db.prepare(`SELECT token, destination, amount_cents, expires_at, used_at, created_by, created_at
+  const rows = db.prepare(`SELECT token, token_enc, destination, amount_cents, expires_at, used_at, created_by, created_at
                            FROM payment_links WHERE invoice_id = ? AND firm_id = ?
                            ORDER BY created_at DESC LIMIT 20`).all(req.params.id, req.user.firmId);
   const base = appBaseUrl(req);
-  res.json(rows.map(r => ({
+  res.json(rows.map(({ token, token_enc, ...r }) => ({
     ...r,
-    url: base + '/pay/' + r.token,
+    id: token,
+    // null when the raw token can't be recovered (no PAYMENTS_KEK) — mint a new link.
+    url: (() => { const raw = revealLinkToken({ token_enc }); return raw ? base + '/pay/' + raw : null; })(),
     expired: r.expires_at && new Date(r.expires_at) < new Date(),
   })));
 });
@@ -4084,39 +4125,42 @@ app.post('/api/invoices/:id/share-link', authRequired, verifyFirmMembership, req
                                  AND revoked_at IS NULL
                                  AND (expires_at IS NULL OR expires_at > datetime('now'))
                                ORDER BY created_at DESC LIMIT 1`).get(inv.id, req.user.firmId);
-  if (existing) {
+  const existingRaw = existing && revealLinkToken(existing);
+  if (existingRaw) {
     const base = appBaseUrl(req);
     return res.json({
-      token: existing.token,
-      url: base + '/portal/invoice/' + existing.token,
+      token: existingRaw,
+      url: base + '/portal/invoice/' + existingRaw,
       expiresAt: existing.expires_at,
       reused: true,
     });
   }
 
-  const token = crypto.randomBytes(32).toString('base64url');
+  const t = mintLinkToken();
   const expiresAt = new Date(nowMs + expiresInDays * 86400000).toISOString();
-  db.prepare(`INSERT INTO invoice_share_tokens (token, firm_id, invoice_id, created_by, expires_at)
-              VALUES (?, ?, ?, ?, ?)`)
-    .run(token, req.user.firmId, inv.id, req.user.email, expiresAt);
+  db.prepare(`INSERT INTO invoice_share_tokens (token, token_enc, firm_id, invoice_id, created_by, expires_at)
+              VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(t.hash, t.enc, req.user.firmId, inv.id, req.user.email, expiresAt);
 
-  logAudit(req, 'invoice.share_link_create', 'invoice', inv.id, null, { token, expires_at: expiresAt });
+  logAudit(req, 'invoice.share_link_create', 'invoice', inv.id, null, { link_id: t.hash, expires_at: expiresAt });
 
   const base = appBaseUrl(req);
-  res.json({ token, url: base + '/portal/invoice/' + token, expiresAt, reused: false });
+  res.json({ token: t.raw, url: base + '/portal/invoice/' + t.raw, expiresAt, reused: false });
 });
 
 app.get('/api/invoices/:id/share-links', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
   const inv = db.prepare('SELECT id FROM invoices WHERE id = ? AND firm_id = ?').get(req.params.id, req.user.firmId);
   if (!inv) return res.status(404).json({ error: 'Invoice not found' });
-  const rows = db.prepare(`SELECT token, created_by, created_at, expires_at, revoked_at, last_viewed_at, view_count
+  const rows = db.prepare(`SELECT token, token_enc, created_by, created_at, expires_at, revoked_at, last_viewed_at, view_count
                            FROM invoice_share_tokens
                            WHERE invoice_id = ? AND firm_id = ?
                            ORDER BY created_at DESC LIMIT 20`).all(inv.id, req.user.firmId);
   const base = appBaseUrl(req);
-  res.json(rows.map(r => ({
+  res.json(rows.map(({ token, token_enc, ...r }) => ({
     ...r,
-    url: base + '/portal/invoice/' + r.token,
+    // `token` here is the link id (the stored hash) — pass it to /revoke.
+    token, id: token,
+    url: (() => { const raw = revealLinkToken({ token_enc }); return raw ? base + '/portal/invoice/' + raw : null; })(),
     expired: r.expires_at && new Date(r.expires_at) < new Date(),
     active: !r.revoked_at && (!r.expires_at || new Date(r.expires_at) > new Date()),
   })));
@@ -4124,12 +4168,12 @@ app.get('/api/invoices/:id/share-links', authRequired, verifyFirmMembership, req
 
 app.post('/api/invoices/:id/share-links/:token/revoke', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
   const row = db.prepare(`SELECT * FROM invoice_share_tokens
-                          WHERE token = ? AND invoice_id = ? AND firm_id = ?`)
-    .get(req.params.token, req.params.id, req.user.firmId);
+                          WHERE token IN (?, ?) AND invoice_id = ? AND firm_id = ?`)
+    .get(req.params.token, hashToken(req.params.token), req.params.id, req.user.firmId);
   if (!row) return res.status(404).json({ error: 'Share link not found' });
   if (row.revoked_at) return res.json({ ok: true, alreadyRevoked: true });
   db.prepare(`UPDATE invoice_share_tokens SET revoked_at = datetime('now') WHERE token = ?`).run(row.token);
-  logAudit(req, 'invoice.share_link_revoke', 'invoice', req.params.id, { token: row.token }, { revoked_at: new Date().toISOString() });
+  logAudit(req, 'invoice.share_link_revoke', 'invoice', req.params.id, { link_id: row.token }, { revoked_at: new Date().toISOString() });
   res.json({ ok: true });
 });
 
@@ -4254,7 +4298,7 @@ const PAY_PAGE_CSP =
 app.get('/pay/:token', payLimiter, (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Content-Security-Policy', PAY_PAGE_CSP);
-  const link = db.prepare('SELECT * FROM payment_links WHERE token = ?').get(req.params.token);
+  const link = db.prepare('SELECT * FROM payment_links WHERE token = ?').get(hashToken(req.params.token));
   if (!link) return res.status(404).type('html').send(renderSimplePayPage('Link not found', 'This payment link is invalid or has been removed.'));
   if (link.expires_at && new Date(link.expires_at) < new Date()) {
     return res.status(410).type('html').send(renderSimplePayPage('Link expired', 'This payment link has expired. Please contact the firm for a new one.'));
@@ -4405,7 +4449,7 @@ app.get('/pay/:token/complete', payLimiter, (req, res) => {
 // invoice-status gates. Returns `{ error, status }` on failure so callers
 // can choose the right HTTP code without redundant query work.
 function loadShareTokenForView(token) {
-  const link = db.prepare('SELECT * FROM invoice_share_tokens WHERE token = ?').get(token);
+  const link = db.prepare('SELECT * FROM invoice_share_tokens WHERE token = ?').get(hashToken(token));
   if (!link) return { error: 'Link not found', message: 'This share link is invalid or has been removed.', status: 404 };
   if (link.revoked_at) return { error: 'Link revoked', message: 'This share link was revoked by the firm. Please contact them for a new one.', status: 410 };
   if (link.expires_at && new Date(link.expires_at) < new Date()) {
@@ -4532,8 +4576,8 @@ app.get('/portal/invoice/:token', payLimiter, (req, res) => {
   ${inv.notes ? `<div class="notes">${escHtml(inv.notes)}</div>` : ''}
 
   <div class="actions">
-    <a class="btn btn-ghost" href="/portal/invoice/${escHtml(link.token)}/pdf">Download PDF</a>
-    ${canPay ? `<form method="POST" action="/portal/invoice/${escHtml(link.token)}/pay" style="margin:0"><button class="btn btn-gold" type="submit">Pay ${escHtml(formatMoney(balance))}</button></form>` : ''}
+    <a class="btn btn-ghost" href="/portal/invoice/${escHtml(req.params.token)}/pdf">Download PDF</a>
+    ${canPay ? `<form method="POST" action="/portal/invoice/${escHtml(req.params.token)}/pay" style="margin:0"><button class="btn btn-gold" type="submit">Pay ${escHtml(formatMoney(balance))}</button></form>` : ''}
   </div>
 
   <div class="footnote">If you have questions about this invoice, please contact ${escHtml(firm.name)} directly.</div>
@@ -4602,20 +4646,20 @@ app.post('/portal/invoice/:token/pay', payLimiter, (req, res) => {
   // a fresh row on every click (and to share the in-flight PaymentIntent
   // already attached to that token).
   let payToken = null;
-  const existing = db.prepare(`SELECT token, expires_at, used_at FROM payment_links
+  const existing = db.prepare(`SELECT token, token_enc, expires_at, used_at FROM payment_links
                                WHERE invoice_id = ? AND firm_id = ? AND used_at IS NULL
                                  AND (expires_at IS NULL OR expires_at > datetime('now'))
                                ORDER BY created_at DESC LIMIT 1`)
     .get(inv.id, link.firm_id);
-  if (existing) {
-    payToken = existing.token;
-  } else {
-    payToken = crypto.randomBytes(32).toString('base64url');
+  payToken = existing ? revealLinkToken(existing) : null;
+  if (!payToken) {
+    const t = mintLinkToken();
+    payToken = t.raw;
     const expiresAt = new Date(Date.now() + 7 * 86400000).toISOString();
     db.prepare(`INSERT INTO payment_links
-                (token, firm_id, invoice_id, destination, amount_cents, expires_at, created_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .run(payToken, link.firm_id, inv.id, invoiceDestination(inv), balanceCents, expiresAt, 'portal:' + link.token);
+                (token, token_enc, firm_id, invoice_id, destination, amount_cents, expires_at, created_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(t.hash, t.enc, link.firm_id, inv.id, invoiceDestination(inv), balanceCents, expiresAt, 'portal:' + link.token);
   }
 
   res.redirect(302, '/pay/' + payToken);
@@ -4626,7 +4670,7 @@ app.post('/portal/invoice/:token/pay', payLimiter, (req, res) => {
 // same link return the same PI's client_secret so re-renders don't duplicate.
 app.post('/api/pay/:token/intent', payLimiter, async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
-  const link = db.prepare('SELECT * FROM payment_links WHERE token = ?').get(req.params.token);
+  const link = db.prepare('SELECT * FROM payment_links WHERE token = ?').get(hashToken(req.params.token));
   if (!link) return res.status(404).json({ error: 'Invalid link' });
   if (link.expires_at && new Date(link.expires_at) < new Date()) return res.status(410).json({ error: 'Link expired' });
 
