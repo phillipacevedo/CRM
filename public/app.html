@@ -1014,7 +1014,7 @@ function parseDateish(v) {
 }
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const fmt = { money: n => '$' + (Number(n)||0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+const fmt = { money: n => { const v = Number(n) || 0; return (v < 0 ? '-$' : '$') + Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); },
               hours: m => ((Number(m)||0)/60).toFixed(2) + ' hr',
               date: d => { if (!d) return ''; const dt = parseDateish(d); return isNaN(dt) ? String(d) : dt.toLocaleDateString(); },
               mdy: d => { if (!d) return ''; const m = String(d).match(/^(\d{4})-(\d{2})-(\d{2})/); if (m) return `${m[2]}/${m[3]}/${m[1]}`; const dt = new Date(d); return isNaN(dt) ? String(d) : dt.toLocaleDateString('en-US'); },

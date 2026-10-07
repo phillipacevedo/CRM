@@ -825,6 +825,10 @@ db.exec(`UPDATE trust_ledger SET reverses_id = substr(reference, 9)
     }
   })();
 }
+// Matters store a denormalized client_name that client pickers rely on;
+// fill it from the contact wherever it's missing.
+db.exec(`UPDATE matters SET client_name = (SELECT full_name FROM contacts c WHERE c.id = matters.client_contact_id)
+         WHERE client_contact_id IS NOT NULL AND (client_name IS NULL OR trim(client_name) = '')`);
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_trust_reverses ON trust_ledger(reverses_id) WHERE reverses_id IS NOT NULL`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_trust_payment ON trust_ledger(payment_id) WHERE payment_id IS NOT NULL`);
 
@@ -3080,8 +3084,14 @@ app.post('/api/matters', authRequired, verifyFirmMembership, requireCap('editCon
   // per-firm clientless sequence otherwise — so every matter has a real number
   // to print on invoices instead of falling back to the internal uuid.
   const matterNumber = clientId ? nextMatterNumber(clientId) : nextFirmMatterNumber(req.user.firmId);
+  let clientName = b.clientName || null;
+  if (clientId) {
+    const c = db.prepare('SELECT full_name FROM contacts WHERE id = ? AND firm_id = ?').get(clientId, req.user.firmId);
+    if (!c) return res.status(400).json({ error: 'Client not found in this firm' });
+    clientName = clientName || c.full_name;
+  }
   db.prepare(`INSERT INTO matters (id, firm_id, dt_matter_id, client_contact_id, client_name, name, description, billing_type, flat_fee, status, billing_increment_minutes, matter_number, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-    id, req.user.firmId, b.dtMatterId || null, clientId, b.clientName || null,
+    id, req.user.firmId, b.dtMatterId || null, clientId, clientName,
     b.name.trim(), b.description || null, b.billingType || 'hourly', b.flatFee || 0, b.status || 'active', inc, matterNumber, req.user.email);
   res.json(db.prepare(MATTER_SELECT + ' WHERE m.id = ?').get(id));
 });
@@ -3100,6 +3110,10 @@ app.put('/api/matters/:id', authRequired, verifyFirmMembership, requireCap('edit
   // matter still has no number on a no-op edit, assign one now.
   const newClientId = ('clientContactId' in b) ? (b.clientContactId || null) : existing.client_contact_id;
   let matterNumber = existing.matter_number;
+  if (newClientId && newClientId !== existing.client_contact_id &&
+      !db.prepare('SELECT 1 FROM contacts WHERE id = ? AND firm_id = ?').get(newClientId, req.user.firmId)) {
+    return res.status(400).json({ error: 'Client not found in this firm' });
+  }
   if (newClientId !== existing.client_contact_id) {
     // The matter number is printed on invoices; once billed, the matter can't
     // move to another client (which would re-issue its number).
@@ -3150,7 +3164,10 @@ app.put('/api/matters/:id', authRequired, verifyFirmMembership, requireCap('edit
     'description' in b ? (b.description ?? null) : existing.description,
     b.billingType || null,
     typeof b.flatFee === 'number' ? b.flatFee : null, b.status || null,
-    newClientId, b.clientName ?? existing.client_name,
+    newClientId,
+    b.clientName || (newClientId !== existing.client_contact_id || !existing.client_name
+      ? (newClientId ? db.prepare('SELECT full_name FROM contacts WHERE id = ? AND firm_id = ?').get(newClientId, req.user.firmId)?.full_name || null : null)
+      : existing.client_name),
     'dtMatterId' in b ? (b.dtMatterId || null) : existing.dt_matter_id,
     inc,
     matterNumber,
