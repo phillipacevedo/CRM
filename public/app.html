@@ -119,11 +119,11 @@ a:hover{text-decoration:underline}
 
 /* Grids */
 .grid{display:grid;gap:16px}
-.grid-4{grid-template-columns:repeat(4,1fr)}
+.grid-4{grid-template-columns:repeat(4,1fr)}.grid-5{grid-template-columns:repeat(5,1fr)}
 .grid-3{grid-template-columns:repeat(3,1fr)}
 .grid-2{grid-template-columns:repeat(2,1fr)}
-@media (max-width:1100px){.grid-4{grid-template-columns:repeat(2,1fr)}.grid-3{grid-template-columns:repeat(2,1fr)}}
-@media (max-width:700px){.grid-4,.grid-3,.grid-2{grid-template-columns:1fr}}
+@media (max-width:1100px){.grid-4,.grid-5{grid-template-columns:repeat(2,1fr)}.grid-3{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:700px){.grid-5,.grid-4,.grid-3,.grid-2{grid-template-columns:1fr}}
 
 /* Narrow-viewport responsiveness: let wide data tables scroll horizontally
    instead of blowing out the layout, and stack kanban columns instead of
@@ -7377,14 +7377,15 @@ async function renderCashflowAgingPanel(slot, buildQs) {
   const rows    = data.rows    || [];
 
   const AGING_DEFS = [
-    { key: '0-30',  label: '0–30 days',  color: '#4f86c6' },
+    { key: 'current', label: 'Not yet due', color: '#16a34a' },
+    { key: '0-30',  label: '1–30 days past due',  color: '#4f86c6' },
     { key: '31-60', label: '31–60 days', color: '#f59e0b' },
     { key: '61-90', label: '61–90 days', color: '#ef4444' },
     { key: '90+',   label: '90+ days',   color: '#991b1b' },
   ];
   const totalAR = AGING_DEFS.reduce((s, b) => s + ((buckets[b.key] && buckets[b.key].amount) || 0), 0);
 
-  const statsRow = el('div', { class: 'grid grid-4 mb-16' });
+  const statsRow = el('div', { class: 'grid grid-5 mb-16' });
   AGING_DEFS.forEach(b => {
     const val = (buckets[b.key] && buckets[b.key].amount) || 0;
     statsRow.appendChild(el('div', { class: 'stat-card' }, [
@@ -7414,9 +7415,10 @@ async function renderCashflowAgingPanel(slot, buildQs) {
         el('th', {}, 'Issued'),
         el('th', {}, 'Due'),
         el('th', { class: 'num' }, 'Amount'),
+        el('th', { class: 'num' }, 'Adj.'),
         el('th', { class: 'num' }, 'Paid'),
         el('th', { class: 'num' }, 'Balance'),
-        el('th', {}, 'Age'),
+        el('th', {}, 'Past due'),
       ])),
       el('tbody', {}, rows.map(r => {
         const def = AGING_DEFS.find(b => b.key === r.bucket);
@@ -7427,9 +7429,10 @@ async function renderCashflowAgingPanel(slot, buildQs) {
           el('td', {}, fmt.date(r.issued_at)),
           el('td', {}, r.due_at ? fmt.date(r.due_at) : '—'),
           el('td', { class: 'num' }, fmt.money(r.total)),
+          el('td', { class: 'num' }, r.adjustments ? fmt.money(r.adjustments) : '—'),
           el('td', { class: 'num' }, fmt.money(r.paid)),
           el('td', { class: 'num', style: 'font-weight:600;color:' + color }, fmt.money(r.balance)),
-          el('td', { style: 'color:' + color }, r.days_overdue + 'd'),
+          el('td', { style: 'color:' + color }, r.bucket === 'current' ? 'Not due' : r.days_overdue + 'd'),
         ]);
       })),
     ]));

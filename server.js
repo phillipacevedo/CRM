@@ -4452,7 +4452,7 @@ app.get('/portal/invoice/:token/pdf', payLimiter, (req, res) => {
     WHERE t.invoice_id = ? ORDER BY t.date, t.created_at
   `).all(inv.id);
   const outstandingRow = inv.client_contact_id ? db.prepare(`
-    SELECT COALESCE(SUM(total - amount_paid), 0) AS bal
+    SELECT COALESCE(SUM(total + COALESCE(amount_writedown, 0) - amount_paid), 0) AS bal
     FROM invoices WHERE firm_id = ? AND client_contact_id = ? AND id != ? AND status = 'sent'
   `).get(link.firm_id, inv.client_contact_id, inv.id) : { bal: 0 };
   const outstanding = Number(outstandingRow.bal) || 0;
@@ -5342,7 +5342,7 @@ app.get('/api/invoices/:id/pdf', authRequired, verifyFirmMembership, requireCap(
     WHERE t.invoice_id = ? ORDER BY t.date, t.created_at
   `).all(req.params.id);
   const outstandingRow = inv.client_contact_id ? db.prepare(`
-    SELECT COALESCE(SUM(total - amount_paid), 0) AS bal
+    SELECT COALESCE(SUM(total + COALESCE(amount_writedown, 0) - amount_paid), 0) AS bal
     FROM invoices WHERE firm_id = ? AND client_contact_id = ? AND id != ? AND status = 'sent'
   `).get(req.user.firmId, inv.client_contact_id, inv.id) : { bal: 0 };
   const outstanding = Number(outstandingRow.bal) || 0;
@@ -5680,37 +5680,42 @@ function periodFmtJs(iso, granularity) {
   return `${m[1]}-${m[2]}-${m[3]}`;
 }
 
-// AR aging — outstanding balance on issued invoices, bucketed by days since
-// issued_at. Status='sent' is the AR universe; 'paid' and 'void' are excluded
-// because their balance is zero (or nullified). Balance is computed from
-// invoice_payments (succeeded), not invoices.amount_paid, since that field is
-// a stale denormalization that the payments table is the source of truth for.
+// AR aging — open balance per issued invoice as of `asOf`, bucketed by days
+// past due (due_at; issued_at when no due date). Balance = total + write-downs/
+// write-ups − payments, each counted only if dated on or before asOf, so a
+// past asOf shows what was owed then. Universe is every non-draft invoice
+// issued by asOf except voids (void has no date stamp, so a since-voided
+// invoice is excluded from historical runs too).
 app.get('/api/reports/ar-aging', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
   const f = resolveCashflowFilters(req);
-  const asOfStr = req.query.asOf || new Date().toISOString().slice(0, 10);
-  const today = new Date(asOfStr + 'T00:00:00');
-  today.setHours(0, 0, 0, 0);
-  const todayMs = today.getTime();
+  const asOfStr = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.asOf || '')) ? req.query.asOf : new Date().toISOString().slice(0, 10);
+  const asOfEnd = asOfStr + 'T23:59:59.999Z';
+  const asOfMs = Date.parse(asOfStr + 'T00:00:00Z');
 
   const cIn = inClause('i.client_contact_id', f.clientIdIn);
   const mIn = inClause('i.matter_id',         f.matterIdIn);
   const sql = `
-    SELECT i.id, i.number, i.client_contact_id, i.client_name, i.matter_id,
+    SELECT i.id, i.number, i.kind, i.client_contact_id, i.client_name, i.matter_id,
            i.issued_at, i.due_at, i.total,
            (SELECT COALESCE(SUM(p.amount), 0) FROM invoice_payments p
-              WHERE p.invoice_id = i.id AND p.status = 'succeeded') AS paid,
+              WHERE p.invoice_id = i.id AND p.status = 'succeeded'
+                AND COALESCE(p.occurred_at, p.created_at) <= ?) AS paid,
+           (SELECT COALESCE(SUM(a.amount), 0) FROM invoice_adjustments a
+              WHERE a.invoice_id = i.id AND COALESCE(a.occurred_at, a.created_at) <= ?) AS adjustments,
            m.name AS matter_name, m.matter_number,
            c.client_number, c.originating_attorney_email, c.billing_attorney_email
       FROM invoices i
       LEFT JOIN matters  m ON m.id = i.matter_id
       LEFT JOIN contacts c ON c.id = i.client_contact_id
-     WHERE i.firm_id = ? AND i.status = 'sent' AND i.issued_at IS NOT NULL
+     WHERE i.firm_id = ? AND i.status IN ('sent','paid') AND i.issued_at IS NOT NULL
+       AND substr(i.issued_at, 1, 10) <= ?
      ${cIn.sql}${mIn.sql}
      ORDER BY i.issued_at
   `;
-  const invoices = db.prepare(sql).all(req.user.firmId, ...cIn.params, ...mIn.params);
+  const invoices = db.prepare(sql).all(asOfEnd, asOfEnd, req.user.firmId, asOfStr, ...cIn.params, ...mIn.params);
 
   const buckets = {
+    'current': { count: 0, amount: 0 },
     '0-30':  { count: 0, amount: 0 },
     '31-60': { count: 0, amount: 0 },
     '61-90': { count: 0, amount: 0 },
@@ -5718,28 +5723,29 @@ app.get('/api/reports/ar-aging', authRequired, verifyFirmMembership, requireCap(
   };
   const rows = [];
   for (const inv of invoices) {
-    const balance = +(Number(inv.total || 0) - Number(inv.paid || 0)).toFixed(2);
+    const balance = round2(Number(inv.total || 0) + Number(inv.adjustments || 0) - Number(inv.paid || 0));
     if (balance <= 0.005) continue;
-    const issuedDate = String(inv.issued_at).slice(0, 10);
-    const issuedMs = new Date(issuedDate + 'T00:00:00').getTime();
-    const days = Math.max(0, Math.floor((todayMs - issuedMs) / 86400000));
-    const bucket = days <= 30 ? '0-30' : days <= 60 ? '31-60' : days <= 90 ? '61-90' : '90+';
+    const ageFrom = String(inv.due_at || inv.issued_at).slice(0, 10);
+    const daysPastDue = Math.floor((asOfMs - Date.parse(ageFrom + 'T00:00:00Z')) / 86400000);
+    const days = Math.max(0, daysPastDue);
+    const bucket = daysPastDue <= 0 ? 'current' : days <= 30 ? '0-30' : days <= 60 ? '31-60' : days <= 90 ? '61-90' : '90+';
     buckets[bucket].count  += 1;
-    buckets[bucket].amount = +(buckets[bucket].amount + balance).toFixed(2);
+    buckets[bucket].amount = round2(buckets[bucket].amount + balance);
     rows.push({
-      invoice_id: inv.id, number: inv.number,
+      invoice_id: inv.id, number: inv.number, kind: inv.kind || 'fees',
       client_contact_id: inv.client_contact_id, client_name: inv.client_name, client_number: inv.client_number,
       matter_id: inv.matter_id, matter_name: inv.matter_name, matter_number: inv.matter_number,
       issued_at: inv.issued_at, due_at: inv.due_at,
-      total: +Number(inv.total || 0).toFixed(2),
-      paid:  +Number(inv.paid  || 0).toFixed(2),
+      total: round2(inv.total),
+      adjustments: round2(inv.adjustments),
+      paid:  round2(inv.paid),
       balance, days_overdue: days, bucket,
       originating_attorney_email: inv.originating_attorney_email,
       billing_attorney_email: inv.billing_attorney_email,
     });
   }
   rows.sort((a, b) => b.days_overdue - a.days_overdue);
-  const totals = { count: rows.length, balance: +rows.reduce((s, r) => s + r.balance, 0).toFixed(2) };
+  const totals = { count: rows.length, balance: round2(rows.reduce((s, r) => s + r.balance, 0)) };
   res.json({ asOf: asOfStr, buckets, rows, totals });
 });
 
@@ -6110,7 +6116,7 @@ app.get('/api/dashboard', authRequired, verifyFirmMembership, (req, res) => {
   if (CAPS.manageBilling(req.user)) {
     const unbilled = db.prepare(`SELECT COALESCE(SUM(minutes * rate / 60), 0) AS v FROM time_entries
                                  WHERE firm_id = ? AND status = 'draft' AND billable = 1`).get(firmId).v;
-    const outstanding = db.prepare(`SELECT COALESCE(SUM(total - amount_paid), 0) AS v FROM invoices
+    const outstanding = db.prepare(`SELECT COALESCE(SUM(total + COALESCE(amount_writedown, 0) - amount_paid), 0) AS v FROM invoices
                                     WHERE firm_id = ? AND status IN ('sent')`).get(firmId).v;
     const trustTotal = db.prepare(`SELECT COALESCE(SUM(amount), 0) AS v FROM trust_ledger WHERE firm_id = ?`).get(firmId).v;
     // Aging slice — uses the same per-matter aging logic as the WIP report so
