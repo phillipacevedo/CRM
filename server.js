@@ -5656,17 +5656,29 @@ app.post('/api/invoices/preview', authRequired, verifyFirmMembership, requireCap
 
 app.get('/api/trust', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
   const { clientId, matterId } = req.query;
-  let sql = 'SELECT * FROM trust_ledger WHERE firm_id = ?';
+  let sql = `SELECT t.*, m.name AS matter_name, m.matter_number, c.client_number
+             FROM trust_ledger t
+             LEFT JOIN matters m ON m.id = t.matter_id
+             LEFT JOIN contacts c ON c.id = t.client_contact_id
+             WHERE t.firm_id = ?`;
   const p = [req.user.firmId];
-  if (clientId) { sql += ' AND client_contact_id = ?'; p.push(clientId); }
-  if (matterId) { sql += ' AND matter_id = ?';         p.push(matterId); }
-  sql += ' ORDER BY occurred_at DESC LIMIT 1000';
+  if (clientId) { sql += ' AND t.client_contact_id = ?'; p.push(clientId); }
+  if (matterId) { sql += ' AND t.matter_id = ?';         p.push(matterId); }
+  sql += ' ORDER BY t.occurred_at DESC LIMIT 1000';
   const rows = db.prepare(sql).all(...p);
-  // Balances summary
-  const balances = db.prepare(`SELECT client_contact_id, client_name, SUM(amount) AS balance
-      FROM trust_ledger WHERE firm_id = ? GROUP BY client_contact_id, client_name ORDER BY balance DESC`)
+  // Balances summary: per client, and per client+matter bucket (matter_id
+  // NULL = unallocated client funds). Overdraw checks run per bucket.
+  const balances = db.prepare(`SELECT client_contact_id, MAX(client_name) AS client_name, ROUND(SUM(amount), 2) AS balance
+      FROM trust_ledger WHERE firm_id = ? GROUP BY client_contact_id ORDER BY balance DESC`)
     .all(req.user.firmId);
-  res.json({ entries: rows, balances });
+  const matterBalances = db.prepare(`SELECT t.client_contact_id, t.matter_id, m.name AS matter_name, m.matter_number,
+             c.client_number, ROUND(SUM(t.amount), 2) AS balance
+      FROM trust_ledger t
+      LEFT JOIN matters m ON m.id = t.matter_id
+      LEFT JOIN contacts c ON c.id = t.client_contact_id
+      WHERE t.firm_id = ? GROUP BY t.client_contact_id, t.matter_id
+      ORDER BY m.name IS NULL, m.name`).all(req.user.firmId);
+  res.json({ entries: rows, balances, matterBalances });
 });
 
 app.post('/api/trust', authRequired, verifyFirmMembership, requireCap('manageBilling'), (req, res) => {
